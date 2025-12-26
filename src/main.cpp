@@ -12,6 +12,7 @@
 #include "render/Crosshair.h"
 #include "render/BlockHighlight.h"
 #include "render/TextureAtlas.h"
+#include "render/VertexPool.h"
 
 #include <iostream>
 #include <iomanip>
@@ -4390,6 +4391,16 @@ int main() {
     textureAtlas.generate();
     std::cout << "Texture atlas generated (256x256)" << std::endl;
 
+    // Initialize vertex pool for reduced allocation overhead
+    if (g_useVertexPool) {
+        if (VertexPool::getInstance().initialize()) {
+            std::cout << "Vertex pool initialized (" << VERTEX_POOL_SIZE_MB << "MB)" << std::endl;
+        } else {
+            std::cout << "Vertex pool failed to initialize - using per-chunk allocation" << std::endl;
+            g_useVertexPool = false;
+        }
+    }
+
     // Initialize UI elements
     Crosshair crosshair;
     crosshair.init();
@@ -5757,6 +5768,11 @@ int main() {
 
     // Cleanup SSAO resources
     glDeleteBuffers(1, &ssaoKernelUBO);
+
+    // Shutdown vertex pool
+    if (g_useVertexPool) {
+        VertexPool::getInstance().shutdown();
+    }
 
     glfwDestroyWindow(window);
     glfwTerminate();

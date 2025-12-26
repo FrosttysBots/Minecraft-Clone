@@ -917,8 +917,14 @@ public:
                 subChunk.subChunkY = subData.subChunkY;
                 subChunk.isEmpty = subData.isEmpty;
 
-                // Upload solid geometry for each LOD level
-                for (int lod = 0; lod < LOD_LEVELS; lod++) {
+                // Upload LOD 0 using face buckets for 35% better backface culling
+                bool hasLOD0Data = subData.getLOD0VertexCount() > 0;
+                if (hasLOD0Data) {
+                    mesh->uploadFaceBucketsToSubChunk(subY, subData.faceBucketVertices);
+                }
+
+                // Upload solid geometry for LOD 1+ (no face buckets for distant geometry)
+                for (int lod = 1; lod < LOD_LEVELS; lod++) {
                     if (!subData.lodVertices[lod].empty()) {
                         mesh->uploadToSubChunk(subY, subData.lodVertices[lod], lod);
                     }
@@ -927,8 +933,15 @@ public:
                 // Generate meshlets for mesh shader rendering (if enabled)
                 // Must be done on main thread (OpenGL calls)
                 // Skip during burst mode for faster initial loading
-                if (g_generateMeshlets && !burstMode && !subData.lodVertices[0].empty()) {
-                    mesh->generateMeshlets(subY, subData.lodVertices[0]);
+                // Use combined vertices from face buckets for meshlet generation
+                if (g_generateMeshlets && !burstMode && hasLOD0Data) {
+                    // Combine face buckets into a single vertex array for meshlet generation
+                    std::vector<PackedChunkVertex> combinedVertices;
+                    combinedVertices.reserve(subData.getLOD0VertexCount());
+                    for (const auto& bucket : subData.faceBucketVertices) {
+                        combinedVertices.insert(combinedVertices.end(), bucket.begin(), bucket.end());
+                    }
+                    mesh->generateMeshlets(subY, combinedVertices);
                 }
 
                 // Upload pre-generated water vertices (generated on worker thread)

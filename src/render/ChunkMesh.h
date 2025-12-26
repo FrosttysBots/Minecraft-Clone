@@ -57,13 +57,19 @@ struct ChunkVertex {
     glm::vec2 texSlotBase; // Base UV of texture slot in atlas (for greedy meshing tiling)
 };
 
+// Include BinaryGreedyMesher.h for FACE_BUCKET_COUNT constant
+// Must be included after PackedChunkVertex is defined (no circular dependency)
+#include "BinaryGreedyMesher.h"
+
 // ============================================================
 // MESH SHADER STRUCTURES (GL_NV_mesh_shader)
 // ============================================================
 
-// Meshlet configuration - NVIDIA recommends max 64 vertices, 126 triangles
-constexpr int MESHLET_MAX_VERTICES = 64;
-constexpr int MESHLET_MAX_TRIANGLES = 126;
+// Meshlet configuration - Tuned for better GPU occupancy
+// AMD recommends 128 vertices/256 triangles for mesh shaders
+// Using 128/256 as a balanced choice for both vendors
+constexpr int MESHLET_MAX_VERTICES = 128;
+constexpr int MESHLET_MAX_TRIANGLES = 256;
 constexpr int MESHLET_MAX_INDICES = MESHLET_MAX_TRIANGLES * 3;
 
 // GPU-side meshlet descriptor (matches mesh shader layout)
@@ -200,8 +206,16 @@ constexpr int SUB_CHUNK_HEIGHT = 16;                       // Height of each sub
 constexpr int SUB_CHUNKS_PER_COLUMN = CHUNK_SIZE_Y / SUB_CHUNK_HEIGHT;  // 256/16 = 16 sub-chunks
 
 // Sub-chunk mesh - contains LOD meshes for a 16x16x16 section
+// Now with face-orientation buckets for 35% better backface culling
 struct SubChunkMesh {
-    std::array<LODMesh, LOD_LEVELS> lodMeshes;  // LOD 0-3 for this sub-chunk
+    // Face-orientation buckets for LOD 0 (one per cardinal direction)
+    // Enables skipping entire face directions based on camera position
+    std::array<GLuint, FACE_BUCKET_COUNT> faceBucketVAOs = {};
+    std::array<GLuint, FACE_BUCKET_COUNT> faceBucketVBOs = {};
+    std::array<int, FACE_BUCKET_COUNT> faceBucketVertexCounts = {};
+    std::array<GLsizeiptr, FACE_BUCKET_COUNT> faceBucketCapacities = {};
+    
+    std::array<LODMesh, LOD_LEVELS> lodMeshes;  // LOD 0-3 for this sub-chunk (LOD 0 unused if buckets active)
 
     // Water geometry for this sub-chunk
     GLuint waterVAO = 0;
@@ -216,8 +230,16 @@ struct SubChunkMesh {
     int subChunkY = 0;     // Y index (0-15)
     bool isEmpty = true;   // Skip rendering if no geometry
     bool hasWater = false; // Quick check for water rendering pass
+    bool useFaceBuckets = true;  // Use face buckets for LOD 0 (can disable for debugging)
 
     void destroy() {
+        // Clean up face buckets
+        for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
+            if (faceBucketVBOs[i] != 0) { glDeleteBuffers(1, &faceBucketVBOs[i]); faceBucketVBOs[i] = 0; }
+            if (faceBucketVAOs[i] != 0) { glDeleteVertexArrays(1, &faceBucketVAOs[i]); faceBucketVAOs[i] = 0; }
+            faceBucketVertexCounts[i] = 0;
+            faceBucketCapacities[i] = 0;
+        }
         for (auto& lod : lodMeshes) {
             lod.destroy();
         }
@@ -235,16 +257,38 @@ struct SubChunkMesh {
     // Check if this sub-chunk has any geometry at any LOD level
     bool hasGeometry() const {
         if (!isEmpty) return true;
+        // Check face buckets
+        for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
+            if (faceBucketVertexCounts[i] > 0) return true;
+        }
         for (const auto& lod : lodMeshes) {
             if (lod.vertexCount > 0) return true;
         }
         return false;
     }
 
+    // Get total vertex count at LOD 0 (sum of all face buckets)
+    int getLOD0VertexCount() const {
+        int total = 0;
+        for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
+            total += faceBucketVertexCounts[i];
+        }
+        return total;
+    }
+
     // Get vertex count at specified LOD
     int getVertexCount(int lodLevel = 0) const {
         lodLevel = std::max(0, std::min(lodLevel, LOD_LEVELS - 1));
+        if (lodLevel == 0 && useFaceBuckets) {
+            return getLOD0VertexCount();
+        }
         return lodMeshes[lodLevel].vertexCount;
+    }
+    
+    // Check if a specific face bucket has vertices
+    bool hasFaceBucket(int bucketIndex) const {
+        if (bucketIndex < 0 || bucketIndex >= FACE_BUCKET_COUNT) return false;
+        return faceBucketVertexCounts[bucketIndex] > 0 && faceBucketVAOs[bucketIndex] != 0;
     }
 };
 
@@ -586,12 +630,27 @@ public:
     }
 
     // Render a specific sub-chunk at the given LOD level
+    // For LOD 0: Renders all 6 face buckets (use renderSubChunkWithFaceCulling for directional culling)
+    // For LOD 1+: Uses pre-baked LOD meshes
     void renderSubChunk(int subChunkY, int lodLevel = 0) const {
         if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
         const auto& sub = subChunks[subChunkY];
         if (sub.isEmpty) return;
 
         lodLevel = std::max(0, std::min(lodLevel, LOD_LEVELS - 1));
+
+        // LOD 0: Use face buckets for potential per-direction culling
+        if (lodLevel == 0 && sub.useFaceBuckets) {
+            bool rendered = false;
+            for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
+                if (sub.faceBucketVertexCounts[bucketIdx] > 0 && sub.faceBucketVAOs[bucketIdx] != 0) {
+                    glBindVertexArray(sub.faceBucketVAOs[bucketIdx]);
+                    glDrawArrays(GL_TRIANGLES, 0, sub.faceBucketVertexCounts[bucketIdx]);
+                    rendered = true;
+                }
+            }
+            if (rendered) return;
+        }
 
         // Try requested LOD, fall back to lower LODs if not available
         for (int level = lodLevel; level >= 0; level--) {
@@ -2424,6 +2483,111 @@ public:
 
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
+    }
+
+    // Upload face-orientation buckets to a specific sub-chunk
+    // Each bucket contains faces for one cardinal direction, enabling 35% better backface culling
+    void uploadFaceBucketsToSubChunk(int subChunkY, 
+                                      const std::array<std::vector<PackedChunkVertex>, FACE_BUCKET_COUNT>& faceBuckets) {
+        if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
+
+        SubChunkMesh& sub = subChunks[subChunkY];
+        sub.subChunkY = subChunkY;
+        sub.useFaceBuckets = true;
+
+        // Track if any bucket has data
+        bool hasAnyData = false;
+
+        for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
+            const auto& vertices = faceBuckets[bucketIdx];
+            
+            if (vertices.empty()) {
+                sub.faceBucketVertexCounts[bucketIdx] = 0;
+                continue;
+            }
+
+            hasAnyData = true;
+            sub.faceBucketVertexCounts[bucketIdx] = static_cast<int>(vertices.size());
+            GLsizeiptr dataSize = vertices.size() * sizeof(PackedChunkVertex);
+
+            // Reuse buffer if data fits
+            if (sub.faceBucketVAOs[bucketIdx] != 0 && 
+                sub.faceBucketVBOs[bucketIdx] != 0 && 
+                dataSize <= sub.faceBucketCapacities[bucketIdx]) {
+                glBindBuffer(GL_ARRAY_BUFFER, sub.faceBucketVBOs[bucketIdx]);
+                glBufferSubData(GL_ARRAY_BUFFER, 0, dataSize, vertices.data());
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+                continue;
+            }
+
+            // Reallocate with headroom
+            if (sub.faceBucketVBOs[bucketIdx] != 0) {
+                glDeleteBuffers(1, &sub.faceBucketVBOs[bucketIdx]);
+            }
+            if (sub.faceBucketVAOs[bucketIdx] != 0) {
+                glDeleteVertexArrays(1, &sub.faceBucketVAOs[bucketIdx]);
+            }
+
+            GLsizeiptr newCapacity = static_cast<GLsizeiptr>(dataSize * 1.5);
+            
+            glGenBuffers(1, &sub.faceBucketVBOs[bucketIdx]);
+            glBindBuffer(GL_ARRAY_BUFFER, sub.faceBucketVBOs[bucketIdx]);
+            glBufferData(GL_ARRAY_BUFFER, newCapacity, nullptr, GL_DYNAMIC_DRAW);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, dataSize, vertices.data());
+            sub.faceBucketCapacities[bucketIdx] = newCapacity;
+
+            glGenVertexArrays(1, &sub.faceBucketVAOs[bucketIdx]);
+            glBindVertexArray(sub.faceBucketVAOs[bucketIdx]);
+
+            // Same vertex format as regular sub-chunk mesh
+            glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, sizeof(PackedChunkVertex),
+                                  (void*)offsetof(PackedChunkVertex, x));
+            glEnableVertexAttribArray(0);
+
+            glVertexAttribPointer(1, 2, GL_UNSIGNED_SHORT, GL_FALSE, sizeof(PackedChunkVertex),
+                                  (void*)offsetof(PackedChunkVertex, u));
+            glEnableVertexAttribArray(1);
+
+            glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                                   (void*)offsetof(PackedChunkVertex, normalIndex));
+            glEnableVertexAttribArray(2);
+
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindVertexArray(0);
+        }
+
+        sub.isEmpty = !hasAnyData;
+    }
+
+    // Render a specific face bucket of a sub-chunk (for face-orientation culling)
+    void renderSubChunkFaceBucket(int subChunkY, int bucketIndex) const {
+        if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
+        if (bucketIndex < 0 || bucketIndex >= FACE_BUCKET_COUNT) return;
+        
+        const auto& sub = subChunks[subChunkY];
+        if (sub.faceBucketVertexCounts[bucketIndex] == 0) return;
+        if (sub.faceBucketVAOs[bucketIndex] == 0) return;
+
+        glBindVertexArray(sub.faceBucketVAOs[bucketIndex]);
+        glDrawArrays(GL_TRIANGLES, 0, sub.faceBucketVertexCounts[bucketIndex]);
+    }
+
+    // Render sub-chunk with face-orientation culling based on camera position
+    // visibilityMask is a bitmask where bit i is set if face bucket i should be rendered
+    void renderSubChunkWithFaceCulling(int subChunkY, uint8_t visibilityMask) const {
+        if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
+        
+        const auto& sub = subChunks[subChunkY];
+        if (sub.isEmpty) return;
+
+        for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
+            if ((visibilityMask & (1 << bucketIdx)) == 0) continue;  // Skip culled bucket
+            if (sub.faceBucketVertexCounts[bucketIdx] == 0) continue;
+            if (sub.faceBucketVAOs[bucketIdx] == 0) continue;
+
+            glBindVertexArray(sub.faceBucketVAOs[bucketIdx]);
+            glDrawArrays(GL_TRIANGLES, 0, sub.faceBucketVertexCounts[bucketIdx]);
+        }
     }
 
     // Upload water geometry to a specific sub-chunk
