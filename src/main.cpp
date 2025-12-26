@@ -570,12 +570,12 @@ InputState processInput(GLFWwindow* window) {
         ssaoTogglePressed = false;
     }
 
-    // Debug mode cycle (F9)
+    // Debug mode cycle - use F12 to cycle through modes
     static bool debugTogglePressed = false;
-    if (glfwGetKey(window, GLFW_KEY_F9) == GLFW_PRESS) {
+    if (glfwGetKey(window, GLFW_KEY_F12) == GLFW_PRESS) {
         if (!debugTogglePressed) {
-            g_deferredDebugMode = (g_deferredDebugMode + 1) % 5;
-            const char* modeNames[] = {"Normal", "Albedo", "Normals", "Position", "Depth"};
+            g_deferredDebugMode = (g_deferredDebugMode + 1) % 9;
+            const char* modeNames[] = {"Normal", "Albedo", "Normals", "Position", "Depth", "Vertex AO", "AO*SSAO", "Diffuse Only", "Light Level"};
             std::cout << "Debug mode: " << modeNames[g_deferredDebugMode] << std::endl;
             debugTogglePressed = true;
         }
@@ -905,8 +905,8 @@ void main() {
     // Discard very transparent pixels (for glass, leaves)
     if (texColor.a < 0.1) discard;
 
-    // Check for emissive blocks (use texSlotBase to identify block type)
-    float emission = getEmission(texSlotBase);
+    // Check for emissive blocks (use tiledUV to identify block type)
+    float emission = getEmission(tiledUV);
 
     // Lighting calculation
     vec3 norm = normalize(fragNormal);
@@ -1030,6 +1030,7 @@ out float fogDepth;
 uniform mat4 view;
 uniform mat4 projection;
 uniform float time;
+uniform vec3 chunkOffset;  // Transform local to world coordinates
 
 // ============================================================
 // Simplex 2D Noise for vertex displacement
@@ -1080,7 +1081,7 @@ float fbmVertex(vec2 p, float t) {
 }
 
 void main() {
-    vec3 pos = aPos;
+    vec3 pos = aPos + chunkOffset;  // Transform to world coordinates
 
     // Only animate the top surface of water (normal pointing up)
     if (aNormal.y > 0.5) {
@@ -2355,6 +2356,46 @@ void main() {
         // Debug mode 4: Depth visualization
         FragColor = vec4(vec3(1.0 - depth), 1.0);  // Invert so closer = brighter
         return;
+    } else if (debugMode == 5) {
+        // Debug mode 5: Raw vertex AO from G-buffer
+        if (depth >= 0.999) {
+            FragColor = vec4(0.0, 1.0, 1.0, 1.0);  // Cyan = sky
+        } else {
+            float aoVal = posAO.w;
+            FragColor = vec4(aoVal, aoVal, aoVal, 1.0);  // White = 1.0, Black = 0.0
+        }
+        return;
+    } else if (debugMode == 6) {
+        // Debug mode 6: Combined AO * SSAO
+        if (depth >= 0.999) {
+            FragColor = vec4(0.0, 1.0, 1.0, 1.0);  // Cyan = sky
+        } else {
+            float aoVal = posAO.w;
+            float ssaoVal = enableSSAO ? texture(ssaoTexture, TexCoords).r : 1.0;
+            float combined = aoVal * ssaoVal;
+            FragColor = vec4(combined, combined, combined, 1.0);
+        }
+        return;
+    } else if (debugMode == 7) {
+        // Debug mode 7: Diffuse lighting only (no albedo, no fog)
+        if (depth >= 0.999) {
+            FragColor = vec4(0.0, 1.0, 1.0, 1.0);  // Cyan = sky
+        } else {
+            vec3 normal = normalize(normalLight.xyz);
+            vec3 lightDirection = normalize(lightDir);
+            float diff = max(dot(normal, lightDirection), 0.0);
+            FragColor = vec4(diff, diff, diff, 1.0);  // White = full diffuse, black = no diffuse
+        }
+        return;
+    } else if (debugMode == 8) {
+        // Debug mode 8: Light level (from emissive blocks)
+        if (depth >= 0.999) {
+            FragColor = vec4(0.0, 1.0, 1.0, 1.0);  // Cyan = sky
+        } else {
+            float ll = normalLight.w;
+            FragColor = vec4(ll, ll, ll, 1.0);  // White = high light level
+        }
+        return;
     }
 
     // Early out for sky pixels
@@ -3049,6 +3090,25 @@ uniform mat4 viewProj;
 uniform int numMipLevels;
 uniform vec2 screenSize;
 uniform int chunkCount;
+uniform vec4 frustumPlanes[6];  // Frustum planes for culling
+
+// GPU frustum test - returns true if box is visible
+bool frustumTestAABB(vec3 minB, vec3 maxB) {
+    for (int i = 0; i < 6; i++) {
+        vec4 plane = frustumPlanes[i];
+        // Find the positive vertex (furthest along plane normal)
+        vec3 pVertex = vec3(
+            plane.x >= 0.0 ? maxB.x : minB.x,
+            plane.y >= 0.0 ? maxB.y : minB.y,
+            plane.z >= 0.0 ? maxB.z : minB.z
+        );
+        // If positive vertex is behind plane, AABB is outside
+        if (dot(plane.xyz, pVertex) + plane.w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 void main() {
     uint idx = gl_GlobalInvocationID.x;
@@ -3056,6 +3116,12 @@ void main() {
 
     vec3 minB = bounds[idx].minBound.xyz;
     vec3 maxB = bounds[idx].maxBound.xyz;
+
+    // GPU frustum culling first (fast rejection)
+    if (!frustumTestAABB(minB, maxB)) {
+        visible[idx] = 0u;
+        return;
+    }
 
     // Project all 8 corners to screen space
     vec4 corners[8];
@@ -3812,6 +3878,7 @@ int main() {
     GLint waterViewLoc = glGetUniformLocation(waterShaderProgram, "view");
     GLint waterProjectionLoc = glGetUniformLocation(waterShaderProgram, "projection");
     GLint waterTimeLoc = glGetUniformLocation(waterShaderProgram, "time");
+    GLint waterChunkOffsetLoc = glGetUniformLocation(waterShaderProgram, "chunkOffset");
     GLint waterLightDirLoc = glGetUniformLocation(waterShaderProgram, "lightDir");
     GLint waterLightColorLoc = glGetUniformLocation(waterShaderProgram, "lightColor");
     GLint waterAmbientColorLoc = glGetUniformLocation(waterShaderProgram, "ambientColor");
@@ -3922,6 +3989,7 @@ int main() {
     GLint occlusionNumMipsLoc = glGetUniformLocation(occlusionCullProgram, "numMipLevels");
     GLint occlusionScreenSizeLoc = glGetUniformLocation(occlusionCullProgram, "screenSize");
     GLint occlusionChunkCountLoc = glGetUniformLocation(occlusionCullProgram, "chunkCount");
+    GLint occlusionFrustumPlanesLoc = glGetUniformLocation(occlusionCullProgram, "frustumPlanes");
 
     // FSR EASU (upscaling) shader uniforms
     GLint fsrEASUInputLoc = glGetUniformLocation(fsrEASUProgram, "inputTexture");
@@ -5298,6 +5366,9 @@ int main() {
                         glUniform2f(occlusionScreenSizeLoc, static_cast<float>(width), static_cast<float>(height));
                         glUniform1i(occlusionChunkCountLoc, subChunkCount);
 
+                        // Pass frustum planes to GPU for combined frustum + occlusion culling
+                        glUniform4fv(occlusionFrustumPlanesLoc, 6, glm::value_ptr(world.frustum.planes[0]));
+
                         // Dispatch
                         int groups = (subChunkCount + 63) / 64;
                         glDispatchCompute(groups, 1, 1);
@@ -5592,7 +5663,7 @@ int main() {
         glUniform1f(waterLodDistanceLoc, waterLodDist);
 
         // Render water with depth writing disabled (prevents water from occluding objects behind it)
-        world.renderWater(camera.position);
+        world.renderWater(camera.position, waterChunkOffsetLoc);
 
         glEndQuery(GL_TIME_ELAPSED);
 

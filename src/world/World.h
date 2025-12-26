@@ -129,8 +129,68 @@ public:
     }
 
     // Check if a sub-chunk is visible (16x16x16 section)
+    // Uses sphere pre-test for fast early rejection
     // subChunkPos.x = chunk X, subChunkPos.y = sub-chunk Y index (0-15), subChunkPos.z = chunk Z
     bool isSubChunkVisible(const glm::ivec3& subChunkPos) const {
+        // Sphere pre-test for fast rejection (cheaper than full AABB)
+        glm::vec3 center(
+            (subChunkPos.x + 0.5f) * CHUNK_SIZE_X,
+            (subChunkPos.y + 0.5f) * SUB_CHUNK_HEIGHT,
+            (subChunkPos.z + 0.5f) * CHUNK_SIZE_Z
+        );
+        constexpr float SUBCHUNK_SPHERE_RADIUS = 13.86f;  // sqrt(8^2 + 8^2 + 8^2)
+        
+        int sphereResult = testSphere(center, SUBCHUNK_SPHERE_RADIUS);
+        if (sphereResult == -1) return false;  // Definitely outside
+        if (sphereResult == 1) return true;    // Definitely inside
+        
+        // Sphere intersects - do precise AABB test
+        glm::vec3 min(
+            subChunkPos.x * CHUNK_SIZE_X,
+            subChunkPos.y * SUB_CHUNK_HEIGHT,
+            subChunkPos.z * CHUNK_SIZE_Z
+        );
+        glm::vec3 max(
+            (subChunkPos.x + 1) * CHUNK_SIZE_X,
+            (subChunkPos.y + 1) * SUB_CHUNK_HEIGHT,
+            (subChunkPos.z + 1) * CHUNK_SIZE_Z
+        );
+        return isBoxVisible(min, max);
+    }
+
+    // Fast sphere visibility test - use as pre-filter before AABB test
+    // Returns: -1 = definitely outside, 0 = intersecting, 1 = definitely inside
+    int testSphere(const glm::vec3& center, float radius) const {
+        int result = 1;  // Assume inside
+        for (const auto& plane : planes) {
+            float distance = glm::dot(glm::vec3(plane), center) + plane.w;
+            if (distance < -radius) {
+                return -1;  // Completely outside this plane
+            }
+            if (distance < radius) {
+                result = 0;  // Intersecting (might be partially visible)
+            }
+        }
+        return result;
+    }
+
+    // Optimized sub-chunk visibility with sphere pre-test
+    // Uses bounding sphere first (cheaper) then AABB if needed
+    bool isSubChunkVisibleFast(const glm::ivec3& subChunkPos) const {
+        // Calculate sub-chunk center and bounding sphere radius
+        glm::vec3 center(
+            (subChunkPos.x + 0.5f) * CHUNK_SIZE_X,
+            (subChunkPos.y + 0.5f) * SUB_CHUNK_HEIGHT,
+            (subChunkPos.z + 0.5f) * CHUNK_SIZE_Z
+        );
+        // Radius of bounding sphere for 16x16x16 cube = sqrt(8^2 + 8^2 + 8^2) ≈ 13.86
+        constexpr float SUBCHUNK_SPHERE_RADIUS = 13.86f;
+
+        int sphereResult = testSphere(center, SUBCHUNK_SPHERE_RADIUS);
+        if (sphereResult == -1) return false;  // Definitely outside
+        if (sphereResult == 1) return true;    // Definitely inside
+
+        // Sphere intersects frustum - do precise AABB test
         glm::vec3 min(
             subChunkPos.x * CHUNK_SIZE_X,
             subChunkPos.y * SUB_CHUNK_HEIGHT,
@@ -201,6 +261,13 @@ public:
 
     // Last known player chunk position
     glm::ivec2 lastPlayerChunk{0, 0};
+
+    // Predictive chunk streaming
+    glm::vec3 lastPlayerPos{0.0f, 0.0f, 0.0f};
+    glm::vec3 playerVelocity{0.0f, 0.0f, 0.0f};
+    float velocitySmoothing = 0.85f;  // EMA smoothing for velocity (0.85 = responsive but stable)
+    float predictionTime = 3.0f;      // How far ahead to predict (seconds)
+    bool usePredictiveLoading = true; // Enable/disable predictive chunk streaming
 
     // Enable/disable multithreading
     bool useMultithreading = true;
@@ -545,6 +612,14 @@ public:
     void update(const glm::vec3& playerPos, float deltaTime = 0.0f) {
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
 
+        // Update player velocity for predictive chunk streaming
+        if (usePredictiveLoading && deltaTime > 0.0f) {
+            glm::vec3 instantVelocity = (playerPos - lastPlayerPos) / deltaTime;
+            // Exponential moving average for smooth velocity
+            playerVelocity = glm::mix(instantVelocity, playerVelocity, velocitySmoothing);
+            lastPlayerPos = playerPos;
+        }
+
         // Auto burst mode during initial load for faster startup
         if (!initialLoadComplete) {
             // Calculate expected chunk count
@@ -751,39 +826,88 @@ public:
     // Load chunks around player position
     void loadChunksAroundPlayer(const glm::ivec2& playerChunk) {
         int chunksQueued = 0;
-
-        // Generate chunks in a spiral pattern from player position
-        // This prioritizes closer chunks
-        // OPTIMIZATION: Reduced multiplier from 4 to 2 for smoother frame pacing
         int maxToQueue = burstMode ? 10000 : maxChunksPerFrame * 2;
-        for (int ring = 0; ring <= renderDistance && chunksQueued < maxToQueue; ring++) {
-            for (int dx = -ring; dx <= ring && chunksQueued < maxToQueue; dx++) {
-                for (int dz = -ring; dz <= ring && chunksQueued < maxToQueue; dz++) {
-                    // Only process the outer edge of this ring
-                    if (abs(dx) != ring && abs(dz) != ring) continue;
 
+        // Predictive chunk streaming: prioritize chunks in movement direction
+        if (usePredictiveLoading && !burstMode && glm::length(playerVelocity) > 0.5f) {
+            // Predict future position and convert to chunk coords
+            glm::vec3 predictedPos = lastPlayerPos + playerVelocity * predictionTime;
+            glm::ivec2 predictedChunk = Chunk::worldToChunkPos(predictedPos);
+
+            // Collect chunks that need loading with priority scores
+            struct ChunkToLoad {
+                glm::ivec2 pos;
+                float priority;  // Lower = higher priority
+            };
+            std::vector<ChunkToLoad> chunksToLoad;
+            chunksToLoad.reserve((renderDistance * 2 + 1) * (renderDistance * 2 + 1));
+
+            for (int dx = -renderDistance; dx <= renderDistance; dx++) {
+                for (int dz = -renderDistance; dz <= renderDistance; dz++) {
                     glm::ivec2 chunkPos(playerChunk.x + dx, playerChunk.y + dz);
 
-                    // Check if chunk already exists or is being generated
-                    if (getChunk(chunkPos) == nullptr) {
-                        if (useMultithreading && chunkThreadPool) {
-                            // Queue for async generation
-                            if (!chunkThreadPool->isGenerating(chunkPos)) {
-                                chunkThreadPool->queueChunk(chunkPos);
-                                chunksQueued++;
-                            }
-                        } else {
-                            // Synchronous fallback
-                            Chunk* chunk = createChunk(chunkPos);
-                            terrainGenerator.generateChunk(*chunk);
-                            calculateChunkLighting(*chunk);
-                            chunksQueued++;
+                    if (getChunk(chunkPos) == nullptr &&
+                        (!chunkThreadPool || !chunkThreadPool->isGenerating(chunkPos))) {
+                        // Score: weighted combination of current and predicted distance
+                        float currentDistSq = static_cast<float>(dx * dx + dz * dz);
+                        int pdx = chunkPos.x - predictedChunk.x;
+                        int pdz = chunkPos.y - predictedChunk.y;
+                        float predictedDistSq = static_cast<float>(pdx * pdx + pdz * pdz);
 
-                            // Mark neighboring chunks as dirty
-                            markChunkDirty(glm::ivec2(chunkPos.x - 1, chunkPos.y));
-                            markChunkDirty(glm::ivec2(chunkPos.x + 1, chunkPos.y));
-                            markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y - 1));
-                            markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y + 1));
+                        // Priority: 40% current distance, 60% predicted distance
+                        float priority = currentDistSq * 0.4f + predictedDistSq * 0.6f;
+                        chunksToLoad.push_back({chunkPos, priority});
+                    }
+                }
+            }
+
+            // Sort by priority (ascending)
+            std::sort(chunksToLoad.begin(), chunksToLoad.end(),
+                [](const ChunkToLoad& a, const ChunkToLoad& b) {
+                    return a.priority < b.priority;
+                });
+
+            // Queue highest priority chunks
+            for (const auto& c : chunksToLoad) {
+                if (chunksQueued >= maxToQueue) break;
+                if (useMultithreading && chunkThreadPool) {
+                    chunkThreadPool->queueChunk(c.pos);
+                } else {
+                    Chunk* chunk = createChunk(c.pos);
+                    terrainGenerator.generateChunk(*chunk);
+                    calculateChunkLighting(*chunk);
+                    markChunkDirty(glm::ivec2(c.pos.x - 1, c.pos.y));
+                    markChunkDirty(glm::ivec2(c.pos.x + 1, c.pos.y));
+                    markChunkDirty(glm::ivec2(c.pos.x, c.pos.y - 1));
+                    markChunkDirty(glm::ivec2(c.pos.x, c.pos.y + 1));
+                }
+                chunksQueued++;
+            }
+        } else {
+            // Fallback: spiral pattern from player position (for standing still or initial load)
+            for (int ring = 0; ring <= renderDistance && chunksQueued < maxToQueue; ring++) {
+                for (int dx = -ring; dx <= ring && chunksQueued < maxToQueue; dx++) {
+                    for (int dz = -ring; dz <= ring && chunksQueued < maxToQueue; dz++) {
+                        if (abs(dx) != ring && abs(dz) != ring) continue;
+
+                        glm::ivec2 chunkPos(playerChunk.x + dx, playerChunk.y + dz);
+
+                        if (getChunk(chunkPos) == nullptr) {
+                            if (useMultithreading && chunkThreadPool) {
+                                if (!chunkThreadPool->isGenerating(chunkPos)) {
+                                    chunkThreadPool->queueChunk(chunkPos);
+                                    chunksQueued++;
+                                }
+                            } else {
+                                Chunk* chunk = createChunk(chunkPos);
+                                terrainGenerator.generateChunk(*chunk);
+                                calculateChunkLighting(*chunk);
+                                chunksQueued++;
+                                markChunkDirty(glm::ivec2(chunkPos.x - 1, chunkPos.y));
+                                markChunkDirty(glm::ivec2(chunkPos.x + 1, chunkPos.y));
+                                markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y - 1));
+                                markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y + 1));
+                            }
                         }
                     }
                 }
@@ -982,23 +1106,22 @@ public:
 
     // Calculate LOD level based on squared distance and render distance
     // Returns 0-3 (LOD 0 = full detail, LOD 3 = lowest detail)
-    // Distant Horizons-style: Full detail for most of render distance,
-    // LOD only kicks in at the far edges where fog hides the transition
+    // Tuned for performance: More aggressive LOD transitions where fog hides detail
     int calculateLOD(float distSq) const {
         float maxDistSq = static_cast<float>(renderDistance * renderDistance);
         float ratio = distSq / maxDistSq;
 
-        // Full detail (LOD 0) for 70% of render distance - this is the key!
-        // Players rarely notice detail at the far edges due to fog
-        if (ratio < 0.49f) return 0;   // 0-70% of distance (0.7^2 = 0.49)
+        // Full detail (LOD 0) for 60% of render distance
+        // This is where players spend most of their time looking
+        if (ratio < 0.36f) return 0;   // 0-60% of distance (0.6^2 = 0.36)
 
-        // LOD 1 (2x scale) for 70-85% - subtle reduction, fog is starting
-        if (ratio < 0.7225f) return 1; // 70-85% (0.85^2 = 0.7225)
+        // LOD 1 (2x scale) for 60-75% - subtle reduction, fog starting
+        if (ratio < 0.5625f) return 1; // 60-75% (0.75^2 = 0.5625)
 
-        // LOD 2 (4x scale) for 85-95% - more reduction, heavy fog
-        if (ratio < 0.9025f) return 2; // 85-95% (0.95^2 = 0.9025)
+        // LOD 2 (4x scale) for 75-87% - medium fog, detail hard to see
+        if (ratio < 0.7569f) return 2; // 75-87% (0.87^2 = 0.7569)
 
-        // LOD 3 (8x scale) for 95-100% - furthest chunks, mostly fog
+        // LOD 3 (8x scale) for 87-100% - heavy fog, silhouettes only
         return 3;
     }
 
@@ -1365,19 +1488,20 @@ public:
 
     // Render all water geometry - call this AFTER render() with depth write disabled
     // Sorted back-to-front for proper alpha blending
-    void renderWater(const glm::vec3& playerPos) {
+    void renderWater(const glm::vec3& playerPos, GLint chunkOffsetLoc = -1) {
         // Use sub-chunk water rendering if enabled
         if (useSubChunkCulling) {
-            renderWaterSubChunks(playerPos);
+            renderWaterSubChunks(playerPos, chunkOffsetLoc);
             return;
         }
 
         // Legacy water rendering
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
 
-        // Collect visible water chunks with their distances
+        // Collect visible water chunks with their distances and positions
         struct WaterToDraw {
             ChunkMesh* mesh;
+            glm::ivec2 chunkPos;
             float distSq;
         };
         std::vector<WaterToDraw> waterChunks;
@@ -1400,7 +1524,7 @@ public:
                 }
 
                 float distSq = static_cast<float>(dx * dx + dz * dz);
-                waterChunks.push_back({mesh.get(), distSq});
+                waterChunks.push_back({mesh.get(), pos, distSq});
             }
         }
 
@@ -1415,6 +1539,11 @@ public:
 
         // Render sorted water chunks
         for (const auto& water : waterChunks) {
+            // Set chunk offset uniform for proper world positioning
+            if (chunkOffsetLoc >= 0) {
+                glm::vec3 offset(water.chunkPos.x * CHUNK_SIZE_X, 0.0f, water.chunkPos.y * CHUNK_SIZE_Z);
+                glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(offset));
+            }
             water.mesh->renderWater();
         }
 
@@ -1423,7 +1552,7 @@ public:
     }
 
     // Render water using sub-chunk culling
-    void renderWaterSubChunks(const glm::vec3& playerPos) {
+    void renderWaterSubChunks(const glm::vec3& playerPos, GLint chunkOffsetLoc = -1) {
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
         int playerSubY = static_cast<int>(playerPos.y) / SUB_CHUNK_HEIGHT;
         lastRenderedWaterSubChunks = 0;
@@ -1432,6 +1561,7 @@ public:
         // Collect visible water sub-chunks with their distances
         struct WaterSubChunkToDraw {
             ChunkMesh* mesh;
+            glm::ivec2 chunkPos;  // Need chunk position for offset uniform
             int subChunkY;
             float distSq;
         };
@@ -1478,7 +1608,7 @@ public:
 
                 int dy = subY - playerSubY;
                 float distSq = baseDistSq + static_cast<float>(dy * dy) * 0.25f;
-                waterSubChunks.push_back({mesh.get(), subY, distSq});
+                waterSubChunks.push_back({mesh.get(), pos, subY, distSq});
             }
         }
 
@@ -1490,7 +1620,14 @@ public:
 
         glDepthMask(GL_FALSE);
 
+        glm::ivec2 lastChunkPos(-999999, -999999);  // Track to avoid redundant uniform sets
         for (const auto& water : waterSubChunks) {
+            // Set chunk offset uniform for proper world positioning (only when chunk changes)
+            if (chunkOffsetLoc >= 0 && water.chunkPos != lastChunkPos) {
+                glm::vec3 offset(water.chunkPos.x * CHUNK_SIZE_X, 0.0f, water.chunkPos.y * CHUNK_SIZE_Z);
+                glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(offset));
+                lastChunkPos = water.chunkPos;
+            }
             water.mesh->renderSubChunkWater(water.subChunkY);
             lastRenderedWaterSubChunks++;
         }

@@ -677,18 +677,19 @@ private:
         switch (face) {
             case BGMFace::POS_Y: {
                 int fy = y + 1;
-                ao0 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz+height),
-                              isSolidForAO(getBlock, wx, fy, wz+height+1),
-                              isSolidForAO(getBlock, wx-1, fy, wz+height+1));
-                ao1 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz+height),
-                              isSolidForAO(getBlock, wx+width-1, fy, wz+height+1),
-                              isSolidForAO(getBlock, wx+width, fy, wz+height+1));
-                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz-1),
-                              isSolidForAO(getBlock, wx+width-1, fy, wz-1),
-                              isSolidForAO(getBlock, wx+width, fy, wz-1));
-                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz-1),
+                // Corner 0: back-left, Corner 1: back-right, Corner 2: front-right, Corner 3: front-left
+                ao0 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
                               isSolidForAO(getBlock, wx, fy, wz-1),
                               isSolidForAO(getBlock, wx-1, fy, wz-1));
+                ao1 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz),
+                              isSolidForAO(getBlock, wx+width-1, fy, wz-1),
+                              isSolidForAO(getBlock, wx+width, fy, wz-1));
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz+height),
+                              isSolidForAO(getBlock, wx+width-1, fy, wz+height+1),
+                              isSolidForAO(getBlock, wx+width, fy, wz+height+1));
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz+height),
+                              isSolidForAO(getBlock, wx, fy, wz+height+1),
+                              isSolidForAO(getBlock, wx-1, fy, wz+height+1));
                 break;
             }
             case BGMFace::NEG_Y: {
@@ -813,11 +814,11 @@ inline void expandSingleBucketToVertices(
         uint8_t packedAO = quad.getAO();
 
         // Unpack AO values for each corner (2 bits each, 0-3 range)
-        // Convert to 0-255 range: 0->64, 1->128, 2->192, 3->255
+        // Maps 0-3 to 140-255 range for visible but subtle AO
         std::array<uint8_t, 4> aoValues;
         for (int i = 0; i < 4; i++) {
             int aoVal = (packedAO >> (i * 2)) & 0x3;
-            aoValues[i] = static_cast<uint8_t>(64 + aoVal * 64);  // Maps 0-3 to 64-255
+            aoValues[i] = static_cast<uint8_t>(140 + aoVal * 38);
         }
 
         // Local positions (scaled by 256 for precision)

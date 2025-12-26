@@ -206,10 +206,20 @@ constexpr int SUB_CHUNK_HEIGHT = 16;                       // Height of each sub
 constexpr int SUB_CHUNKS_PER_COLUMN = CHUNK_SIZE_Y / SUB_CHUNK_HEIGHT;  // 256/16 = 16 sub-chunks
 
 // Sub-chunk mesh - contains LOD meshes for a 16x16x16 section
-// Now with face-orientation buckets for 35% better backface culling
+// Uses consolidated VBO with glMultiDrawArrays for batched rendering
 struct SubChunkMesh {
-    // Face-orientation buckets for LOD 0 (one per cardinal direction)
-    // Enables skipping entire face directions based on camera position
+    // Consolidated face bucket storage - single VAO/VBO for all 6 face directions
+    // Uses glMultiDrawArrays to draw all faces in one call (reduces VAO binds by 6x)
+    GLuint consolidatedVAO = 0;
+    GLuint consolidatedVBO = 0;
+    GLsizeiptr consolidatedCapacity = 0;
+
+    // MultiDraw arrays for batched rendering
+    std::array<GLint, FACE_BUCKET_COUNT> faceBucketOffsets = {};   // Vertex offset per face
+    std::array<GLsizei, FACE_BUCKET_COUNT> faceBucketCounts = {};  // Vertex count per face
+    int activeBucketCount = 0;  // Number of non-empty buckets
+
+    // Legacy separate face buckets (kept for compatibility, TODO: remove)
     std::array<GLuint, FACE_BUCKET_COUNT> faceBucketVAOs = {};
     std::array<GLuint, FACE_BUCKET_COUNT> faceBucketVBOs = {};
     std::array<int, FACE_BUCKET_COUNT> faceBucketVertexCounts = {};
@@ -233,7 +243,17 @@ struct SubChunkMesh {
     bool useFaceBuckets = true;  // Use face buckets for LOD 0 (can disable for debugging)
 
     void destroy() {
-        // Clean up face buckets
+        // Clean up consolidated face bucket buffer
+        if (consolidatedVBO != 0) { glDeleteBuffers(1, &consolidatedVBO); consolidatedVBO = 0; }
+        if (consolidatedVAO != 0) { glDeleteVertexArrays(1, &consolidatedVAO); consolidatedVAO = 0; }
+        consolidatedCapacity = 0;
+        activeBucketCount = 0;
+        for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
+            faceBucketOffsets[i] = 0;
+            faceBucketCounts[i] = 0;
+        }
+
+        // Clean up legacy separate face buckets
         for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
             if (faceBucketVBOs[i] != 0) { glDeleteBuffers(1, &faceBucketVBOs[i]); faceBucketVBOs[i] = 0; }
             if (faceBucketVAOs[i] != 0) { glDeleteVertexArrays(1, &faceBucketVAOs[i]); faceBucketVAOs[i] = 0; }
@@ -639,7 +659,7 @@ public:
 
         lodLevel = std::max(0, std::min(lodLevel, LOD_LEVELS - 1));
 
-        // LOD 0: Use face buckets for potential per-direction culling
+        // LOD 0: Use face buckets (original separate VAO approach for debugging)
         if (lodLevel == 0 && sub.useFaceBuckets) {
             bool rendered = false;
             for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
@@ -2487,7 +2507,7 @@ public:
 
     // Upload face-orientation buckets to a specific sub-chunk
     // Each bucket contains faces for one cardinal direction, enabling 35% better backface culling
-    void uploadFaceBucketsToSubChunk(int subChunkY, 
+    void uploadFaceBucketsToSubChunk(int subChunkY,
                                       const std::array<std::vector<PackedChunkVertex>, FACE_BUCKET_COUNT>& faceBuckets) {
         if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
 
@@ -2500,7 +2520,7 @@ public:
 
         for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
             const auto& vertices = faceBuckets[bucketIdx];
-            
+
             if (vertices.empty()) {
                 sub.faceBucketVertexCounts[bucketIdx] = 0;
                 continue;
@@ -2511,8 +2531,8 @@ public:
             GLsizeiptr dataSize = vertices.size() * sizeof(PackedChunkVertex);
 
             // Reuse buffer if data fits
-            if (sub.faceBucketVAOs[bucketIdx] != 0 && 
-                sub.faceBucketVBOs[bucketIdx] != 0 && 
+            if (sub.faceBucketVAOs[bucketIdx] != 0 &&
+                sub.faceBucketVBOs[bucketIdx] != 0 &&
                 dataSize <= sub.faceBucketCapacities[bucketIdx]) {
                 glBindBuffer(GL_ARRAY_BUFFER, sub.faceBucketVBOs[bucketIdx]);
                 glBufferSubData(GL_ARRAY_BUFFER, 0, dataSize, vertices.data());
@@ -2529,7 +2549,7 @@ public:
             }
 
             GLsizeiptr newCapacity = static_cast<GLsizeiptr>(dataSize * 1.5);
-            
+
             glGenBuffers(1, &sub.faceBucketVBOs[bucketIdx]);
             glBindBuffer(GL_ARRAY_BUFFER, sub.faceBucketVBOs[bucketIdx]);
             glBufferData(GL_ARRAY_BUFFER, newCapacity, nullptr, GL_DYNAMIC_DRAW);
@@ -2563,31 +2583,43 @@ public:
     void renderSubChunkFaceBucket(int subChunkY, int bucketIndex) const {
         if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
         if (bucketIndex < 0 || bucketIndex >= FACE_BUCKET_COUNT) return;
-        
-        const auto& sub = subChunks[subChunkY];
-        if (sub.faceBucketVertexCounts[bucketIndex] == 0) return;
-        if (sub.faceBucketVAOs[bucketIndex] == 0) return;
 
-        glBindVertexArray(sub.faceBucketVAOs[bucketIndex]);
-        glDrawArrays(GL_TRIANGLES, 0, sub.faceBucketVertexCounts[bucketIndex]);
+        const auto& sub = subChunks[subChunkY];
+        if (sub.faceBucketCounts[bucketIndex] == 0) return;
+        if (sub.consolidatedVAO == 0) return;
+
+        // Use consolidated VAO with offset for this specific bucket
+        glBindVertexArray(sub.consolidatedVAO);
+        glDrawArrays(GL_TRIANGLES, sub.faceBucketOffsets[bucketIndex], sub.faceBucketCounts[bucketIndex]);
     }
 
     // Render sub-chunk with face-orientation culling based on camera position
     // visibilityMask is a bitmask where bit i is set if face bucket i should be rendered
     void renderSubChunkWithFaceCulling(int subChunkY, uint8_t visibilityMask) const {
         if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
-        
+
         const auto& sub = subChunks[subChunkY];
-        if (sub.isEmpty) return;
+        if (sub.isEmpty || sub.consolidatedVAO == 0) return;
+
+        // Build arrays for visible buckets only
+        GLint visibleOffsets[FACE_BUCKET_COUNT];
+        GLsizei visibleCounts[FACE_BUCKET_COUNT];
+        int visibleCount = 0;
 
         for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
             if ((visibilityMask & (1 << bucketIdx)) == 0) continue;  // Skip culled bucket
-            if (sub.faceBucketVertexCounts[bucketIdx] == 0) continue;
-            if (sub.faceBucketVAOs[bucketIdx] == 0) continue;
+            if (sub.faceBucketCounts[bucketIdx] == 0) continue;
 
-            glBindVertexArray(sub.faceBucketVAOs[bucketIdx]);
-            glDrawArrays(GL_TRIANGLES, 0, sub.faceBucketVertexCounts[bucketIdx]);
+            visibleOffsets[visibleCount] = sub.faceBucketOffsets[bucketIdx];
+            visibleCounts[visibleCount] = sub.faceBucketCounts[bucketIdx];
+            visibleCount++;
         }
+
+        if (visibleCount == 0) return;
+
+        // Single VAO bind + glMultiDrawArrays for all visible buckets
+        glBindVertexArray(sub.consolidatedVAO);
+        glMultiDrawArrays(GL_TRIANGLES, visibleOffsets, visibleCounts, visibleCount);
     }
 
     // Upload water geometry to a specific sub-chunk
