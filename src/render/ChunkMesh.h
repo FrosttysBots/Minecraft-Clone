@@ -9,6 +9,8 @@
 #include <array>
 #include <functional>
 #include <cstring>
+#include <cfloat>
+#include <cmath>
 
 // Face mask entry for greedy meshing
 struct FaceMask {
@@ -54,6 +56,56 @@ struct ChunkVertex {
     float lightLevel;      // Block light level (0-1, from emissive blocks)
     glm::vec2 texSlotBase; // Base UV of texture slot in atlas (for greedy meshing tiling)
 };
+
+// ============================================================
+// MESH SHADER STRUCTURES (GL_NV_mesh_shader)
+// ============================================================
+
+// Meshlet configuration - NVIDIA recommends max 64 vertices, 126 triangles
+constexpr int MESHLET_MAX_VERTICES = 64;
+constexpr int MESHLET_MAX_TRIANGLES = 126;
+constexpr int MESHLET_MAX_INDICES = MESHLET_MAX_TRIANGLES * 3;
+
+// GPU-side meshlet descriptor (matches mesh shader layout)
+// Packed for efficient GPU access
+struct alignas(16) MeshletDescriptor {
+    uint32_t vertexOffset;      // Offset into vertex buffer
+    uint32_t vertexCount;       // Number of vertices in this meshlet
+    uint32_t triangleOffset;    // Offset into index buffer (in triangles)
+    uint32_t triangleCount;     // Number of triangles
+
+    // Bounding sphere for frustum culling (in local chunk coordinates)
+    float centerX, centerY, centerZ;  // Center of bounding sphere
+    float radius;                      // Radius of bounding sphere
+};
+
+// Meshlet data for a sub-chunk (used by mesh shaders)
+struct MeshletData {
+    std::vector<MeshletDescriptor> meshlets;  // List of meshlet descriptors
+    std::vector<uint32_t> indices;            // Local indices (relative to meshlet vertex offset)
+
+    // GPU buffer handles (uploaded separately for mesh shader usage)
+    GLuint meshletSSBO = 0;   // SSBO for meshlet descriptors
+    GLuint indexSSBO = 0;     // SSBO for meshlet indices
+
+    void destroy() {
+        if (meshletSSBO != 0) { glDeleteBuffers(1, &meshletSSBO); meshletSSBO = 0; }
+        if (indexSSBO != 0) { glDeleteBuffers(1, &indexSSBO); indexSSBO = 0; }
+        meshlets.clear();
+        indices.clear();
+    }
+
+    bool hasMeshlets() const {
+        return !meshlets.empty() && meshletSSBO != 0;
+    }
+
+    size_t getMeshletCount() const {
+        return meshlets.size();
+    }
+};
+
+// Global flag to enable meshlet generation (set from main based on GPU support)
+inline bool g_generateMeshlets = false;
 
 // Normal lookup table (used by shader to decode normal index)
 // 0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z
@@ -106,14 +158,25 @@ struct LODMesh {
         capacity = 0;
     }
 
-    // Wait for GPU to finish using this buffer (call before writing)
+    // Check if GPU is done with this buffer (non-blocking)
+    // Returns true if GPU is ready and fence has been cleared
+    bool isGPUReady() {
+        if (fence == nullptr) return true;
+
+        GLenum result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+        if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
+            glDeleteSync(fence);
+            fence = nullptr;
+            return true;
+        }
+        return false;  // GPU still using buffer
+    }
+
+    // Wait for GPU to finish using this buffer (blocking - use sparingly!)
     void waitForGPU() {
         if (fence != nullptr) {
-            GLenum result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
-            if (result == GL_TIMEOUT_EXPIRED || result == GL_WAIT_FAILED) {
-                // GPU still using buffer - wait with timeout
-                glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000); // 100ms
-            }
+            // Wait up to 100ms (blocking)
+            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);
             glDeleteSync(fence);
             fence = nullptr;
         }
@@ -146,6 +209,10 @@ struct SubChunkMesh {
     int waterVertexCount = 0;
     GLsizeiptr waterVboCapacity = 0;
 
+    // Mesh shader data (for GL_NV_mesh_shader rendering path)
+    MeshletData meshletData;
+    GLuint vertexSSBO = 0;  // SSBO for vertex data (mesh shaders read from SSBO, not VBO)
+
     int subChunkY = 0;     // Y index (0-15)
     bool isEmpty = true;   // Skip rendering if no geometry
     bool hasWater = false; // Quick check for water rendering pass
@@ -158,6 +225,9 @@ struct SubChunkMesh {
         if (waterVAO != 0) { glDeleteVertexArrays(1, &waterVAO); waterVAO = 0; }
         waterVertexCount = 0;
         waterVboCapacity = 0;
+        // Clean up mesh shader resources
+        meshletData.destroy();
+        if (vertexSSBO != 0) { glDeleteBuffers(1, &vertexSSBO); vertexSSBO = 0; }
         isEmpty = true;
         hasWater = false;
     }
@@ -466,6 +536,11 @@ public:
             // Upload to this sub-chunk
             uploadToSubChunk(subY, solidVertices, 0);
             uploadWaterToSubChunk(subY, waterVertices);
+
+            // Generate meshlets for mesh shader rendering (if enabled)
+            if (g_generateMeshlets && !solidVertices.empty()) {
+                generateMeshlets(subY, solidVertices);
+            }
 
             // Generate LODs for this sub-chunk
             generateSubChunkLODs(subY, chunk, yStart, yEnd, getSafeBlock);
@@ -856,8 +931,8 @@ private:
 
     // Generate a mesh at a specific LOD level
     // Scale factor: LOD_SCALES[lodLevel] (1, 2, 4, or 8)
-    void generateLODMesh(const Chunk& chunk, int lodLevel, const BlockGetter& getWorldBlock,
-                         const BlockGetter& getSafeBlock, const LightGetter& getLightLevel) {
+    void generateLODMesh(const Chunk& chunk, int lodLevel, const BlockGetter& /*getWorldBlock*/,
+                         const BlockGetter& getSafeBlock, const LightGetter& /*getLightLevel*/) {
         if (lodLevel <= 0 || lodLevel >= LOD_LEVELS) return;
 
         int scale = LOD_SCALES[lodLevel];
@@ -905,6 +980,7 @@ private:
                     // World coordinates for neighbor checks
                     int wx = baseX + lodX;
                     int wz = baseZ + lodZ;
+                (void)wx; (void)wz; // Suppress warnings
 
                     // Check each face - for LOD, we use scaled block size
                     // TOP face (+Y)
@@ -1371,9 +1447,9 @@ private:
     }
 
     // Add a merged quad for greedy meshing (produces packed vertices)
-    void addGreedyQuad(std::vector<PackedChunkVertex>& vertices, const BlockGetter& getWorldBlock,
-                       const LightGetter& getLightLevel, int baseX, int baseZ,
-                       const glm::vec3& chunkWorldPos, BlockFace face, int textureSlot,
+    void addGreedyQuad(std::vector<PackedChunkVertex>& vertices, const BlockGetter& /*getWorldBlock*/,
+                       const LightGetter& /*getLightLevel*/, int /*baseX*/, int /*baseZ*/,
+                       const glm::vec3& /*chunkWorldPos*/, BlockFace face, int textureSlot,
                        int x, int y, int z, int width, int height) {
 
         // Normal index for packed format
@@ -1573,6 +1649,7 @@ private:
         // Check water neighbors for smooth height interpolation
         bool waterAbove = (by + 1 < CHUNK_SIZE_Y) && (chunk.getBlock(bx, by + 1, bz) == BlockType::WATER);
         bool waterBelow = (by > 0) && (chunk.getBlock(bx, by - 1, bz) == BlockType::WATER);
+                (void)waterBelow; // May be used in future for water column optimization
 
         // If water above, we're submerged - use full height
         if (waterAbove) {
@@ -2075,13 +2152,15 @@ private:
         GLsizeiptr dataSize = vertices.size() * sizeof(PackedChunkVertex);
 
         // ============================================================
-        // PERSISTENT MAPPED BUFFER PATH - avoids driver stalls
+        // PERSISTENT MAPPED BUFFER PATH - non-blocking
         // ============================================================
         if (g_usePersistentMapping && lod.mappedPtr != nullptr && dataSize <= lod.capacity) {
-            // Fast path: direct memcpy to persistent mapped memory
-            lod.waitForGPU();  // Ensure GPU is done with previous data
+            // Non-blocking check - if GPU isn't ready, wait (can't orphan glBufferStorage)
+            if (!lod.isGPUReady()) {
+                lod.waitForGPU();
+            }
             std::memcpy(lod.mappedPtr, vertices.data(), dataSize);
-            lod.signalCPUDone();  // Signal we're done writing
+            lod.signalCPUDone();
             return;
         }
 
@@ -2092,7 +2171,7 @@ private:
 
         // Clean up old persistent mapping if exists
         if (lod.mappedPtr != nullptr && lod.VBO != 0) {
-            lod.waitForGPU();
+            lod.waitForGPU();  // Must wait when unmapping
             glBindBuffer(GL_ARRAY_BUFFER, lod.VBO);
             glUnmapBuffer(GL_ARRAY_BUFFER);
             glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -2268,10 +2347,16 @@ public:
         GLsizeiptr dataSize = vertices.size() * sizeof(PackedChunkVertex);
 
         // ============================================================
-        // PERSISTENT MAPPED BUFFER PATH
+        // PERSISTENT MAPPED BUFFER PATH (non-blocking)
         // ============================================================
         if (g_usePersistentMapping && lod.mappedPtr != nullptr && dataSize <= lod.capacity) {
-            lod.waitForGPU();
+            // Non-blocking check - if GPU isn't ready, just wait (can't orphan glBufferStorage)
+            // The isGPUReady() call is fast and usually succeeds
+            if (!lod.isGPUReady()) {
+                // GPU still using buffer - wait briefly for it to finish
+                // This is rare since we're usually 2-3 frames ahead
+                lod.waitForGPU();
+            }
             std::memcpy(lod.mappedPtr, vertices.data(), dataSize);
             lod.signalCPUDone();
             return;
@@ -2281,6 +2366,7 @@ public:
         // BUFFER REALLOCATION NEEDED
         // ============================================================
         if (lod.mappedPtr != nullptr && lod.VBO != 0) {
+            // Must wait here because we're unmapping the buffer
             lod.waitForGPU();
             glBindBuffer(GL_ARRAY_BUFFER, lod.VBO);
             glUnmapBuffer(GL_ARRAY_BUFFER);
@@ -2413,6 +2499,108 @@ public:
 
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
+    }
+
+    // ============================================================
+    // MESH SHADER - Meshlet Generation
+    // ============================================================
+
+    // Generate meshlets from vertex data for mesh shader rendering
+    // Divides vertices into groups of up to MESHLET_MAX_VERTICES vertices
+    void generateMeshlets(int subChunkY, const std::vector<PackedChunkVertex>& vertices) {
+        if (subChunkY < 0 || subChunkY >= SUB_CHUNKS_PER_COLUMN) return;
+        if (vertices.empty()) return;
+
+        SubChunkMesh& sub = subChunks[subChunkY];
+        MeshletData& meshlets = sub.meshletData;
+
+        // Clean up existing meshlet data
+        meshlets.destroy();
+        if (sub.vertexSSBO != 0) {
+            glDeleteBuffers(1, &sub.vertexSSBO);
+            sub.vertexSSBO = 0;
+        }
+
+        // Create meshlets - each holds up to MESHLET_MAX_VERTICES vertices
+        // Since we use triangle lists (non-indexed), every 3 vertices = 1 triangle
+        size_t vertexCount = vertices.size();
+        size_t triangleCount = vertexCount / 3;
+
+        // Calculate number of meshlets needed
+        // For non-indexed geometry: MESHLET_MAX_VERTICES vertices = MESHLET_MAX_VERTICES/3 triangles
+        size_t maxTrianglesPerMeshlet = std::min((size_t)MESHLET_MAX_TRIANGLES, (size_t)MESHLET_MAX_VERTICES / 3);
+        size_t meshletCount = (triangleCount + maxTrianglesPerMeshlet - 1) / maxTrianglesPerMeshlet;
+
+        meshlets.meshlets.reserve(meshletCount);
+
+        size_t currentVertex = 0;
+        while (currentVertex < vertexCount) {
+            MeshletDescriptor desc = {};
+
+            // Calculate vertices for this meshlet (must be multiple of 3 for triangles)
+            size_t remainingVertices = vertexCount - currentVertex;
+            size_t meshletVertices = std::min(remainingVertices, (size_t)MESHLET_MAX_VERTICES);
+            meshletVertices = (meshletVertices / 3) * 3;  // Round down to triangle boundary
+
+            if (meshletVertices == 0) break;
+
+            desc.vertexOffset = static_cast<uint32_t>(currentVertex);
+            desc.vertexCount = static_cast<uint32_t>(meshletVertices);
+            desc.triangleOffset = static_cast<uint32_t>(currentVertex / 3);
+            desc.triangleCount = static_cast<uint32_t>(meshletVertices / 3);
+
+            // Calculate bounding sphere for frustum culling
+            // Position is stored as int16 with 8.8 fixed point (multiply by 1/256 for world coords)
+            float minX = FLT_MAX, minY = FLT_MAX, minZ = FLT_MAX;
+            float maxX = -FLT_MAX, maxY = -FLT_MAX, maxZ = -FLT_MAX;
+
+            for (size_t i = 0; i < meshletVertices; i++) {
+                const PackedChunkVertex& v = vertices[currentVertex + i];
+                float x = static_cast<float>(v.x) / 256.0f;
+                float y = static_cast<float>(v.y) / 256.0f;
+                float z = static_cast<float>(v.z) / 256.0f;
+                minX = std::min(minX, x);
+                minY = std::min(minY, y);
+                minZ = std::min(minZ, z);
+                maxX = std::max(maxX, x);
+                maxY = std::max(maxY, y);
+                maxZ = std::max(maxZ, z);
+            }
+
+            // Bounding sphere center and radius
+            desc.centerX = (minX + maxX) * 0.5f;
+            desc.centerY = (minY + maxY) * 0.5f;
+            desc.centerZ = (minZ + maxZ) * 0.5f;
+
+            float dx = maxX - minX;
+            float dy = maxY - minY;
+            float dz = maxZ - minZ;
+            desc.radius = sqrtf(dx*dx + dy*dy + dz*dz) * 0.5f;
+
+            meshlets.meshlets.push_back(desc);
+            currentVertex += meshletVertices;
+        }
+
+        if (meshlets.meshlets.empty()) return;
+
+        // Upload vertex data to SSBO (mesh shaders read from SSBO, not VBO)
+        glGenBuffers(1, &sub.vertexSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, sub.vertexSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     vertices.size() * sizeof(PackedChunkVertex),
+                     vertices.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        // Upload meshlet descriptors to SSBO
+        glGenBuffers(1, &meshlets.meshletSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, meshlets.meshletSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     meshlets.meshlets.size() * sizeof(MeshletDescriptor),
+                     meshlets.meshlets.data(), GL_STATIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        // No index SSBO needed for non-indexed triangle lists
+        // Mesh shader will directly output triangles from vertex data
     }
 
     // Public wrapper for water block generation (used by World for async mesh completion)

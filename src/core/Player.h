@@ -166,7 +166,7 @@ private:
 
     void updateSwimming(float deltaTime, World& world,
                         bool forward, bool backward, bool left, bool right,
-                        bool swimUp, bool swimDown) {
+                        bool swimUp, bool /*swimDown*/) {
 
         // Get movement direction (horizontal only, like Minecraft)
         glm::vec3 moveDir(0.0f);

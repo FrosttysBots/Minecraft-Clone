@@ -103,6 +103,7 @@ private:
 
     // Control
     std::atomic<bool> running{true};
+    std::atomic<bool> fastLoadMode{true};  // Skip extra LOD levels during initial load
     int worldSeed;
     int numWorkerThreads = 0;
 
@@ -135,6 +136,10 @@ public:
     }
 
     int getThreadCount() const { return numWorkerThreads; }
+
+    // Disable fast load mode (enables full LOD generation)
+    void setFastLoadMode(bool enabled) { fastLoadMode = enabled; }
+    bool isFastLoadMode() const { return fastLoadMode; }
 
     ~ChunkThreadPool() {
         shutdown();
@@ -254,6 +259,19 @@ public:
         return meshCompletedQueue.size();
     }
 
+    // Check if any meshes are pending or in progress
+    bool hasPendingMeshes() {
+        {
+            std::lock_guard<std::mutex> lock(meshPendingMutex);
+            if (!meshPendingQueue.empty()) return true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(meshInProgressMutex);
+            if (!meshInProgress.empty()) return true;
+        }
+        return false;
+    }
+
 private:
     void chunkWorkerLoop(int threadIndex) {
         TerrainGenerator* generator = generators[threadIndex].get();
@@ -305,7 +323,7 @@ private:
     }
 
     // Calculate lighting within a chunk (same logic as World but standalone)
-    void calculateChunkLighting(Chunk& chunk, TerrainGenerator& gen) {
+    void calculateChunkLighting(Chunk& chunk, TerrainGenerator& /*gen*/) {
         for (int y = 0; y < CHUNK_SIZE_Y; y++) {
             for (int z = 0; z < CHUNK_SIZE_Z; z++) {
                 for (int x = 0; x < CHUNK_SIZE_X; x++) {
@@ -423,8 +441,8 @@ private:
 
     // Generate mesh vertex data for all sub-chunks (CPU-only, no GPU upload)
     void generateMeshData(MeshResult& result, const Chunk& chunk,
-                         const std::function<BlockType(int, int, int)>& getWorldBlock,
-                         const std::function<BlockType(int, int, int)>& getWaterBlock,
+                         const std::function<BlockType(int, int, int)>& /*getWorldBlock*/,
+                         const std::function<BlockType(int, int, int)>& /*getWaterBlock*/,
                          const std::function<BlockType(int, int, int)>& getSafeBlock,
                          const std::function<uint8_t(int, int, int)>& getLightLevel) {
 
@@ -462,12 +480,11 @@ private:
                                            static_cast<BlockFace>(face), yStart, yEnd);
             }
 
-            // Note: Water/lava generation is done synchronously on main thread
-            // for now due to complexity of water level calculations and texture atlas lookups.
-            // The async mesh generation handles solid geometry only.
+            // Generate water/lava geometry on worker thread
+            generateWaterForRange(waterVertices, chunk, baseX, baseZ, getSafeBlock, yStart, yEnd);
 
             subData.isEmpty = vertices.empty();
-            subData.hasWater = false;  // Water handled by main thread
+            subData.hasWater = !waterVertices.empty();
 
             if (!vertices.empty()) {
                 subData.lodVertices[0] = std::move(vertices);
@@ -477,10 +494,12 @@ private:
                 subData.waterVertices = std::move(waterVertices);
             }
 
-            // Generate lower LOD levels for sub-chunk
-            for (int lodLevel = 1; lodLevel < LOD_LEVELS; lodLevel++) {
-                generateLODForRange(subData.lodVertices[lodLevel], chunk, baseX, baseZ,
-                                   lodLevel, yStart, yEnd);
+            // Generate lower LOD levels for sub-chunk (skip in fast load mode)
+            if (!fastLoadMode) {
+                for (int lodLevel = 1; lodLevel < LOD_LEVELS; lodLevel++) {
+                    generateLODForRange(subData.lodVertices[lodLevel], chunk, baseX, baseZ,
+                                       lodLevel, yStart, yEnd);
+                }
             }
         }
     }
@@ -493,7 +512,7 @@ private:
                                      BlockFace face, int yStart, int yEnd) {
 
         // Direction info for each face
-        int normalIndex = static_cast<int>(face);
+        int normalIndex = static_cast<int>(face); (void)normalIndex;
         int dx = 0, dy = 0, dz = 0;
 
         switch (face) {
@@ -881,5 +900,159 @@ private:
         vertices.push_back(makeVertex(2));
         vertices.push_back(makeVertex(3));
         vertices.push_back(makeVertex(0));
+    }
+
+    // ================================================================
+    // WATER GENERATION - Moved to worker threads for better performance
+    // ================================================================
+
+    // Generate water vertices for a Y range
+    void generateWaterForRange(std::vector<ChunkVertex>& vertices,
+                               const Chunk& chunk, int baseX, int baseZ,
+                               const std::function<BlockType(int, int, int)>& getBlock,
+                               int yStart, int yEnd) {
+
+        // Get water texture slot
+        int waterTextureSlot = getBlockTextures(BlockType::WATER).faceSlots[0];
+        glm::vec4 uv = TextureAtlas::getUV(waterTextureSlot);
+        glm::vec2 texSlotBase(uv.x, uv.y);
+
+        float ao = 1.0f;
+        float light = 0.0f;
+
+        // Clamp to chunk bounds
+        int effectiveMinY = std::max(yStart, static_cast<int>(chunk.chunkMinY));
+        int effectiveMaxY = std::min(yEnd, static_cast<int>(chunk.chunkMaxY));
+
+        for (int y = effectiveMinY; y <= effectiveMaxY; y++) {
+            for (int z = 0; z < CHUNK_SIZE_Z; z++) {
+                for (int x = 0; x < CHUNK_SIZE_X; x++) {
+                    BlockType block = chunk.getBlock(x, y, z);
+                    if (block != BlockType::WATER && block != BlockType::LAVA) continue;
+
+                    // Use lava texture if lava
+                    if (block == BlockType::LAVA) {
+                        int lavaSlot = getBlockTextures(BlockType::LAVA).faceSlots[0];
+                        glm::vec4 lavaUv = TextureAtlas::getUV(lavaSlot);
+                        texSlotBase = glm::vec2(lavaUv.x, lavaUv.y);
+                    }
+
+                    int wx = baseX + x;
+                    int wz = baseZ + z;
+                    glm::vec3 pos(x, y, z);
+
+                    // Check if water above (submerged)
+                    bool waterAbove = (y + 1 < CHUNK_SIZE_Y) &&
+                                     (chunk.getBlock(x, y + 1, z) == BlockType::WATER ||
+                                      chunk.getBlock(x, y + 1, z) == BlockType::LAVA);
+
+                    // Lambda to check if side should be rendered
+                    auto shouldRenderSide = [&](int nx, int nz) -> bool {
+                        BlockType neighbor = getBlock(nx, y, nz);
+                        return neighbor != BlockType::WATER && neighbor != BlockType::LAVA;
+                    };
+
+                    glm::vec3 normal;
+
+                    if (waterAbove) {
+                        // Submerged - only render sides, full height
+                        float topY = 1.0f;
+
+                        // Front (+Z)
+                        if (shouldRenderSide(wx, wz + 1)) {
+                            normal = glm::vec3(0, 0, 1);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        0,0,1, 1,0,1, 1,topY,1, 0,topY,1);
+                        }
+                        // Back (-Z)
+                        if (shouldRenderSide(wx, wz - 1)) {
+                            normal = glm::vec3(0, 0, -1);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        1,0,0, 0,0,0, 0,topY,0, 1,topY,0);
+                        }
+                        // Left (-X)
+                        if (shouldRenderSide(wx - 1, wz)) {
+                            normal = glm::vec3(-1, 0, 0);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        0,0,0, 0,0,1, 0,topY,1, 0,topY,0);
+                        }
+                        // Right (+X)
+                        if (shouldRenderSide(wx + 1, wz)) {
+                            normal = glm::vec3(1, 0, 0);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        1,0,1, 1,0,0, 1,topY,0, 1,topY,1);
+                        }
+                    } else {
+                        // Surface water - render top with slight lowering + sides
+                        float h = 0.875f;  // Slightly below full block
+
+                        // Top face
+                        normal = glm::vec3(0, 1, 0);
+                        addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                    0,h,1, 1,h,1, 1,h,0, 0,h,0);
+
+                        // Side faces
+                        if (shouldRenderSide(wx, wz + 1)) {
+                            normal = glm::vec3(0, 0, 1);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        0,0,1, 1,0,1, 1,h,1, 0,h,1);
+                        }
+                        if (shouldRenderSide(wx, wz - 1)) {
+                            normal = glm::vec3(0, 0, -1);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        1,0,0, 0,0,0, 0,h,0, 1,h,0);
+                        }
+                        if (shouldRenderSide(wx - 1, wz)) {
+                            normal = glm::vec3(-1, 0, 0);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        0,0,0, 0,0,1, 0,h,1, 0,h,0);
+                        }
+                        if (shouldRenderSide(wx + 1, wz)) {
+                            normal = glm::vec3(1, 0, 0);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        1,0,1, 1,0,0, 1,h,0, 1,h,1);
+                        }
+
+                        // Bottom face (if no solid block below)
+                        BlockType below = (y > 0) ? chunk.getBlock(x, y - 1, z) : BlockType::STONE;
+                        if (!isBlockSolid(below) && below != BlockType::WATER && below != BlockType::LAVA) {
+                            normal = glm::vec3(0, -1, 0);
+                            addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
+                                        0,0,0, 1,0,0, 1,0,1, 0,0,1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Helper to add a water quad with 4 corner positions (x,y,z offsets from pos)
+    void addWaterQuad(std::vector<ChunkVertex>& vertices,
+                      const glm::vec3& pos, const glm::vec3& normal,
+                      float ao, float light, const glm::vec2& texSlotBase,
+                      float x0, float y0, float z0,
+                      float x1, float y1, float z1,
+                      float x2, float y2, float z2,
+                      float x3, float y3, float z3) {
+        glm::vec3 corners[4] = {
+            pos + glm::vec3(x0, y0, z0),
+            pos + glm::vec3(x1, y1, z1),
+            pos + glm::vec3(x2, y2, z2),
+            pos + glm::vec3(x3, y3, z3)
+        };
+
+        // UVs
+        glm::vec2 uvs[4] = {
+            glm::vec2(0.0f, 1.0f), glm::vec2(1.0f, 1.0f),
+            glm::vec2(1.0f, 0.0f), glm::vec2(0.0f, 0.0f)
+        };
+
+        // Two triangles
+        vertices.push_back({ corners[0], uvs[0], normal, ao, light, texSlotBase });
+        vertices.push_back({ corners[1], uvs[1], normal, ao, light, texSlotBase });
+        vertices.push_back({ corners[2], uvs[2], normal, ao, light, texSlotBase });
+        vertices.push_back({ corners[2], uvs[2], normal, ao, light, texSlotBase });
+        vertices.push_back({ corners[3], uvs[3], normal, ao, light, texSlotBase });
+        vertices.push_back({ corners[0], uvs[0], normal, ao, light, texSlotBase });
     }
 };

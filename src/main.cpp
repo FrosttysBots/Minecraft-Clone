@@ -38,6 +38,11 @@ int WINDOW_WIDTH = 1280;
 int WINDOW_HEIGHT = 720;
 const char* WINDOW_TITLE = "Voxel Engine";
 
+// Render resolution (for FSR upscaling)
+int RENDER_WIDTH = 1280;
+int RENDER_HEIGHT = 720;
+float g_renderScale = 1.0f;  // 1.0 = native, 0.5 = 50% resolution
+
 // Global state
 Camera camera(glm::vec3(8.0f, 100.0f, 8.0f));
 Player* player = nullptr;  // Will be initialized after world generation
@@ -120,6 +125,42 @@ GLuint gPosition = 0;    // RGB16F: world position, A: vertex AO
 GLuint gNormal = 0;      // RGB16F: world normal, A: light level
 GLuint gAlbedo = 0;      // RGBA8: albedo RGB, emission flag A
 GLuint gDepth = 0;       // DEPTH32F: linear depth
+
+// FSR (FidelityFX Super Resolution) upscaling
+GLuint sceneFBO = 0;           // Render target at render resolution (before FSR)
+GLuint sceneColorTexture = 0;  // RGB16F: scene color at render resolution
+GLuint sceneDepthRBO = 0;      // Depth renderbuffer for scene FBO
+bool g_enableFSR = false;      // FSR enable toggle (runtime)
+
+// Mesh shader support (GL_NV_mesh_shader)
+bool g_meshShadersAvailable = false;   // Hardware support detected
+bool g_enableMeshShaders = false;      // Runtime toggle
+GLuint meshShaderProgram = 0;          // Mesh shader program (task + mesh + fragment)
+GLuint meshShaderVertexSSBO = 0;       // SSBO for vertex data
+GLuint meshShaderMeshletSSBO = 0;      // SSBO for meshlet descriptors
+GLuint meshShaderDataUBO = 0;          // UBO for mesh shader uniforms
+GLuint frustumPlanesUBO = 0;           // UBO for frustum planes (culling)
+
+// Sodium-style batched rendering
+bool g_enableBatchedRendering = true;  // Column-batched rendering (reduces uniform updates)
+
+// GL_NV_mesh_shader extension constants (not in glad by default)
+#ifndef GL_TASK_SHADER_NV
+#define GL_TASK_SHADER_NV 0x955A
+#endif
+#ifndef GL_MESH_SHADER_NV
+#define GL_MESH_SHADER_NV 0x9559
+#endif
+
+// Function pointer for glDrawMeshTasksNV (use GLAD's if available, otherwise define our own)
+#ifndef GLAD_GL_NV_mesh_shader
+typedef void (APIENTRY* PFNGLDRAWMESHTASKSNVPROC_LOCAL)(GLuint first, GLuint count);
+PFNGLDRAWMESHTASKSNVPROC_LOCAL pfn_glDrawMeshTasksNV = nullptr;
+#define glDrawMeshTasksNV_ptr pfn_glDrawMeshTasksNV
+#else
+// GLAD has mesh shader support, use its function pointer
+#define glDrawMeshTasksNV_ptr glad_glDrawMeshTasksNV
+#endif
 
 // Cascade shadow maps (3 cascades)
 const int NUM_CASCADES = 3;
@@ -551,6 +592,56 @@ InputState processInput(GLFWwindow* window) {
         }
     } else {
         perfStatsTogglePressed = false;
+    }
+
+    // FSR toggle (F12) - Note: Only affects runtime, FBOs are created at startup
+    static bool fsrTogglePressed = false;
+    if (glfwGetKey(window, GLFW_KEY_F12) == GLFW_PRESS) {
+        if (!fsrTogglePressed) {
+            // FSR can only be toggled if scene FBO was created at startup
+            if (sceneFBO != 0) {
+                g_enableFSR = !g_enableFSR;
+                std::cout << "FSR Upscaling: " << (g_enableFSR ? "ON" : "OFF");
+                if (g_enableFSR) {
+                    std::cout << " (render " << RENDER_WIDTH << "x" << RENDER_HEIGHT << " -> " << WINDOW_WIDTH << "x" << WINDOW_HEIGHT << ")";
+                }
+                std::cout << std::endl;
+            } else {
+                std::cout << "FSR: Not available (enable in settings.cfg and restart)" << std::endl;
+            }
+            fsrTogglePressed = true;
+        }
+    } else {
+        fsrTogglePressed = false;
+    }
+
+    // Mesh Shader toggle (M key) - NVIDIA Turing+ only
+    static bool meshShaderTogglePressed = false;
+    if (glfwGetKey(window, GLFW_KEY_M) == GLFW_PRESS) {
+        if (!meshShaderTogglePressed) {
+            if (g_meshShadersAvailable && meshShaderProgram != 0) {
+                g_enableMeshShaders = !g_enableMeshShaders;
+                g_generateMeshlets = g_enableMeshShaders;
+                std::cout << "Mesh Shaders: " << (g_enableMeshShaders ? "ON" : "OFF") << std::endl;
+            } else {
+                std::cout << "Mesh Shaders: Not available (requires NVIDIA Turing+ GPU)" << std::endl;
+            }
+            meshShaderTogglePressed = true;
+        }
+    } else {
+        meshShaderTogglePressed = false;
+    }
+
+    // Batched Rendering toggle (B key) - Sodium-style column batching
+    static bool batchedRenderingTogglePressed = false;
+    if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
+        if (!batchedRenderingTogglePressed) {
+            g_enableBatchedRendering = !g_enableBatchedRendering;
+            std::cout << "Batched Rendering: " << (g_enableBatchedRendering ? "ON" : "OFF") << std::endl;
+            batchedRenderingTogglePressed = true;
+        }
+    } else {
+        batchedRenderingTogglePressed = false;
     }
 
     // Number keys for hotbar
@@ -2168,10 +2259,9 @@ float getFogDensity(float y) {
 }
 
 float calculateCascadeShadow(vec3 fragPos, vec3 normal, float viewDepth) {
-    // Temporarily disabled - return no shadow for debugging
-    return 0.0;
+    // Early out if shadows disabled
+    if (shadowStrength < 0.01) return 0.0;
 
-    /* Full implementation - uncomment when working
     // Select cascade based on view depth
     int cascade = 2;
     if (viewDepth < cascadeSplits[0]) cascade = 0;
@@ -2191,42 +2281,32 @@ float calculateCascadeShadow(vec3 fragPos, vec3 normal, float viewDepth) {
     float bias = max(0.005 * (1.0 - dot(normal, lightDir)), 0.001);
     float currentDepth = projCoords.z - bias;
 
-    // PCF with hardware shadow comparison
+    // Optimized PCF - fewer samples for distant cascades
     float shadow = 0.0;
     vec2 texelSize = 1.0 / vec2(textureSize(cascadeShadowMaps, 0).xy);
-    for (int x = -1; x <= 1; x++) {
-        for (int y = -1; y <= 1; y++) {
-            vec2 offset = vec2(x, y) * texelSize;
-            shadow += texture(cascadeShadowMaps, vec4(projCoords.xy + offset, float(cascade), currentDepth));
-        }
-    }
-    shadow = 1.0 - (shadow / 9.0);
 
-    // Fade at cascade boundaries
-    float fadeStart = cascadeSplits[cascade] * 0.9;
-    float fadeEnd = cascadeSplits[cascade];
-    if (cascade < 2 && viewDepth > fadeStart) {
-        float t = (viewDepth - fadeStart) / (fadeEnd - fadeStart);
-        // Blend with next cascade
-        int nextCascade = cascade + 1;
-        vec4 nextLightSpace = cascadeMatrices[nextCascade] * vec4(fragPos, 1.0);
-        vec3 nextProj = nextLightSpace.xyz / nextLightSpace.w * 0.5 + 0.5;
-        float nextDepth = nextProj.z - bias;
-        float nextShadow = 0.0;
+    if (cascade == 0) {
+        // Near cascade: 3x3 PCF for quality (9 samples)
         for (int x = -1; x <= 1; x++) {
             for (int y = -1; y <= 1; y++) {
                 vec2 offset = vec2(x, y) * texelSize;
-                nextShadow += texture(cascadeShadowMaps, vec4(nextProj.xy + offset, float(nextCascade), nextDepth));
+                shadow += texture(cascadeShadowMaps, vec4(projCoords.xy + offset, float(cascade), currentDepth));
             }
         }
-        nextShadow = 1.0 - (nextShadow / 9.0);
-        shadow = mix(shadow, nextShadow, t);
+        shadow = 1.0 - (shadow / 9.0);
+    } else {
+        // Distant cascades: 4-tap PCF for performance
+        shadow += texture(cascadeShadowMaps, vec4(projCoords.xy + vec2(-0.5, -0.5) * texelSize, float(cascade), currentDepth));
+        shadow += texture(cascadeShadowMaps, vec4(projCoords.xy + vec2(0.5, -0.5) * texelSize, float(cascade), currentDepth));
+        shadow += texture(cascadeShadowMaps, vec4(projCoords.xy + vec2(-0.5, 0.5) * texelSize, float(cascade), currentDepth));
+        shadow += texture(cascadeShadowMaps, vec4(projCoords.xy + vec2(0.5, 0.5) * texelSize, float(cascade), currentDepth));
+        shadow = 1.0 - (shadow / 4.0);
     }
 
     // Distance fade
     float distFade = smoothstep(150.0, 250.0, viewDepth);
     return shadow * shadowStrength * (1.0 - distFade);
-    */
+
 }
 
 uniform int debugMode;  // 0=normal, 1=albedo, 2=normals, 3=position, 4=depth
@@ -2262,7 +2342,12 @@ void main() {
         if (depth >= 0.999) {
             FragColor = vec4(0.0, 1.0, 1.0, 1.0);  // Cyan = sky
         } else {
-            FragColor = vec4(fract(posAO.xyz / 16.0), 1.0);
+            // Reconstruct position from depth for debug view
+            vec2 ndc = TexCoords * 2.0 - 1.0;
+            vec4 clipPos = vec4(ndc, depth * 2.0 - 1.0, 1.0);
+            vec4 worldPos4 = invViewProj * clipPos;
+            vec3 debugPos = worldPos4.xyz / worldPos4.w;
+            FragColor = vec4(fract(debugPos / 16.0), 1.0);
         }
         return;
     } else if (debugMode == 4) {
@@ -2277,8 +2362,13 @@ void main() {
         return;
     }
 
-    vec3 fragPos = posAO.xyz;
-    float ao = posAO.w;
+    // Reconstruct world position from depth (saves G-buffer bandwidth)
+    vec2 ndc = TexCoords * 2.0 - 1.0;
+    vec4 clipPos = vec4(ndc, depth * 2.0 - 1.0, 1.0);
+    vec4 worldPos4 = invViewProj * clipPos;
+    vec3 fragPos = worldPos4.xyz / worldPos4.w;
+
+    float ao = posAO.w;  // Still reading AO from position buffer for now
     vec3 normal = normalize(normalLight.xyz);
     float lightLevel = normalLight.w;
     vec3 albedo = albedoEmit.rgb;
@@ -2351,6 +2441,454 @@ void main() {
     }
 
     FragColor = vec4(result, 1.0);
+}
+)";
+
+// ============================================
+// FSR 1.0 SHADERS (FidelityFX Super Resolution)
+// ============================================
+
+// FSR Vertex shader (shared by EASU and RCAS)
+const char* fsrVertexSource = R"(
+#version 460 core
+layout (location = 0) in vec2 aPos;
+layout (location = 1) in vec2 aTexCoord;
+
+out vec2 TexCoords;
+
+void main() {
+    TexCoords = aTexCoord;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)";
+
+// FSR EASU (Edge Adaptive Spatial Upscaling) - Main upscaling pass
+// Simplified implementation based on AMD FidelityFX FSR 1.0
+const char* fsrEASUFragmentSource = R"(
+#version 460 core
+out vec4 FragColor;
+in vec2 TexCoords;
+
+uniform sampler2D inputTexture;
+uniform vec2 inputSize;      // Render resolution (e.g., 640x360)
+uniform vec2 outputSize;     // Display resolution (e.g., 1280x720)
+
+// FsrEasuConst equivalent parameters
+uniform vec4 con0;  // {inputSize.x/outputSize.x, inputSize.y/outputSize.y, 0.5*inputSize.x/outputSize.x - 0.5, 0.5*inputSize.y/outputSize.y - 0.5}
+uniform vec4 con1;  // {1.0/inputSize.x, 1.0/inputSize.y, 1.0/inputSize.x, -1.0/inputSize.y}
+uniform vec4 con2;  // {-1.0/inputSize.x, 2.0/inputSize.y, 1.0/inputSize.x, 2.0/inputSize.y}
+uniform vec4 con3;  // {0.0/inputSize.x, 4.0/inputSize.y, 0, 0}
+
+// Compute edge-directed weights for a 12-tap filter pattern
+void main() {
+    // Input pixel position (in output space)
+    vec2 pos = TexCoords * outputSize;
+
+    // Position in input texture
+    vec2 srcPos = pos * con0.xy + con0.zw;
+    vec2 srcUV = srcPos / inputSize;
+
+    // Get texel offsets
+    vec2 texelSize = 1.0 / inputSize;
+
+    // 12-tap filter: sample in a cross pattern around the target pixel
+    // This is a simplified version of FSR EASU's edge-aware sampling
+
+    // Center and immediate neighbors
+    vec3 c = texture(inputTexture, srcUV).rgb;
+    vec3 n = texture(inputTexture, srcUV + vec2(0.0, -texelSize.y)).rgb;
+    vec3 s = texture(inputTexture, srcUV + vec2(0.0, texelSize.y)).rgb;
+    vec3 e = texture(inputTexture, srcUV + vec2(texelSize.x, 0.0)).rgb;
+    vec3 w = texture(inputTexture, srcUV + vec2(-texelSize.x, 0.0)).rgb;
+
+    // Corner samples
+    vec3 nw = texture(inputTexture, srcUV + vec2(-texelSize.x, -texelSize.y)).rgb;
+    vec3 ne = texture(inputTexture, srcUV + vec2(texelSize.x, -texelSize.y)).rgb;
+    vec3 sw = texture(inputTexture, srcUV + vec2(-texelSize.x, texelSize.y)).rgb;
+    vec3 se = texture(inputTexture, srcUV + vec2(texelSize.x, texelSize.y)).rgb;
+
+    // Extended samples for edge detection
+    vec3 n2 = texture(inputTexture, srcUV + vec2(0.0, -2.0 * texelSize.y)).rgb;
+    vec3 s2 = texture(inputTexture, srcUV + vec2(0.0, 2.0 * texelSize.y)).rgb;
+    vec3 e2 = texture(inputTexture, srcUV + vec2(2.0 * texelSize.x, 0.0)).rgb;
+    vec3 w2 = texture(inputTexture, srcUV + vec2(-2.0 * texelSize.x, 0.0)).rgb;
+
+    // Compute luminance for edge detection
+    float lc = dot(c, vec3(0.299, 0.587, 0.114));
+    float ln = dot(n, vec3(0.299, 0.587, 0.114));
+    float ls = dot(s, vec3(0.299, 0.587, 0.114));
+    float le = dot(e, vec3(0.299, 0.587, 0.114));
+    float lw = dot(w, vec3(0.299, 0.587, 0.114));
+    float lnw = dot(nw, vec3(0.299, 0.587, 0.114));
+    float lne = dot(ne, vec3(0.299, 0.587, 0.114));
+    float lsw = dot(sw, vec3(0.299, 0.587, 0.114));
+    float lse = dot(se, vec3(0.299, 0.587, 0.114));
+
+    // Detect edges using Sobel-like gradients
+    float gradH = abs((lnw + 2.0*lw + lsw) - (lne + 2.0*le + lse));
+    float gradV = abs((lnw + 2.0*ln + lne) - (lsw + 2.0*ls + lse));
+
+    // Subpixel offset within the source texel
+    vec2 subpix = fract(srcPos) - 0.5;
+
+    // Edge-aware interpolation weights
+    // Prefer interpolation along edges, not across them
+    float edgeH = 1.0 / (1.0 + gradH * 4.0);
+    float edgeV = 1.0 / (1.0 + gradV * 4.0);
+
+    // Bilinear-like weights with edge awareness
+    float wx = abs(subpix.x);
+    float wy = abs(subpix.y);
+
+    // Lanczos-inspired weights (simplified)
+    float wc = (1.0 - wx) * (1.0 - wy);
+    float wn = (1.0 - wx) * wy * (subpix.y < 0.0 ? 1.0 : 0.0) * edgeV;
+    float ws = (1.0 - wx) * wy * (subpix.y >= 0.0 ? 1.0 : 0.0) * edgeV;
+    float we = wx * (1.0 - wy) * (subpix.x >= 0.0 ? 1.0 : 0.0) * edgeH;
+    float ww = wx * (1.0 - wy) * (subpix.x < 0.0 ? 1.0 : 0.0) * edgeH;
+
+    // Normalize weights
+    float wsum = wc + wn + ws + we + ww + 0.0001;
+    wc /= wsum;
+    wn /= wsum;
+    ws /= wsum;
+    we /= wsum;
+    ww /= wsum;
+
+    // Final color blend
+    vec3 result = c * wc + n * wn + s * ws + e * we + w * ww;
+
+    FragColor = vec4(result, 1.0);
+}
+)";
+
+// FSR RCAS (Robust Contrast Adaptive Sharpening)
+// Sharpening pass that enhances detail without amplifying noise
+const char* fsrRCASFragmentSource = R"(
+#version 460 core
+out vec4 FragColor;
+in vec2 TexCoords;
+
+uniform sampler2D inputTexture;
+uniform vec2 texelSize;     // 1.0 / resolution
+uniform float sharpness;    // 0.0 = no sharpening, 2.0 = max (default 0.5)
+
+void main() {
+    // Sample the center and 4 neighbors (plus pattern)
+    vec3 c = texture(inputTexture, TexCoords).rgb;
+    vec3 n = texture(inputTexture, TexCoords + vec2(0.0, -texelSize.y)).rgb;
+    vec3 s = texture(inputTexture, TexCoords + vec2(0.0, texelSize.y)).rgb;
+    vec3 e = texture(inputTexture, TexCoords + vec2(texelSize.x, 0.0)).rgb;
+    vec3 w = texture(inputTexture, TexCoords + vec2(-texelSize.x, 0.0)).rgb;
+
+    // Compute min and max of neighborhood (for clamping)
+    vec3 minC = min(c, min(min(n, s), min(e, w)));
+    vec3 maxC = max(c, max(max(n, s), max(e, w)));
+
+    // Average of neighbors
+    vec3 avg = (n + s + e + w) * 0.25;
+
+    // Compute local contrast
+    vec3 diff = c - avg;
+
+    // Apply sharpening with contrast-adaptive strength
+    // The sharpening is reduced in high-contrast areas to prevent halos
+    vec3 contrast = maxC - minC + 0.0001;
+    vec3 adaptiveSharp = sharpness / (contrast + 0.5);
+    adaptiveSharp = min(adaptiveSharp, vec3(1.0));  // Cap sharpening strength
+
+    // Sharpen
+    vec3 result = c + diff * adaptiveSharp;
+
+    // Clamp to neighborhood bounds to prevent ringing/halos
+    result = clamp(result, minC, maxC);
+
+    FragColor = vec4(result, 1.0);
+}
+)";
+
+// ============================================
+// MESH SHADER (GL_NV_mesh_shader) - NVIDIA Turing+ only
+// ============================================
+// Mesh shaders replace the traditional vertex/geometry pipeline with a more efficient
+// compute-like approach. Benefits: better GPU utilization, per-meshlet culling.
+
+// Task shader - dispatches mesh shader workgroups based on visibility
+// Performs per-meshlet frustum culling for efficient rendering
+const char* meshTaskShaderSource = R"(
+#version 460 core
+#extension GL_NV_mesh_shader : require
+#extension GL_KHR_shader_subgroup_ballot : require
+
+layout(local_size_x = 32) in;
+
+// Meshlet descriptor (32 bytes) - matches MeshletDescriptor in ChunkMesh.h
+struct Meshlet {
+    uint vertexOffset;      // Offset into vertex SSBO
+    uint vertexCount;       // Number of vertices
+    uint triangleOffset;    // Triangle index (for reference)
+    uint triangleCount;     // Number of triangles
+    float centerX, centerY, centerZ;  // Bounding sphere center
+    float radius;           // Bounding sphere radius
+};
+
+layout(std430, binding = 2) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+};
+
+// Uniforms
+layout(std140, binding = 3) uniform MeshShaderData {
+    mat4 viewProj;
+    vec3 chunkOffset;
+    uint meshletCount;      // Total meshlets for this draw
+};
+
+// Additional frustum data for culling
+layout(std140, binding = 4) uniform FrustumPlanes {
+    vec4 planes[6];
+} frustum;
+
+// Task output - which meshlets to draw
+taskNV out Task {
+    uint meshletIndices[32];
+} OUT;
+
+// Frustum culling for bounding sphere
+bool isVisible(vec3 center, float radius) {
+    for (int i = 0; i < 6; i++) {
+        if (dot(frustum.planes[i].xyz, center) + frustum.planes[i].w < -radius) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    uint meshletIndex = gl_GlobalInvocationID.x;
+
+    bool visible = false;
+    if (meshletIndex < meshletCount) {
+        Meshlet m = meshlets[meshletIndex];
+        vec3 localCenter = vec3(m.centerX, m.centerY, m.centerZ);
+        vec3 worldCenter = localCenter + chunkOffset;
+        visible = isVisible(worldCenter, m.radius);
+    }
+
+    // Count visible meshlets using subgroup operations
+    uvec4 ballot = subgroupBallot(visible);
+    uint visibleCount = subgroupBallotBitCount(ballot);
+
+    // First thread writes the task count
+    if (gl_LocalInvocationID.x == 0) {
+        gl_TaskCountNV = visibleCount;
+    }
+
+    // Compact visible meshlet indices
+    if (visible) {
+        uint localIndex = subgroupBallotExclusiveBitCount(ballot);
+        OUT.meshletIndices[localIndex] = meshletIndex;
+    }
+}
+)";
+
+// Mesh shader - generates vertices and primitives from meshlet data
+// Uses non-indexed triangle lists for simplicity with greedy meshing output
+const char* meshShaderSource = R"(
+#version 460 core
+#extension GL_NV_mesh_shader : require
+#extension GL_NV_shader_subgroup_partitioned : enable
+
+// Workgroup size: 32 threads (optimal for Turing/Ampere)
+layout(local_size_x = 32) in;
+
+// Output: triangles, max 64 vertices, max 21 primitives (64 vertices / 3 = 21 triangles)
+layout(triangles, max_vertices = 64, max_primitives = 21) out;
+
+// Meshlet descriptor (32 bytes) - matches MeshletDescriptor in ChunkMesh.h
+struct Meshlet {
+    uint vertexOffset;      // Offset into vertex SSBO
+    uint vertexCount;       // Number of vertices
+    uint triangleOffset;    // Triangle index (for reference)
+    uint triangleCount;     // Number of triangles
+    float centerX, centerY, centerZ;  // Bounding sphere center
+    float radius;           // Bounding sphere radius
+};
+
+// Vertex data SSBO - packed as uvec4 (16 bytes each = 4 uints)
+// PackedChunkVertex layout: [x,y,z] [u,v] [normalIndex,ao,light,texSlot] [padding]
+layout(std430, binding = 0) readonly buffer VertexBuffer {
+    uvec4 vertexData[];
+};
+
+// Meshlet data SSBO
+layout(std430, binding = 2) readonly buffer MeshletBuffer {
+    Meshlet meshlets[];
+};
+
+// Uniforms
+layout(std140, binding = 3) uniform MeshShaderData {
+    mat4 viewProj;
+    vec3 chunkOffset;
+    uint meshletCount;
+};
+
+// Task input
+taskNV in Task {
+    uint meshletIndices[32];
+} IN;
+
+// Per-vertex outputs (match G-buffer shader)
+layout(location = 0) out PerVertexData {
+    vec3 worldPos;
+    vec3 normal;
+    vec2 texCoord;
+    vec2 texSlotBase;
+    float aoFactor;
+    float lightLevel;
+} v_out[];
+
+// Normal lookup table
+const vec3 NORMALS[6] = vec3[6](
+    vec3(1, 0, 0), vec3(-1, 0, 0),
+    vec3(0, 1, 0), vec3(0, -1, 0),
+    vec3(0, 0, 1), vec3(0, 0, -1)
+);
+
+// Texture atlas constants
+const float ATLAS_SIZE = 256.0;
+const float TILE_SIZE = 16.0;
+const float TILES_PER_ROW = ATLAS_SIZE / TILE_SIZE;
+
+void main() {
+    uint meshletIndex = IN.meshletIndices[gl_WorkGroupID.x];
+    Meshlet m = meshlets[meshletIndex];
+
+    uint threadId = gl_LocalInvocationID.x;
+
+    // Set output counts - use gl_PrimitiveCountNV for primitive count
+    // For NV mesh shaders: vertices are set implicitly by writing to gl_MeshVerticesNV[]
+    gl_PrimitiveCountNV = m.triangleCount;
+
+    // Process vertices (each thread handles multiple if needed)
+    for (uint i = threadId; i < m.vertexCount; i += 32u) {
+        uvec4 data = vertexData[m.vertexOffset + i];
+
+        // PackedChunkVertex layout (16 bytes):
+        // bytes 0-1: x (int16), bytes 2-3: y (int16)
+        // bytes 4-5: z (int16), bytes 6-7: u (uint16)
+        // bytes 8-9: v (uint16), bytes 10: normalIndex, bytes 11: ao
+        // bytes 12: light, bytes 13: texSlot, bytes 14-15: padding
+
+        // data.x = [x_low, x_high, y_low, y_high] = x(16) | y(16)<<16
+        // data.y = [z_low, z_high, u_low, u_high] = z(16) | u(16)<<16
+        // data.z = [v_low, v_high, normalIdx, ao] = v(16) | (normalIdx | ao<<8)<<16
+        // data.w = [light, texSlot, pad, pad] = light | texSlot<<8 | pad<<16
+
+        // Extract x (signed 16-bit from low bits of data.x)
+        int xInt = int(data.x & 0xFFFFu);
+        if (xInt >= 32768) xInt -= 65536;
+        float x = float(xInt);
+
+        // Extract y (signed 16-bit from high bits of data.x)
+        int yInt = int(data.x >> 16u);
+        if (yInt >= 32768) yInt -= 65536;
+        float y = float(yInt);
+
+        // Extract z (signed 16-bit from low bits of data.y)
+        int zInt = int(data.y & 0xFFFFu);
+        if (zInt >= 32768) zInt -= 65536;
+        float z = float(zInt);
+
+        vec3 localPos = vec3(x, y, z) / 256.0;
+        vec3 worldPos = localPos + chunkOffset;
+
+        // Extract u (unsigned 16-bit from high bits of data.y)
+        float u = float(data.y >> 16u);
+
+        // Extract v (unsigned 16-bit from low bits of data.z)
+        float v = float(data.z & 0xFFFFu);
+
+        vec2 texCoord = vec2(u, v) / 256.0;
+
+        // Extract normalIndex from byte 2 of high 16 bits of data.z
+        uint normalIdx = (data.z >> 16u) & 0xFFu;
+
+        // Extract ao from byte 3 of data.z
+        uint ao = (data.z >> 24u) & 0xFFu;
+
+        // Extract light from byte 0 of data.w
+        uint light = data.w & 0xFFu;
+
+        // Extract texSlot from byte 1 of data.w
+        uint texSlot = (data.w >> 8u) & 0xFFu;
+
+        vec3 normal = NORMALS[min(normalIdx, 5u)];
+
+        // Calculate texture slot base UV
+        float slotX = mod(float(texSlot), TILES_PER_ROW);
+        float slotY = floor(float(texSlot) / TILES_PER_ROW);
+        vec2 texSlotBase = vec2(slotX, slotY) * (TILE_SIZE / ATLAS_SIZE);
+
+        // Write outputs
+        gl_MeshVerticesNV[i].gl_Position = viewProj * vec4(worldPos, 1.0);
+        v_out[i].worldPos = worldPos;
+        v_out[i].normal = normal;
+        v_out[i].texCoord = texCoord;
+        v_out[i].texSlotBase = texSlotBase;
+        v_out[i].aoFactor = float(ao) / 255.0;
+        v_out[i].lightLevel = float(light) / 255.0;
+    }
+
+    // For non-indexed triangles, set sequential indices (0,1,2, 3,4,5, ...)
+    for (uint i = threadId; i < m.triangleCount; i += 32u) {
+        uint triIdx = i * 3u;
+        gl_PrimitiveIndicesNV[triIdx + 0u] = triIdx + 0u;
+        gl_PrimitiveIndicesNV[triIdx + 1u] = triIdx + 1u;
+        gl_PrimitiveIndicesNV[triIdx + 2u] = triIdx + 2u;
+    }
+}
+)";
+
+// Fragment shader for mesh shader path (same as G-buffer fragment)
+const char* meshFragmentShaderSource = R"(
+#version 460 core
+
+layout(location = 0) out vec4 gPosition;
+layout(location = 1) out vec4 gNormal;
+layout(location = 2) out vec4 gAlbedo;
+
+uniform sampler2D texAtlas;
+
+// Per-vertex input
+layout(location = 0) in PerVertexData {
+    vec3 worldPos;
+    vec3 normal;
+    vec2 texCoord;
+    vec2 texSlotBase;
+    float aoFactor;
+    float lightLevel;
+} v_in;
+
+const float ATLAS_SIZE = 256.0;
+const float TILE_SIZE = 16.0;
+
+void main() {
+    // Calculate final texture coordinates with tiling
+    vec2 tileUV = fract(v_in.texCoord) * (TILE_SIZE / ATLAS_SIZE);
+    vec2 finalUV = v_in.texSlotBase + tileUV;
+
+    // Sample texture
+    vec4 texColor = texture(texAtlas, finalUV);
+
+    // Alpha test
+    if (texColor.a < 0.5) {
+        discard;
+    }
+
+    // Output to G-buffer
+    gPosition = vec4(v_in.worldPos, v_in.aoFactor);
+    gNormal = vec4(normalize(v_in.normal), v_in.lightLevel);
+    gAlbedo = vec4(texColor.rgb, 0.0);  // Alpha = emission flag
 }
 )";
 
@@ -2778,6 +3316,47 @@ int main() {
     g_hardware.calculateRecommendations();
     g_hardware.print();
 
+    // Check for mesh shader extension (GL_NV_mesh_shader)
+    GLint numExtensions = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &numExtensions);
+    for (GLint i = 0; i < numExtensions; i++) {
+        const char* ext = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
+        if (ext && strcmp(ext, "GL_NV_mesh_shader") == 0) {
+            g_meshShadersAvailable = true;
+            break;
+        }
+    }
+
+    if (g_meshShadersAvailable) {
+        std::cout << "Mesh shaders available (GL_NV_mesh_shader)" << std::endl;
+        // Load glDrawMeshTasksNV function pointer (if not already provided by GLAD)
+#ifndef GLAD_GL_NV_mesh_shader
+        pfn_glDrawMeshTasksNV = (PFNGLDRAWMESHTASKSNVPROC_LOCAL)glfwGetProcAddress("glDrawMeshTasksNV");
+        if (pfn_glDrawMeshTasksNV) {
+            std::cout << "  glDrawMeshTasksNV loaded successfully" << std::endl;
+        } else {
+            std::cout << "  Failed to load glDrawMeshTasksNV" << std::endl;
+            g_meshShadersAvailable = false;
+        }
+#else
+        // GLAD provides mesh shader support
+        std::cout << "  Using GLAD mesh shader functions" << std::endl;
+#endif
+        if (g_meshShadersAvailable) {
+            // Enable by default on supported hardware
+            g_enableMeshShaders = g_hardware.supportsMeshShaders;
+            // Enable meshlet generation for mesh shader rendering
+            g_generateMeshlets = g_enableMeshShaders;
+        } else {
+            g_enableMeshShaders = false;
+            g_generateMeshlets = false;
+        }
+    } else {
+        std::cout << "Mesh shaders not available" << std::endl;
+        g_enableMeshShaders = false;
+        g_generateMeshlets = false;
+    }
+
     // Auto-tune if enabled
     if (g_config.autoTuneOnStartup) {
         g_config.autoTune();
@@ -3025,6 +3604,48 @@ int main() {
     glDeleteShader(ssaoBlurVertexShader);
     glDeleteShader(ssaoBlurFragmentShader);
 
+    // FSR EASU (upscaling) shader program
+    GLuint fsrEASUVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(fsrEASUVertexShader, 1, &fsrVertexSource, nullptr);
+    glCompileShader(fsrEASUVertexShader);
+    if (!checkShaderCompilation(fsrEASUVertexShader, "FSR_EASU_VERTEX")) return -1;
+
+    GLuint fsrEASUFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fsrEASUFragmentShader, 1, &fsrEASUFragmentSource, nullptr);
+    glCompileShader(fsrEASUFragmentShader);
+    if (!checkShaderCompilation(fsrEASUFragmentShader, "FSR_EASU_FRAGMENT")) return -1;
+
+    GLuint fsrEASUProgram = glCreateProgram();
+    glAttachShader(fsrEASUProgram, fsrEASUVertexShader);
+    glAttachShader(fsrEASUProgram, fsrEASUFragmentShader);
+    glLinkProgram(fsrEASUProgram);
+    if (!checkProgramLinking(fsrEASUProgram)) return -1;
+
+    glDeleteShader(fsrEASUVertexShader);
+    glDeleteShader(fsrEASUFragmentShader);
+
+    // FSR RCAS (sharpening) shader program
+    GLuint fsrRCASVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(fsrRCASVertexShader, 1, &fsrVertexSource, nullptr);
+    glCompileShader(fsrRCASVertexShader);
+    if (!checkShaderCompilation(fsrRCASVertexShader, "FSR_RCAS_VERTEX")) return -1;
+
+    GLuint fsrRCASFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fsrRCASFragmentShader, 1, &fsrRCASFragmentSource, nullptr);
+    glCompileShader(fsrRCASFragmentShader);
+    if (!checkShaderCompilation(fsrRCASFragmentShader, "FSR_RCAS_FRAGMENT")) return -1;
+
+    GLuint fsrRCASProgram = glCreateProgram();
+    glAttachShader(fsrRCASProgram, fsrRCASVertexShader);
+    glAttachShader(fsrRCASProgram, fsrRCASFragmentShader);
+    glLinkProgram(fsrRCASProgram);
+    if (!checkProgramLinking(fsrRCASProgram)) return -1;
+
+    glDeleteShader(fsrRCASVertexShader);
+    glDeleteShader(fsrRCASFragmentShader);
+
+    std::cout << "FSR shaders compiled successfully." << std::endl;
+
     // Hi-Z downsample compute shader program
     GLuint hiZDownsampleShader = glCreateShader(GL_COMPUTE_SHADER);
     glShaderSource(hiZDownsampleShader, 1, &hiZDownsampleSource, nullptr);
@@ -3052,6 +3673,92 @@ int main() {
     glDeleteShader(occlusionCullShader);
 
     std::cout << "Deferred rendering shaders compiled successfully" << std::endl;
+
+    // ================================================================
+    // MESH SHADER COMPILATION (GL_NV_mesh_shader) - Optional path
+    // ================================================================
+    if (g_meshShadersAvailable) {
+        std::cout << "Compiling mesh shader program..." << std::endl;
+
+        // Compile task shader
+        GLuint taskShader = glCreateShader(GL_TASK_SHADER_NV);
+        glShaderSource(taskShader, 1, &meshTaskShaderSource, nullptr);
+        glCompileShader(taskShader);
+        if (!checkShaderCompilation(taskShader, "MESH_TASK")) {
+            std::cerr << "Task shader compilation failed, disabling mesh shaders" << std::endl;
+            g_meshShadersAvailable = false;
+            g_enableMeshShaders = false;
+            g_generateMeshlets = false;
+        }
+
+        if (g_meshShadersAvailable) {
+            // Compile mesh shader
+            GLuint meshShader = glCreateShader(GL_MESH_SHADER_NV);
+            glShaderSource(meshShader, 1, &meshShaderSource, nullptr);
+            glCompileShader(meshShader);
+            if (!checkShaderCompilation(meshShader, "MESH_SHADER")) {
+                std::cerr << "Mesh shader compilation failed, disabling mesh shaders" << std::endl;
+                g_meshShadersAvailable = false;
+                g_enableMeshShaders = false;
+                g_generateMeshlets = false;
+                glDeleteShader(taskShader);
+            } else {
+                // Compile fragment shader
+                GLuint meshFragShader = glCreateShader(GL_FRAGMENT_SHADER);
+                glShaderSource(meshFragShader, 1, &meshFragmentShaderSource, nullptr);
+                glCompileShader(meshFragShader);
+                if (!checkShaderCompilation(meshFragShader, "MESH_FRAGMENT")) {
+                    std::cerr << "Mesh fragment shader compilation failed, disabling mesh shaders" << std::endl;
+                    g_meshShadersAvailable = false;
+                    g_enableMeshShaders = false;
+                    g_generateMeshlets = false;
+                    glDeleteShader(taskShader);
+                    glDeleteShader(meshShader);
+                } else {
+                    // Link program
+                    meshShaderProgram = glCreateProgram();
+                    glAttachShader(meshShaderProgram, taskShader);
+                    glAttachShader(meshShaderProgram, meshShader);
+                    glAttachShader(meshShaderProgram, meshFragShader);
+                    glLinkProgram(meshShaderProgram);
+
+                    if (!checkProgramLinking(meshShaderProgram)) {
+                        std::cerr << "Mesh shader program linking failed, disabling mesh shaders" << std::endl;
+                        g_meshShadersAvailable = false;
+                        g_enableMeshShaders = false;
+                        g_generateMeshlets = false;
+                        glDeleteProgram(meshShaderProgram);
+                        meshShaderProgram = 0;
+                    } else {
+                        std::cout << "Mesh shader program compiled successfully!" << std::endl;
+                    }
+
+                    glDeleteShader(taskShader);
+                    glDeleteShader(meshShader);
+                    glDeleteShader(meshFragShader);
+                }
+            }
+        }
+
+        // Create UBOs for mesh shader
+        if (g_meshShadersAvailable && meshShaderProgram != 0) {
+            // Mesh shader data UBO (binding = 3): mat4 viewProj, vec3 chunkOffset, uint meshletCount
+            glGenBuffers(1, &meshShaderDataUBO);
+            glBindBuffer(GL_UNIFORM_BUFFER, meshShaderDataUBO);
+            glBufferData(GL_UNIFORM_BUFFER, sizeof(glm::mat4) + 4 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
+            glBindBufferBase(GL_UNIFORM_BUFFER, 3, meshShaderDataUBO);
+            glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+            // Frustum planes UBO (binding = 4): 6 x vec4
+            glGenBuffers(1, &frustumPlanesUBO);
+            glBindBuffer(GL_UNIFORM_BUFFER, frustumPlanesUBO);
+            glBufferData(GL_UNIFORM_BUFFER, 6 * sizeof(glm::vec4), nullptr, GL_DYNAMIC_DRAW);
+            glBindBufferBase(GL_UNIFORM_BUFFER, 4, frustumPlanesUBO);
+            glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+            std::cout << "Mesh shader UBOs created" << std::endl;
+        }
+    }
 
     // Get uniform locations for loading shader
     GLint loadingOffsetLoc = glGetUniformLocation(loadingShaderProgram, "uOffset");
@@ -3181,6 +3888,7 @@ int main() {
     GLint compositeUnderwaterLoc = glGetUniformLocation(compositeProgram, "isUnderwater");
     GLint compositeDebugModeLoc = glGetUniformLocation(compositeProgram, "debugMode");
     GLint compositeRenderDistLoc = glGetUniformLocation(compositeProgram, "renderDistanceBlocks");
+    GLint compositeInvViewProjLoc = glGetUniformLocation(compositeProgram, "invViewProj");
 
     // Debug: verify composite shader uniform locations
     std::cout << "Composite shader uniform locations:" << std::endl;
@@ -3213,6 +3921,23 @@ int main() {
     GLint occlusionNumMipsLoc = glGetUniformLocation(occlusionCullProgram, "numMipLevels");
     GLint occlusionScreenSizeLoc = glGetUniformLocation(occlusionCullProgram, "screenSize");
     GLint occlusionChunkCountLoc = glGetUniformLocation(occlusionCullProgram, "chunkCount");
+
+    // FSR EASU (upscaling) shader uniforms
+    GLint fsrEASUInputLoc = glGetUniformLocation(fsrEASUProgram, "inputTexture");
+    GLint fsrEASUInputSizeLoc = glGetUniformLocation(fsrEASUProgram, "inputSize");
+    GLint fsrEASUOutputSizeLoc = glGetUniformLocation(fsrEASUProgram, "outputSize");
+    GLint fsrEASUCon0Loc = glGetUniformLocation(fsrEASUProgram, "con0");
+    GLint fsrEASUCon1Loc = glGetUniformLocation(fsrEASUProgram, "con1");
+    GLint fsrEASUCon2Loc = glGetUniformLocation(fsrEASUProgram, "con2");
+    GLint fsrEASUCon3Loc = glGetUniformLocation(fsrEASUProgram, "con3");
+
+    // FSR RCAS (sharpening) shader uniforms
+    GLint fsrRCASInputLoc = glGetUniformLocation(fsrRCASProgram, "inputTexture");
+    GLint fsrRCASTexelSizeLoc = glGetUniformLocation(fsrRCASProgram, "texelSize");
+    GLint fsrRCASSharpnessLoc = glGetUniformLocation(fsrRCASProgram, "sharpness");
+    (void)fsrRCASInputLoc; (void)fsrRCASTexelSizeLoc; (void)fsrRCASSharpnessLoc; // Reserved for RCAS sharpening pass
+
+    std::cout << "FSR uniform locations retrieved." << std::endl;
 
     // SSAO parameters
     float ssaoRadius = g_config.ssaoRadius;   // From config
@@ -3337,6 +4062,28 @@ int main() {
     std::cout << "Shadow map created (" << SHADOW_WIDTH << "x" << SHADOW_HEIGHT << ")" << std::endl;
 
     // ============================================
+    // CALCULATE RENDER RESOLUTION (for FSR upscaling)
+    // ============================================
+    g_enableFSR = g_config.enableFSR;
+    g_renderScale = HardwareInfo::getRenderScale(g_config.upscaleMode);
+    RENDER_WIDTH = static_cast<int>(WINDOW_WIDTH * g_renderScale);
+    RENDER_HEIGHT = static_cast<int>(WINDOW_HEIGHT * g_renderScale);
+
+    // Ensure minimum render resolution (avoid divide by zero issues)
+    RENDER_WIDTH = std::max(RENDER_WIDTH, 320);
+    RENDER_HEIGHT = std::max(RENDER_HEIGHT, 180);
+
+    // Round to multiples of 8 for better GPU efficiency
+    RENDER_WIDTH = (RENDER_WIDTH + 7) & ~7;
+    RENDER_HEIGHT = (RENDER_HEIGHT + 7) & ~7;
+
+    std::cout << "Render resolution: " << RENDER_WIDTH << "x" << RENDER_HEIGHT;
+    if (g_enableFSR && g_renderScale < 1.0f) {
+        std::cout << " (FSR upscaling to " << WINDOW_WIDTH << "x" << WINDOW_HEIGHT << ", scale=" << g_renderScale << ")";
+    }
+    std::cout << std::endl;
+
+    // ============================================
     // CREATE G-BUFFER FOR DEFERRED RENDERING
     // ============================================
     std::cout << "Creating G-buffer..." << std::endl;
@@ -3344,10 +4091,14 @@ int main() {
     glGenFramebuffers(1, &gBufferFBO);
     glBindFramebuffer(GL_FRAMEBUFFER, gBufferFBO);
 
+    // Use render resolution for G-buffer (supports FSR upscaling)
+    int gBufferWidth = g_enableFSR ? RENDER_WIDTH : WINDOW_WIDTH;
+    int gBufferHeight = g_enableFSR ? RENDER_HEIGHT : WINDOW_HEIGHT;
+
     // Position buffer (RGB16F) - world position + vertex AO in alpha
     glGenTextures(1, &gPosition);
     glBindTexture(GL_TEXTURE_2D, gPosition);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, gBufferWidth, gBufferHeight, 0, GL_RGBA, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -3357,7 +4108,7 @@ int main() {
     // Normal buffer (RGB16F) - world normal + light level in alpha
     glGenTextures(1, &gNormal);
     glBindTexture(GL_TEXTURE_2D, gNormal);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, gBufferWidth, gBufferHeight, 0, GL_RGBA, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, gNormal, 0);
@@ -3365,7 +4116,7 @@ int main() {
     // Albedo buffer (RGBA8) - base color + emission flag
     glGenTextures(1, &gAlbedo);
     glBindTexture(GL_TEXTURE_2D, gAlbedo);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, gBufferWidth, gBufferHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, gAlbedo, 0);
@@ -3373,7 +4124,7 @@ int main() {
     // Depth buffer (DEPTH32F) - for Hi-Z and SSAO
     glGenTextures(1, &gDepth);
     glBindTexture(GL_TEXTURE_2D, gDepth);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT32F, gBufferWidth, gBufferHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -3388,7 +4139,39 @@ int main() {
         std::cerr << "G-buffer framebuffer is not complete!" << std::endl;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    std::cout << "G-buffer created (" << WINDOW_WIDTH << "x" << WINDOW_HEIGHT << ")" << std::endl;
+    std::cout << "G-buffer created (" << gBufferWidth << "x" << gBufferHeight << ")" << std::endl;
+
+    // ============================================
+    // CREATE SCENE FBO (for FSR - composite output at render resolution)
+    // ============================================
+    if (g_enableFSR && g_renderScale < 1.0f) {
+        std::cout << "Creating scene FBO for FSR..." << std::endl;
+
+        glGenFramebuffers(1, &sceneFBO);
+        glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
+
+        // Scene color texture at render resolution (output of composite pass)
+        glGenTextures(1, &sceneColorTexture);
+        glBindTexture(GL_TEXTURE_2D, sceneColorTexture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB16F, RENDER_WIDTH, RENDER_HEIGHT, 0, GL_RGB, GL_FLOAT, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);  // Linear for FSR sampling
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, sceneColorTexture, 0);
+
+        // Depth renderbuffer (for sky rendering in scene FBO)
+        glGenRenderbuffers(1, &sceneDepthRBO);
+        glBindRenderbuffer(GL_RENDERBUFFER, sceneDepthRBO);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, RENDER_WIDTH, RENDER_HEIGHT);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, sceneDepthRBO);
+
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+            std::cerr << "Scene FBO is not complete!" << std::endl;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        std::cout << "Scene FBO created (" << RENDER_WIDTH << "x" << RENDER_HEIGHT << ")" << std::endl;
+    }
 
     // ============================================
     // CREATE CASCADE SHADOW MAPS (3 cascades)
@@ -3481,13 +4264,16 @@ int main() {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
-    // Create SSAO FBO
+    // Create SSAO FBO (use render resolution if FSR enabled)
+    int ssaoWidth = g_enableFSR ? RENDER_WIDTH : WINDOW_WIDTH;
+    int ssaoHeight = g_enableFSR ? RENDER_HEIGHT : WINDOW_HEIGHT;
+
     glGenFramebuffers(1, &ssaoFBO);
     glBindFramebuffer(GL_FRAMEBUFFER, ssaoFBO);
 
     glGenTextures(1, &ssaoColorBuffer);
     glBindTexture(GL_TEXTURE_2D, ssaoColorBuffer);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, ssaoWidth, ssaoHeight, 0, GL_RED, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ssaoColorBuffer, 0);
@@ -3502,7 +4288,7 @@ int main() {
 
     glGenTextures(1, &ssaoBlurBuffer);
     glBindTexture(GL_TEXTURE_2D, ssaoBlurBuffer);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, WINDOW_WIDTH, WINDOW_HEIGHT, 0, GL_RED, GL_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, ssaoWidth, ssaoHeight, 0, GL_RED, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, ssaoBlurBuffer, 0);
@@ -3511,7 +4297,7 @@ int main() {
         std::cerr << "SSAO blur framebuffer is not complete!" << std::endl;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    std::cout << "SSAO resources created (kernel size: " << SSAO_KERNEL_SIZE << ")" << std::endl;
+    std::cout << "SSAO resources created (" << ssaoWidth << "x" << ssaoHeight << ", kernel size: " << SSAO_KERNEL_SIZE << ")" << std::endl;
 
     // ============================================
     // CREATE HI-Z BUFFER FOR OCCLUSION CULLING
@@ -3614,6 +4400,9 @@ int main() {
     // Initialize thread pool with config settings
     world.initThreadPool(g_config.chunkThreads, g_config.meshThreads);
 
+    // Initialize indirect rendering buffers for batched rendering
+    world.initIndirectRendering();
+
     // Configure world settings from config
     world.renderDistance = g_config.renderDistance;
     world.unloadDistance = g_config.renderDistance + 4;  // Unload a bit beyond render
@@ -3704,61 +4493,24 @@ int main() {
             // Calculate progress
             float chunkProgress = static_cast<float>(chunksLoaded) / static_cast<float>(totalChunksToLoad);
 
-            // Once all chunks are loaded, build meshes
+            // Once all chunks are loaded, build meshes using thread pool
             if (chunksLoaded >= totalChunksToLoad) {
                 loadingMessage = "Building meshes...";
 
-                // Build all meshes at once (not just maxMeshesPerFrame)
-                int meshesToBuild = 0;
-                for (auto& [pos, chunk] : world.chunks) {
-                    if (chunk->isDirty) {
-                        meshesToBuild++;
-                    }
-                }
+                // Use world.update() with burst mode - this properly uses the thread pool
+                // for mesh generation AND uploads to GPU incrementally (bounded RAM usage)
+                world.burstMode = true;
+                glm::ivec2 centerChunk = Chunk::worldToChunkPos(spawnPos);
+                world.updateMeshes(centerChunk);
 
-                // Build meshes in batches - larger batches during loading for speed
-                int batchSize = 100;
-                int built = 0;
-                for (auto& [pos, chunk] : world.chunks) {
-                    if (chunk->isDirty && built < batchSize) {
-                        // Check if all neighbors exist
-                        bool allNeighborsExist =
-                            world.getChunk(glm::ivec2(pos.x - 1, pos.y)) != nullptr &&
-                            world.getChunk(glm::ivec2(pos.x + 1, pos.y)) != nullptr &&
-                            world.getChunk(glm::ivec2(pos.x, pos.y - 1)) != nullptr &&
-                            world.getChunk(glm::ivec2(pos.x, pos.y + 1)) != nullptr;
+                // Count how many meshes are done
+                meshesBuilt = static_cast<int>(world.meshes.size());
 
-                        if (allNeighborsExist) {
-                            World* worldPtr = &world;
-                            auto worldBlockGetter = [worldPtr](int x, int y, int z) -> BlockType {
-                                return worldPtr->getBlock(x, y, z);
-                            };
-                            auto waterBlockGetter = [worldPtr](int x, int y, int z) -> BlockType {
-                                return worldPtr->getBlockForWater(x, y, z);
-                            };
-                            auto safeBlockGetter = [worldPtr](int x, int y, int z) -> BlockType {
-                                return worldPtr->getBlockSafe(x, y, z);
-                            };
-                            auto lightGetter = [worldPtr](int x, int y, int z) -> uint8_t {
-                                return worldPtr->getLightLevel(x, y, z);
-                            };
-
-                            if (world.meshes.find(pos) == world.meshes.end()) {
-                                world.meshes[pos] = std::make_unique<ChunkMesh>();
-                            }
-                            world.meshes[pos]->generate(*chunk, worldBlockGetter, waterBlockGetter, safeBlockGetter, lightGetter);
-                            chunk->isDirty = false;
-                            meshesBuilt++;
-                            built++;
-                        }
-                    }
-                }
-
-                // Check if all meshes are built
+                // Check if all meshes are built (no dirty chunks with all neighbors)
                 bool allMeshesBuilt = true;
+                int pendingMeshes = 0;
                 for (auto& [pos, chunk] : world.chunks) {
                     if (chunk->isDirty) {
-                        // Check if neighbors exist for this chunk
                         bool allNeighborsExist =
                             world.getChunk(glm::ivec2(pos.x - 1, pos.y)) != nullptr &&
                             world.getChunk(glm::ivec2(pos.x + 1, pos.y)) != nullptr &&
@@ -3766,9 +4518,14 @@ int main() {
                             world.getChunk(glm::ivec2(pos.x, pos.y + 1)) != nullptr;
                         if (allNeighborsExist) {
                             allMeshesBuilt = false;
-                            break;
+                            pendingMeshes++;
                         }
                     }
+                }
+
+                // Also check if any meshes are still being generated in thread pool
+                if (world.chunkThreadPool && world.chunkThreadPool->hasPendingMeshes()) {
+                    allMeshesBuilt = false;
                 }
 
                 if (allMeshesBuilt) {
@@ -4246,7 +5003,10 @@ int main() {
             // ============================================
             // Z-PREPASS (eliminates overdraw in G-buffer pass)
             // ============================================
-            glViewport(0, 0, width, height);
+            // Use render resolution if FSR is enabled
+            int renderW = g_enableFSR ? RENDER_WIDTH : width;
+            int renderH = g_enableFSR ? RENDER_HEIGHT : height;
+            glViewport(0, 0, renderW, renderH);
             glBindFramebuffer(GL_FRAMEBUFFER, gBufferFBO);
 
             // Disable color writes - depth only
@@ -4295,29 +5055,59 @@ int main() {
                 gBufferFBOChecked = true;
             }
 
-            // Use GL_EQUAL - only draw pixels that match Z-prepass depth (zero overdraw!)
-            glDepthFunc(GL_EQUAL);
+            // Use GL_LEQUAL - draw pixels at same or closer depth as Z-prepass
+            // Note: GL_EQUAL can fail due to floating point precision differences between shaders
+            glDepthFunc(GL_LEQUAL);
             glDepthMask(GL_FALSE);  // Don't write depth again
 
             // Only clear color, NOT depth (keep Z-prepass depth)
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT);
 
-            glUseProgram(gBufferProgram);
-            glUniformMatrix4fv(gBufferViewLoc, 1, GL_FALSE, glm::value_ptr(view));
-            glUniformMatrix4fv(gBufferProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
-
+            // Bind texture atlas (needed for both rendering paths)
             textureAtlas.bind(0);
-            glUniform1i(gBufferTexAtlasLoc, 0);
 
-            // Render world to G-buffer (no overdraw!)
-            world.render(camera.position, gBufferChunkOffsetLoc);
+            // Choose rendering path: Mesh Shaders > Batched > Traditional
+            if (g_enableMeshShaders && g_meshShadersAvailable && meshShaderProgram != 0) {
+                // ============================================
+                // MESH SHADER RENDERING PATH (NVIDIA Turing+)
+                // ============================================
+                glm::mat4 viewProj = projection * view;
+                world.renderSubChunksMeshShader(camera.position, viewProj);
+            } else {
+                // Set up traditional shader for both batched and non-batched paths
+                glUseProgram(gBufferProgram);
+                glUniformMatrix4fv(gBufferViewLoc, 1, GL_FALSE, glm::value_ptr(view));
+                glUniformMatrix4fv(gBufferProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
+                glUniform1i(gBufferTexAtlasLoc, 0);
+
+                if (g_enableBatchedRendering) {
+                    // ============================================
+                    // SODIUM-STYLE BATCHED RENDERING PATH
+                    // ============================================
+                    // Groups sub-chunks by column, reducing uniform updates
+                    world.renderSubChunksBatched(camera.position, gBufferChunkOffsetLoc);
+                } else {
+                    // ============================================
+                    // TRADITIONAL VAO/VBO RENDERING PATH
+                    // ============================================
+                    // Render world to G-buffer (no overdraw!)
+                    world.render(camera.position, gBufferChunkOffsetLoc);
+                }
+            }
 
             // One-time debug: report how many chunks were rendered
             static bool renderCountReported = false;
             if (!renderCountReported) {
                 std::cout << "G-buffer pass rendered " << world.lastRenderedChunks
                           << " chunks (culled: " << world.lastCulledChunks << ")" << std::endl;
+                if (g_enableMeshShaders) {
+                    std::cout << "  Using MESH SHADER rendering path" << std::endl;
+                } else if (g_enableBatchedRendering) {
+                    std::cout << "  Using SODIUM-STYLE BATCHED rendering path" << std::endl;
+                } else {
+                    std::cout << "  Using TRADITIONAL VAO/VBO rendering path" << std::endl;
+                }
                 std::cout << std::flush;
                 renderCountReported = true;
             }
@@ -4544,10 +5334,10 @@ int main() {
                 glBindTexture(GL_TEXTURE_2D, ssaoNoiseTexture);
                 glUniform1i(ssaoNoiseLoc, 3);
 
-                // Set SSAO uniforms
+                // Set SSAO uniforms (use render resolution if FSR enabled)
                 glUniformMatrix4fv(ssaoProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
                 glUniformMatrix4fv(ssaoViewLoc, 1, GL_FALSE, glm::value_ptr(view));
-                glUniform2f(ssaoNoiseScaleLoc, width / 4.0f, height / 4.0f);
+                glUniform2f(ssaoNoiseScaleLoc, renderW / 4.0f, renderH / 4.0f);
                 glUniform1f(ssaoRadiusLoc, ssaoRadius);
                 glUniform1f(ssaoBiasLoc, ssaoBias);
 
@@ -4579,10 +5369,21 @@ int main() {
 
             glEndQuery(GL_TIME_ELAPSED);  // End SSAO timer
 
-            // Composite pass - render to screen
+            // Composite pass - render to scene FBO (for FSR) or directly to screen
             glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries[currentTimerFrame][TIMER_COMPOSITE]);
 
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);  // Ensure we're on default framebuffer
+            // Determine render target and viewport
+            int compositeWidth = width;
+            int compositeHeight = height;
+            if (g_enableFSR && sceneFBO != 0) {
+                glBindFramebuffer(GL_FRAMEBUFFER, sceneFBO);
+                compositeWidth = RENDER_WIDTH;
+                compositeHeight = RENDER_HEIGHT;
+            } else {
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            }
+
+            glViewport(0, 0, compositeWidth, compositeHeight);
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
             glDisable(GL_DEPTH_TEST);  // Disable depth test for fullscreen quad
 
@@ -4638,17 +5439,23 @@ int main() {
             glUniform1i(compositeDebugModeLoc, g_deferredDebugMode);
             glUniform1f(compositeRenderDistLoc, static_cast<float>(world.renderDistance * 16));  // Convert chunks to blocks
 
+            // Set inverse view-projection matrix for position reconstruction from depth
+            glm::mat4 viewProj = projection * view;
+            glm::mat4 invViewProj = glm::inverse(viewProj);
+            glUniformMatrix4fv(compositeInvViewProjLoc, 1, GL_FALSE, glm::value_ptr(invViewProj));
+
             // Render fullscreen quad
             glBindVertexArray(quadVAO);
             glDrawArrays(GL_TRIANGLES, 0, 6);
             glBindVertexArray(0);
 
-            // Copy depth from G-buffer to default framebuffer BEFORE sky rendering
+            // Copy depth from G-buffer to current framebuffer BEFORE sky rendering
+            GLuint targetFBO = (g_enableFSR && sceneFBO != 0) ? sceneFBO : 0;
             glBindFramebuffer(GL_READ_FRAMEBUFFER, gBufferFBO);
-            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
-            glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFBO);
+            glBlitFramebuffer(0, 0, compositeWidth, compositeHeight, 0, 0, compositeWidth, compositeHeight,
                               GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glBindFramebuffer(GL_FRAMEBUFFER, targetFBO);
 
             // Re-enable depth test for sky and forward passes
             glEnable(GL_DEPTH_TEST);
@@ -4658,13 +5465,48 @@ int main() {
                 renderSky();
             }
 
+            // ============================================
+            // FSR UPSCALING PASS (if enabled)
+            // ============================================
+            if (g_enableFSR && sceneFBO != 0) {
+                // Switch to screen framebuffer at display resolution
+                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                glViewport(0, 0, width, height);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glDisable(GL_DEPTH_TEST);
+
+                // FSR EASU (Edge Adaptive Spatial Upscaling)
+                glUseProgram(fsrEASUProgram);
+
+                // Bind scene texture
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, sceneColorTexture);
+                glUniform1i(fsrEASUInputLoc, 0);
+
+                // Set resolution uniforms
+                glUniform2f(fsrEASUInputSizeLoc, static_cast<float>(RENDER_WIDTH), static_cast<float>(RENDER_HEIGHT));
+                glUniform2f(fsrEASUOutputSizeLoc, static_cast<float>(width), static_cast<float>(height));
+
+                // FSR constants (con0-con3)
+                float scaleX = static_cast<float>(RENDER_WIDTH) / static_cast<float>(width);
+                float scaleY = static_cast<float>(RENDER_HEIGHT) / static_cast<float>(height);
+                glUniform4f(fsrEASUCon0Loc, scaleX, scaleY, 0.5f * scaleX - 0.5f, 0.5f * scaleY - 0.5f);
+                glUniform4f(fsrEASUCon1Loc, 1.0f / RENDER_WIDTH, 1.0f / RENDER_HEIGHT, 1.0f / RENDER_WIDTH, -1.0f / RENDER_HEIGHT);
+                glUniform4f(fsrEASUCon2Loc, -1.0f / RENDER_WIDTH, 2.0f / RENDER_HEIGHT, 1.0f / RENDER_WIDTH, 2.0f / RENDER_HEIGHT);
+                glUniform4f(fsrEASUCon3Loc, 0.0f, 4.0f / RENDER_HEIGHT, 0.0f, 0.0f);
+
+                // Render fullscreen quad
+                glBindVertexArray(quadVAO);
+                glDrawArrays(GL_TRIANGLES, 0, 6);
+                glBindVertexArray(0);
+
+                // Note: RCAS sharpening pass could be added here if needed
+                // For now, EASU alone provides good quality upscaling
+            }
+
             glActiveTexture(GL_TEXTURE0);
 
             glEndQuery(GL_TIME_ELAPSED);  // End composite timer
-
-            // Switch to next timer frame and mark timers as ready
-            currentTimerFrame = 1 - currentTimerFrame;
-            gpuTimersReady = true;
         } else {
             // ============================================================
             // FORWARD RENDERING PATH (original code)
@@ -4807,6 +5649,10 @@ int main() {
         crosshair.render();
 
         glEndQuery(GL_TIME_ELAPSED);
+
+        // Switch to next timer frame and mark timers as ready (moved here for both paths)
+        currentTimerFrame = 1 - currentTimerFrame;
+        gpuTimersReady = true;
 
         // ============================================
         // PERFORMANCE STATS DISPLAY

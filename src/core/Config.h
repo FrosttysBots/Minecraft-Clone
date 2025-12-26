@@ -32,12 +32,29 @@ enum class RendererType {
     VULKAN
 };
 
+// Upscaling modes (FSR quality presets)
+enum class UpscaleMode {
+    NATIVE = 0,       // 1.0x - No upscaling
+    QUALITY = 1,      // 1.5x - 67% render scale (FSR Quality)
+    BALANCED = 2,     // 1.7x - 59% render scale (FSR Balanced)
+    PERFORMANCE = 3,  // 2.0x - 50% render scale (FSR Performance)
+    ULTRA_PERF = 4    // 3.0x - 33% render scale (FSR Ultra Performance)
+};
+
 struct HardwareInfo {
     // GPU Info
     std::string gpuName = "Unknown";
     std::string gpuVendor = "Unknown";
     int vramMB = 0;
     GPUTier gpuTier = GPUTier::UNKNOWN;
+
+    // Vendor-specific feature support
+    bool isNVIDIA = false;
+    bool isAMD = false;
+    bool isIntel = false;
+    bool supportsMeshShaders = false;      // NVIDIA Turing+ (GL_NV_mesh_shader)
+    bool supportsBindlessTextures = false; // GL_ARB_bindless_texture
+    bool supportsFSR = true;               // FSR 1.0 works on all GPUs
 
     // CPU Info
     int cpuCores = 4;
@@ -50,27 +67,36 @@ struct HardwareInfo {
     int recommendedShadowRes = 2048;
     int recommendedSSAOSamples = 32;
     bool recommendedVolumetricClouds = true;
+    UpscaleMode recommendedUpscaleMode = UpscaleMode::NATIVE;
 
     // Convert string to lowercase for comparison
     static std::string toLower(const std::string& s) {
         std::string result = s;
-        std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+        std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return result;
     }
 
-    // Classify GPU based on name
+    // Classify GPU based on name and set vendor flags
     void classifyGPU() {
         std::string gpuLower = toLower(gpuName);
+
+        // Reset vendor flags
+        isNVIDIA = false;
+        isAMD = false;
+        isIntel = false;
 
         // NVIDIA Detection
         if (gpuLower.find("nvidia") != std::string::npos ||
             gpuLower.find("geforce") != std::string::npos) {
             gpuVendor = "NVIDIA";
+            isNVIDIA = true;
 
-            // RTX 40 series - ULTRA
+            // RTX 40 series - ULTRA (Turing+ supports mesh shaders)
             if (gpuLower.find("4090") != std::string::npos ||
                 gpuLower.find("4080") != std::string::npos) {
                 gpuTier = GPUTier::ULTRA;
+                supportsMeshShaders = true;  // Ada Lovelace
+                recommendedUpscaleMode = UpscaleMode::NATIVE;
             }
             // RTX 40 mid and RTX 30 high - HIGH
             else if (gpuLower.find("4070") != std::string::npos ||
@@ -79,77 +105,109 @@ struct HardwareInfo {
                      gpuLower.find("3080") != std::string::npos ||
                      gpuLower.find("3070") != std::string::npos) {
                 gpuTier = GPUTier::HIGH;
+                supportsMeshShaders = true;  // Ampere/Ada
+                recommendedUpscaleMode = UpscaleMode::NATIVE;
             }
-            // RTX 30 mid, RTX 20 series - MID
+            // RTX 30 mid, RTX 20 series - MID (Turing+ has mesh shaders)
             else if (gpuLower.find("3060") != std::string::npos ||
                      gpuLower.find("3050") != std::string::npos ||
                      gpuLower.find("2080") != std::string::npos ||
                      gpuLower.find("2070") != std::string::npos ||
-                     gpuLower.find("2060") != std::string::npos ||
-                     gpuLower.find("1080") != std::string::npos ||
-                     gpuLower.find("1070") != std::string::npos) {
+                     gpuLower.find("2060") != std::string::npos) {
                 gpuTier = GPUTier::MID;
+                supportsMeshShaders = true;  // Turing/Ampere
+                recommendedUpscaleMode = UpscaleMode::QUALITY;
             }
-            // GTX 10 series low, GTX 16 series - MID-LOW
-            else if (gpuLower.find("1660") != std::string::npos ||
+            // GTX 10 series, GTX 16 series - MID-LOW (no mesh shaders)
+            else if (gpuLower.find("1080") != std::string::npos ||
+                     gpuLower.find("1070") != std::string::npos ||
+                     gpuLower.find("1660") != std::string::npos ||
                      gpuLower.find("1650") != std::string::npos ||
                      gpuLower.find("1060") != std::string::npos ||
                      gpuLower.find("1050") != std::string::npos) {
                 gpuTier = GPUTier::MID;
+                supportsMeshShaders = false;  // Pascal/Turing (no RTX)
+                recommendedUpscaleMode = UpscaleMode::BALANCED;
             }
             // Older or low-end
             else {
                 gpuTier = GPUTier::LOW;
+                supportsMeshShaders = false;
+                recommendedUpscaleMode = UpscaleMode::PERFORMANCE;
             }
         }
         // AMD Detection
         else if (gpuLower.find("amd") != std::string::npos ||
                  gpuLower.find("radeon") != std::string::npos) {
             gpuVendor = "AMD";
+            isAMD = true;
 
-            // RX 7900 series - ULTRA
+            // RX 7900 series - ULTRA (RDNA 3)
             if (gpuLower.find("7900") != std::string::npos) {
                 gpuTier = GPUTier::ULTRA;
+                supportsMeshShaders = true;  // RDNA 2+ has mesh shaders
+                recommendedUpscaleMode = UpscaleMode::NATIVE;
             }
-            // RX 6800-6900, RX 7700-7800 - HIGH
+            // RX 6800-6900, RX 7700-7800 - HIGH (RDNA 2/3)
             else if (gpuLower.find("6900") != std::string::npos ||
                      gpuLower.find("6800") != std::string::npos ||
                      gpuLower.find("7800") != std::string::npos ||
                      gpuLower.find("7700") != std::string::npos) {
                 gpuTier = GPUTier::HIGH;
+                supportsMeshShaders = true;  // RDNA 2+
+                recommendedUpscaleMode = UpscaleMode::NATIVE;
             }
             // RX 6600-6700, RX 5700 - MID
             else if (gpuLower.find("6700") != std::string::npos ||
-                     gpuLower.find("6600") != std::string::npos ||
-                     gpuLower.find("5700") != std::string::npos ||
+                     gpuLower.find("6600") != std::string::npos) {
+                gpuTier = GPUTier::MID;
+                supportsMeshShaders = true;  // RDNA 2
+                recommendedUpscaleMode = UpscaleMode::QUALITY;
+            }
+            else if (gpuLower.find("5700") != std::string::npos ||
                      gpuLower.find("5600") != std::string::npos) {
                 gpuTier = GPUTier::MID;
+                supportsMeshShaders = false;  // RDNA 1 - no mesh shaders
+                recommendedUpscaleMode = UpscaleMode::BALANCED;
             }
             else {
                 gpuTier = GPUTier::LOW;
+                supportsMeshShaders = false;
+                recommendedUpscaleMode = UpscaleMode::PERFORMANCE;
             }
         }
         // Intel Detection
         else if (gpuLower.find("intel") != std::string::npos) {
             gpuVendor = "Intel";
+            isIntel = true;
 
-            // Intel Arc - MID to HIGH
+            // Intel Arc - MID to HIGH (Xe-HPG supports mesh shaders)
             if (gpuLower.find("arc") != std::string::npos) {
                 if (gpuLower.find("a770") != std::string::npos ||
                     gpuLower.find("a750") != std::string::npos) {
                     gpuTier = GPUTier::MID;
+                    supportsMeshShaders = true;  // Xe-HPG
+                    recommendedUpscaleMode = UpscaleMode::QUALITY;
                 } else {
                     gpuTier = GPUTier::LOW;
+                    supportsMeshShaders = true;  // Xe-HPG
+                    recommendedUpscaleMode = UpscaleMode::BALANCED;
                 }
             }
             // Intel integrated - LOW
             else {
                 gpuTier = GPUTier::LOW;
+                supportsMeshShaders = false;
+                recommendedUpscaleMode = UpscaleMode::ULTRA_PERF;
             }
         }
         else {
             gpuTier = GPUTier::MID;  // Default to MID if unknown
+            recommendedUpscaleMode = UpscaleMode::BALANCED;
         }
+
+        // FSR 1.0 works on all GPUs (it's just shader-based)
+        supportsFSR = true;
     }
 
     // Calculate recommended settings based on hardware
@@ -222,6 +280,30 @@ struct HardwareInfo {
         }
     }
 
+    // Get upscale mode name as string
+    std::string getUpscaleModeName() const {
+        switch (recommendedUpscaleMode) {
+            case UpscaleMode::NATIVE: return "NATIVE (1.0x)";
+            case UpscaleMode::QUALITY: return "QUALITY (1.5x)";
+            case UpscaleMode::BALANCED: return "BALANCED (1.7x)";
+            case UpscaleMode::PERFORMANCE: return "PERFORMANCE (2.0x)";
+            case UpscaleMode::ULTRA_PERF: return "ULTRA PERF (3.0x)";
+            default: return "NATIVE (1.0x)";
+        }
+    }
+
+    // Get render scale factor for upscale mode
+    static float getRenderScale(UpscaleMode mode) {
+        switch (mode) {
+            case UpscaleMode::NATIVE: return 1.0f;
+            case UpscaleMode::QUALITY: return 1.0f / 1.5f;      // 67%
+            case UpscaleMode::BALANCED: return 1.0f / 1.7f;     // 59%
+            case UpscaleMode::PERFORMANCE: return 0.5f;          // 50%
+            case UpscaleMode::ULTRA_PERF: return 1.0f / 3.0f;   // 33%
+            default: return 1.0f;
+        }
+    }
+
     void print() const {
         std::cout << "\n=== Hardware Detection ===" << std::endl;
         std::cout << "GPU: " << gpuName << std::endl;
@@ -229,6 +311,12 @@ struct HardwareInfo {
         std::cout << "VRAM: " << (vramMB > 0 ? std::to_string(vramMB) + " MB" : "Unknown") << std::endl;
         std::cout << "Performance Tier: " << getTierName() << std::endl;
         std::cout << "CPU Threads: " << cpuThreads << std::endl;
+        std::cout << "\nVendor Features:" << std::endl;
+        std::cout << "  NVIDIA: " << (isNVIDIA ? "Yes" : "No") << std::endl;
+        std::cout << "  AMD: " << (isAMD ? "Yes" : "No") << std::endl;
+        std::cout << "  Intel: " << (isIntel ? "Yes" : "No") << std::endl;
+        std::cout << "  Mesh Shaders: " << (supportsMeshShaders ? "Yes" : "No") << std::endl;
+        std::cout << "  FSR Support: " << (supportsFSR ? "Yes" : "No") << std::endl;
         std::cout << "\nRecommended Settings:" << std::endl;
         std::cout << "  Render Distance: " << recommendedRenderDistance << std::endl;
         std::cout << "  Shadow Resolution: " << recommendedShadowRes << std::endl;
@@ -236,6 +324,7 @@ struct HardwareInfo {
         std::cout << "  Chunk Threads: " << recommendedChunkThreads << std::endl;
         std::cout << "  Mesh Threads: " << recommendedMeshThreads << std::endl;
         std::cout << "  Volumetric Clouds: " << (recommendedVolumetricClouds ? "Yes" : "No") << std::endl;
+        std::cout << "  Upscale Mode: " << getUpscaleModeName() << std::endl;
         std::cout << "==========================\n" << std::endl;
     }
 };
@@ -279,6 +368,11 @@ struct GameConfig {
     bool enableDeferredRendering = true; // Use deferred rendering pipeline
 
     bool showPerformanceStats = true;   // Show FPS and timing overlay
+
+    // FSR / Upscaling
+    UpscaleMode upscaleMode = UpscaleMode::NATIVE;  // FSR upscaling preset
+    bool enableFSR = false;                          // Enable FSR upscaling
+    float fsrSharpness = 0.5f;                       // FSR sharpening strength (0-2)
 
     // Gameplay
     float mouseSensitivity = 0.1f;
@@ -347,8 +441,16 @@ struct GameConfig {
         // Adjust fog based on render distance
         fogDensity = 0.008f / static_cast<float>(renderDistance);
 
+        // Apply FSR recommendations based on GPU tier
+        upscaleMode = g_hardware.recommendedUpscaleMode;
+        enableFSR = (upscaleMode != UpscaleMode::NATIVE);
+        fsrSharpness = 0.5f;  // Default sharpness
+
         std::cout << "Auto-tune complete. Settings optimized for "
                   << g_hardware.getTierName() << " tier hardware." << std::endl;
+        if (enableFSR) {
+            std::cout << "FSR upscaling enabled: " << g_hardware.getUpscaleModeName() << std::endl;
+        }
     }
 
     // Save config to file
@@ -393,6 +495,11 @@ struct GameConfig {
         file << "enableHiZCulling=" << (enableHiZCulling ? "true" : "false") << "\n";
         file << "enableDeferredRendering=" << (enableDeferredRendering ? "true" : "false") << "\n";
         file << "showPerformanceStats=" << (showPerformanceStats ? "true" : "false") << "\n";
+
+        file << "\n[Upscaling]\n";
+        file << "enableFSR=" << (enableFSR ? "true" : "false") << "\n";
+        file << "upscaleMode=" << static_cast<int>(upscaleMode) << "\n";
+        file << "fsrSharpness=" << fsrSharpness << "\n";
 
         file << "\n[Gameplay]\n";
         file << "mouseSensitivity=" << mouseSensitivity << "\n";
@@ -462,6 +569,10 @@ struct GameConfig {
             else if (key == "enableHiZCulling") enableHiZCulling = (value == "true");
             else if (key == "enableDeferredRendering") enableDeferredRendering = (value == "true");
             else if (key == "showPerformanceStats") showPerformanceStats = (value == "true");
+            // Upscaling settings
+            else if (key == "enableFSR") enableFSR = (value == "true");
+            else if (key == "upscaleMode") upscaleMode = static_cast<UpscaleMode>(std::stoi(value));
+            else if (key == "fsrSharpness") fsrSharpness = std::stof(value);
             else if (key == "mouseSensitivity") mouseSensitivity = std::stof(value);
             else if (key == "invertY") invertY = (value == "true");
             else if (key == "dayLength") dayLength = std::stof(value);

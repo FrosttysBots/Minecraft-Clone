@@ -164,7 +164,7 @@ private:
             for (int x = 0; x < TEXTURE_SIZE; x++) {
                 if (y < 4) {
                     // Grass on top with gradient
-                    uint8_t r = 75, g = 175 - y * 10, b = 95;
+                    uint8_t r = 75, g = static_cast<uint8_t>(175 - y * 10), b = 95;
                     varyColor(r, g, b, x, y, 55, 15);
                     setPixel(pixels, ax, ay, x, y, r, g, b);
                 } else {
@@ -231,7 +231,7 @@ private:
         int cx = TEXTURE_SIZE / 2, cy = TEXTURE_SIZE / 2;
         for (int y = 0; y < TEXTURE_SIZE; y++) {
             for (int x = 0; x < TEXTURE_SIZE; x++) {
-                float dist = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+                float dist = sqrtf(static_cast<float>((x - cx) * (x - cx) + (y - cy) * (y - cy)));
                 if (dist < 6) {
                     // Inner wood with rings
                     uint8_t r = 180, g = 145, b = 90;
@@ -467,7 +467,7 @@ private:
         int cx = TEXTURE_SIZE / 2, cy = TEXTURE_SIZE / 2;
         for (int y = 0; y < TEXTURE_SIZE; y++) {
             for (int x = 0; x < TEXTURE_SIZE; x++) {
-                float dist = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+                float dist = sqrtf(static_cast<float>((x - cx) * (x - cx) + (y - cy) * (y - cy)));
                 // Lighter green in center
                 uint8_t r = 65, g = 140, b = 55;
                 if (dist < 5) {

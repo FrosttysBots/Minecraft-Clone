@@ -13,8 +13,33 @@
 #include <array>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/hash.hpp>
+
+// External mesh shader globals (defined in main.cpp)
+extern bool g_meshShadersAvailable;
+extern bool g_enableMeshShaders;
+extern GLuint meshShaderProgram;
+extern GLuint meshShaderDataUBO;
+extern GLuint frustumPlanesUBO;
+
+// GL_NV_mesh_shader constants
+#ifndef GL_TASK_SHADER_NV
+#define GL_TASK_SHADER_NV 0x955A
+#endif
+#ifndef GL_MESH_SHADER_NV
+#define GL_MESH_SHADER_NV 0x9559
+#endif
+
+// Function pointer for glDrawMeshTasksNV (loaded in main.cpp)
+#ifndef GLAD_GL_NV_mesh_shader
+typedef void (APIENTRY* PFNGLDRAWMESHTASKSNVPROC_LOCAL)(GLuint first, GLuint count);
+extern PFNGLDRAWMESHTASKSNVPROC_LOCAL pfn_glDrawMeshTasksNV;
+#define glDrawMeshTasksNV_ptr pfn_glDrawMeshTasksNV
+#else
+#define glDrawMeshTasksNV_ptr glad_glDrawMeshTasksNV
+#endif
 
 // Frustum culling for chunks
 class Frustum {
@@ -128,6 +153,31 @@ public:
     // Chunk meshes stored by position
     std::unordered_map<glm::ivec2, std::unique_ptr<ChunkMesh>> meshes;
 
+    // ================================================================
+    // SODIUM-STYLE INDIRECT RENDERING
+    // ================================================================
+    // OpenGL indirect draw command (matches glDrawArraysIndirectCommand)
+    struct DrawArraysIndirectCommand {
+        GLuint count;        // Number of vertices
+        GLuint instanceCount; // Number of instances (always 1)
+        GLuint first;        // Offset in vertex buffer
+        GLuint baseInstance; // Base instance (for per-draw data)
+    };
+
+    // Per-draw data sent via SSBO (chunk offset, LOD, etc.)
+    struct alignas(16) DrawCallData {
+        glm::vec3 chunkOffset;
+        float padding;
+    };
+
+    // Indirect rendering resources
+    GLuint indirectCommandBuffer = 0;    // Buffer of DrawArraysIndirectCommand
+    GLuint drawDataSSBO = 0;             // Per-draw chunk offsets
+    GLuint batchedVAO = 0;               // VAO for batched rendering
+    GLuint batchedVBO = 0;               // Combined vertex buffer for batching
+    bool indirectRenderingEnabled = true; // Toggle for indirect vs traditional
+    size_t maxDrawCommands = 8192;       // Max sub-chunks to batch
+
     // Terrain generator (for main thread fallback)
     TerrainGenerator terrainGenerator;
 
@@ -158,6 +208,12 @@ public:
     // Burst mode - removes per-frame throttling for faster loading
     bool burstMode = false;
 
+    // Auto burst mode during initial load
+    bool initialLoadComplete = false;
+    int targetChunkCount = 0;  // Expected chunks based on render distance
+    bool meshletRegenerationNeeded = false;  // Flag to regenerate meshlets after burst mode
+    int meshletRegenIndex = 0;  // Current mesh index for lazy regeneration
+
     World(int worldSeed = 12345) : terrainGenerator(worldSeed), seed(worldSeed) {
         // Thread pool will be initialized later via initThreadPool()
     }
@@ -175,11 +231,37 @@ public:
         std::cout << "  Chunk threads: " << chunkThreads << ", Mesh threads: " << meshThreads << std::endl;
     }
 
+    // Initialize indirect rendering buffers
+    void initIndirectRendering() {
+        // Create indirect command buffer
+        glGenBuffers(1, &indirectCommandBuffer);
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectCommandBuffer);
+        glBufferData(GL_DRAW_INDIRECT_BUFFER,
+                     maxDrawCommands * sizeof(DrawArraysIndirectCommand),
+                     nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+
+        // Create per-draw data SSBO
+        glGenBuffers(1, &drawDataSSBO);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, drawDataSSBO);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,
+                     maxDrawCommands * sizeof(DrawCallData),
+                     nullptr, GL_DYNAMIC_DRAW);
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        std::cout << "Indirect rendering initialized (max " << maxDrawCommands << " draw commands)" << std::endl;
+    }
+
     ~World() {
         // Shutdown thread pool
         if (chunkThreadPool) {
             chunkThreadPool->shutdown();
         }
+        // Cleanup indirect rendering resources
+        if (indirectCommandBuffer != 0) glDeleteBuffers(1, &indirectCommandBuffer);
+        if (drawDataSSBO != 0) glDeleteBuffers(1, &drawDataSSBO);
+        if (batchedVAO != 0) glDeleteVertexArrays(1, &batchedVAO);
+        if (batchedVBO != 0) glDeleteBuffers(1, &batchedVBO);
     }
 
     // Get or create chunk at position
@@ -463,6 +545,33 @@ public:
     void update(const glm::vec3& playerPos, float deltaTime = 0.0f) {
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
 
+        // Auto burst mode during initial load for faster startup
+        if (!initialLoadComplete) {
+            // Calculate expected chunk count
+            if (targetChunkCount == 0) {
+                int diameter = renderDistance * 2 + 1;
+                targetChunkCount = diameter * diameter;
+            }
+
+            // Enable burst mode until we have most chunks loaded
+            int loadedChunks = static_cast<int>(chunks.size());
+            int loadedMeshes = static_cast<int>(meshes.size());
+
+            if (loadedChunks >= targetChunkCount && loadedMeshes >= targetChunkCount * 0.8f) {
+                initialLoadComplete = true;
+                burstMode = false;
+                if (chunkThreadPool) {
+                    chunkThreadPool->setFastLoadMode(false);  // Enable full LOD generation
+                }
+                meshletRegenerationNeeded = g_generateMeshlets;  // Queue meshlet regeneration
+                meshletRegenIndex = 0;
+                std::cout << "Initial load complete! " << loadedChunks << " chunks, "
+                          << loadedMeshes << " meshes" << std::endl;
+            } else {
+                burstMode = true;  // Keep burst mode on during initial load
+            }
+        }
+
         // Process chunks completed by worker threads
         processCompletedChunks();
 
@@ -472,17 +581,65 @@ public:
         // Unload distant chunks
         unloadDistantChunks(playerChunk);
 
-        // Update water simulation
-        waterUpdateTimer += deltaTime;
-        if (waterUpdateTimer >= waterUpdateInterval) {
-            updateWater(playerChunk);
-            waterUpdateTimer = 0.0f;
+        // Update water simulation (skip during burst mode for faster loading)
+        if (!burstMode) {
+            waterUpdateTimer += deltaTime;
+            if (waterUpdateTimer >= waterUpdateInterval) {
+                updateWater(playerChunk);
+                waterUpdateTimer = 0.0f;
+            }
         }
 
         // Update meshes
         updateMeshes(playerChunk);
 
+        // Lazy meshlet regeneration after burst mode (a few per frame)
+        if (meshletRegenerationNeeded && g_generateMeshlets) {
+            regenerateMeshletsLazy(8);  // Regenerate 8 sub-chunks per frame
+        }
+
         lastPlayerChunk = playerChunk;
+    }
+
+    // Lazily regenerate meshlets for meshes that were created during burst mode
+    void regenerateMeshletsLazy(int maxPerFrame) {
+        if (!meshletRegenerationNeeded) return;
+
+        int processed = 0;
+        auto it = meshes.begin();
+
+        // Skip to current index
+        for (int i = 0; i < meshletRegenIndex && it != meshes.end(); ++i, ++it);
+
+        // Process a few meshes per frame
+        while (it != meshes.end() && processed < maxPerFrame) {
+            ChunkMesh* mesh = it->second.get();
+
+            // Find sub-chunks that need meshlet generation
+            for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN && processed < maxPerFrame; ++subY) {
+                auto& subChunk = mesh->subChunks[subY];
+
+                // Skip if already has meshlets or is empty
+                if (subChunk.isEmpty || subChunk.meshletData.hasMeshlets()) continue;
+
+                // Get vertex data from existing VBO (need to read back or cache)
+                // For now, mark as needing rebuild by dirtying the chunk
+                auto chunkIt = chunks.find(it->first);
+                if (chunkIt != chunks.end()) {
+                    chunkIt->second->isDirty = true;
+                }
+                processed++;
+            }
+
+            ++it;
+            ++meshletRegenIndex;
+        }
+
+        // Check if done
+        if (it == meshes.end()) {
+            meshletRegenerationNeeded = false;
+            std::cout << "Meshlet regeneration complete!" << std::endl;
+        }
     }
 
     // Simulate water flow
@@ -752,14 +909,6 @@ public:
             ChunkMesh* mesh = meshes[pos].get();
             mesh->worldOffset = meshResult.worldOffset;
 
-            int baseX = pos.x * CHUNK_SIZE_X;
-            int baseZ = pos.y * CHUNK_SIZE_Z;
-
-            // Block getter for water face culling
-            auto getWaterBlock = [this](int x, int y, int z) -> BlockType {
-                return this->getBlockForWater(x, y, z);
-            };
-
             // Upload each sub-chunk's data to GPU
             for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
                 auto& subData = meshResult.subChunks[subY];
@@ -775,39 +924,17 @@ public:
                     }
                 }
 
-                // Generate water on main thread (needs TextureAtlas access)
-                int yStart = subY * SUB_CHUNK_HEIGHT;
-                int yEnd = yStart + SUB_CHUNK_HEIGHT - 1;
-
-                std::vector<ChunkVertex> waterVertices;
-                waterVertices.reserve(256);
-
-                // Only process if sub-chunk has blocks
-                if (yStart <= chunk->chunkMaxY && yEnd >= chunk->chunkMinY) {
-                    int effectiveMinY = std::max(yStart, static_cast<int>(chunk->chunkMinY));
-                    int effectiveMaxY = std::min(yEnd, static_cast<int>(chunk->chunkMaxY));
-
-                    for (int y = effectiveMinY; y <= effectiveMaxY; y++) {
-                        for (int z = 0; z < CHUNK_SIZE_Z; z++) {
-                            for (int x = 0; x < CHUNK_SIZE_X; x++) {
-                                BlockType block = chunk->getBlock(x, y, z);
-                                if (block == BlockType::WATER || block == BlockType::LAVA) {
-                                    int wx = baseX + x;
-                                    int wz = baseZ + z;
-                                    BlockTextures textures = getBlockTextures(block);
-                                    glm::vec3 blockPos = mesh->worldOffset + glm::vec3(x, y, z);
-                                    mesh->addWaterBlockPublic(waterVertices, *chunk, x, y, z, blockPos,
-                                                             textures.faceSlots[0], getWaterBlock, wx, wz);
-                                }
-                            }
-                        }
-                    }
+                // Generate meshlets for mesh shader rendering (if enabled)
+                // Must be done on main thread (OpenGL calls)
+                // Skip during burst mode for faster initial loading
+                if (g_generateMeshlets && !burstMode && !subData.lodVertices[0].empty()) {
+                    mesh->generateMeshlets(subY, subData.lodVertices[0]);
                 }
 
-                // Upload water and set flag
-                subChunk.hasWater = !waterVertices.empty();
-                if (!waterVertices.empty()) {
-                    mesh->uploadWaterToSubChunk(subY, waterVertices);
+                // Upload pre-generated water vertices (generated on worker thread)
+                subChunk.hasWater = subData.hasWater;
+                if (!subData.waterVertices.empty()) {
+                    mesh->uploadWaterToSubChunk(subY, subData.waterVertices);
                 }
             }
         }
@@ -1042,6 +1169,187 @@ public:
         lastRenderedChunks = static_cast<int>(meshes.size());  // Approximate
     }
 
+    // ================================================================
+    // MESH SHADER RENDERING PATH (GL_NV_mesh_shader)
+    // ================================================================
+    // Renders sub-chunks using mesh shaders with per-meshlet frustum culling
+    void renderSubChunksMeshShader(const glm::vec3& playerPos, const glm::mat4& viewProj) {
+        if (!g_meshShadersAvailable || !g_enableMeshShaders || meshShaderProgram == 0) {
+            return;
+        }
+
+        glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
+        lastRenderedSubChunks = 0;
+
+        // Use mesh shader program
+        glUseProgram(meshShaderProgram);
+
+        // Update frustum planes UBO for per-meshlet culling
+        glBindBuffer(GL_UNIFORM_BUFFER, frustumPlanesUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, 6 * sizeof(glm::vec4), frustum.planes.data());
+        glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+        // Bind texture atlas
+        glActiveTexture(GL_TEXTURE0);
+        // Note: Texture should already be bound by caller
+
+        // Collect visible sub-chunks
+        struct SubChunkToDraw {
+            ChunkMesh* mesh;
+            int subChunkY;
+            float distSq;
+        };
+        std::vector<SubChunkToDraw> visibleSubChunks;
+        visibleSubChunks.reserve(meshes.size() * 8);
+
+        for (auto& [pos, mesh] : meshes) {
+            int dx = pos.x - playerChunk.x;
+            int dz = pos.y - playerChunk.y;
+
+            if (abs(dx) <= renderDistance && abs(dz) <= renderDistance) {
+                float baseDistSq = static_cast<float>(dx * dx + dz * dz);
+
+                for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
+                    const auto& subChunk = mesh->subChunks[subY];
+
+                    // Skip empty sub-chunks or those without meshlet data
+                    if (subChunk.isEmpty) continue;
+                    if (!subChunk.meshletData.hasMeshlets()) continue;
+
+                    // Frustum culling at sub-chunk level
+                    glm::ivec3 subPos(pos.x, subY, pos.y);
+                    if (!frustum.isSubChunkVisible(subPos)) continue;
+
+                    visibleSubChunks.push_back({mesh.get(), subY, baseDistSq});
+                }
+            }
+        }
+
+        // Sort front-to-back
+        std::sort(visibleSubChunks.begin(), visibleSubChunks.end(),
+            [](const SubChunkToDraw& a, const SubChunkToDraw& b) {
+                return a.distSq < b.distSq;
+            });
+
+        // Render each sub-chunk using mesh shaders
+        for (const auto& sub : visibleSubChunks) {
+            const auto& subChunk = sub.mesh->subChunks[sub.subChunkY];
+            const auto& meshletData = subChunk.meshletData;
+
+            if (meshletData.meshlets.empty()) continue;
+
+            // Update mesh shader data UBO
+            struct MeshShaderData {
+                glm::mat4 viewProj;
+                glm::vec3 chunkOffset;
+                uint32_t meshletCount;
+            } uboData;
+
+            uboData.viewProj = viewProj;
+            uboData.chunkOffset = sub.mesh->worldOffset;
+            uboData.meshletCount = static_cast<uint32_t>(meshletData.meshlets.size());
+
+            glBindBuffer(GL_UNIFORM_BUFFER, meshShaderDataUBO);
+            glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(MeshShaderData), &uboData);
+            glBindBuffer(GL_UNIFORM_BUFFER, 0);
+
+            // Bind vertex SSBO (binding = 0)
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, subChunk.vertexSSBO);
+
+            // Bind meshlet descriptors SSBO (binding = 2)
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, meshletData.meshletSSBO);
+
+            // Dispatch mesh shader tasks
+            // Each task shader workgroup handles 32 meshlets
+            uint32_t taskCount = (uboData.meshletCount + 31) / 32;
+            glDrawMeshTasksNV_ptr(0, taskCount);
+
+            lastRenderedSubChunks++;
+        }
+    }
+
+    // ================================================================
+    // SODIUM-STYLE BATCHED RENDERING (Multi-draw indirect)
+    // ================================================================
+    // Batches sub-chunks by chunk column to reduce uniform updates
+    // Uses glMultiDrawArraysIndirect for better driver efficiency
+    void renderSubChunksBatched(const glm::vec3& playerPos, GLint chunkOffsetLoc) {
+        if (indirectCommandBuffer == 0) return;
+
+        glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
+        lastRenderedSubChunks = 0;
+
+        // Group sub-chunks by chunk column for batching
+        struct ChunkColumn {
+            ChunkMesh* mesh;
+            glm::ivec2 pos;
+            float distSq;
+            std::vector<std::pair<int, int>> subChunks; // (subChunkY, lodLevel)
+        };
+        std::vector<ChunkColumn> columns;
+        columns.reserve(meshes.size());
+
+        // Collect visible chunk columns
+        for (auto& [pos, mesh] : meshes) {
+            int dx = pos.x - playerChunk.x;
+            int dz = pos.y - playerChunk.y;
+
+            if (abs(dx) <= renderDistance && abs(dz) <= renderDistance) {
+                float distSq = static_cast<float>(dx * dx + dz * dz);
+
+                ChunkColumn col;
+                col.mesh = mesh.get();
+                col.pos = pos;
+                col.distSq = distSq;
+
+                // Collect visible sub-chunks in this column
+                for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
+                    const auto& subChunk = mesh->subChunks[subY];
+                    if (subChunk.isEmpty) continue;
+
+                    glm::ivec3 subPos(pos.x, subY, pos.y);
+                    if (!frustum.isSubChunkVisible(subPos)) continue;
+
+                    // Hi-Z culling
+                    if (useHiZCulling && !hiZSubChunkVisibility.empty()) {
+                        auto it = hiZSubChunkVisibility.find(subPos);
+                        if (it != hiZSubChunkVisibility.end() && !it->second) continue;
+                    }
+
+                    int lodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(distSq);
+                    col.subChunks.push_back({subY, lodLevel});
+                }
+
+                if (!col.subChunks.empty()) {
+                    columns.push_back(std::move(col));
+                }
+            }
+        }
+
+        // Sort columns front-to-back
+        std::sort(columns.begin(), columns.end(),
+            [](const ChunkColumn& a, const ChunkColumn& b) {
+                return a.distSq < b.distSq;
+            });
+
+        // Render each column - all sub-chunks share the same chunk offset
+        // This reduces uniform updates from O(subchunks) to O(columns)
+        for (const auto& col : columns) {
+            // Update chunk offset once per column
+            if (chunkOffsetLoc >= 0) {
+                glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(col.mesh->worldOffset));
+            }
+
+            // Render all sub-chunks in this column
+            for (const auto& [subY, lodLevel] : col.subChunks) {
+                col.mesh->renderSubChunk(subY, lodLevel);
+                lastRenderedSubChunks++;
+            }
+        }
+
+        lastRenderedChunks = static_cast<int>(columns.size());
+    }
+
     // Render all water geometry - call this AFTER render() with depth write disabled
     // Sorted back-to-front for proper alpha blending
     void renderWater(const glm::vec3& playerPos) {
@@ -1069,10 +1377,17 @@ public:
             int dz = pos.y - playerChunk.y;
 
             if (abs(dx) <= renderDistance && abs(dz) <= renderDistance) {
-                if (frustum.isChunkVisible(pos)) {
-                    float distSq = static_cast<float>(dx * dx + dz * dz);
-                    waterChunks.push_back({mesh.get(), distSq});
+                // Frustum culling
+                if (!frustum.isChunkVisible(pos)) continue;
+
+                // Hi-Z occlusion culling
+                if (useHiZCulling && !hiZVisibility.empty()) {
+                    auto it = hiZVisibility.find(pos);
+                    if (it != hiZVisibility.end() && !it->second) continue;
                 }
+
+                float distSq = static_cast<float>(dx * dx + dz * dz);
+                waterChunks.push_back({mesh.get(), distSq});
             }
         }
 
@@ -1137,6 +1452,15 @@ public:
                 if (!frustum.isSubChunkVisible(subPos)) {
                     lastCulledWaterSubChunks++;
                     continue;
+                }
+
+                // Hi-Z occlusion culling for water (same as solid geometry)
+                if (useHiZCulling && !hiZSubChunkVisibility.empty()) {
+                    auto it = hiZSubChunkVisibility.find(subPos);
+                    if (it != hiZSubChunkVisibility.end() && !it->second) {
+                        lastCulledWaterSubChunks++;
+                        continue;
+                    }
                 }
 
                 int dy = subY - playerSubY;

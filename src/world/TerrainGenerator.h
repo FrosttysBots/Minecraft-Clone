@@ -186,7 +186,7 @@ private:
 
         // Combine noise layers
         // Base height + continent variation + mountains + detail
-        float heightValue = baseHeight;
+        float heightValue = static_cast<float>(baseHeight);
         heightValue += continent * 20.0f;           // +/- 20 blocks from continent
         heightValue += mountain * 30.0f;            // Up to 30 extra for mountains
         heightValue += detail * 4.0f;               // +/- 4 blocks detail
