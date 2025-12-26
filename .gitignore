@@ -1,0 +1,19 @@
+# Build output
+build/
+*.exe
+*.lib
+*.obj
+*.pdb
+
+# IDE files
+.vs/
+*.user
+*.suo
+
+# Logs and temp files
+RenderTime.txt
+nul
+*.log
+
+# Config (user-specific)
+settings.cfg
