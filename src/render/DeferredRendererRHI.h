@@ -132,6 +132,9 @@ private:
     uint32_t m_displayHeight = 0;
     uint32_t m_renderWidth = 0;
     uint32_t m_renderHeight = 0;
+
+    // OpenGL blit framebuffer for final output
+    uint32_t m_blitFBO = 0;
 };
 
 } // namespace Render

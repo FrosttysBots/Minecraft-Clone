@@ -2,6 +2,7 @@
 #include "BackendSelector.h"
 #include "../core/Config.h"
 
+#include <glad/gl.h>
 #include <iostream>
 #include <chrono>
 #include <fstream>
@@ -199,6 +200,12 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 void DeferredRendererRHI::shutdown() {
     if (m_device) {
         m_device->waitIdle();
+    }
+
+    // Cleanup OpenGL blit FBO
+    if (m_blitFBO != 0) {
+        glDeleteFramebuffers(1, &m_blitFBO);
+        m_blitFBO = 0;
     }
 
     // Shutdown world renderer
@@ -410,8 +417,46 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         m_fsrPass->execute(cmd, m_context);
     }
 
-    // 9. Present to swapchain
-    // TODO: Final blit to swapchain
+    // 9. Final blit to default framebuffer (screen)
+    // Get the final output texture (FSR output if enabled, composite output otherwise)
+    RHI::RHITexture* finalOutput = nullptr;
+    RHI::RHIFramebuffer* sourceFramebuffer = nullptr;
+
+    if (m_config.upscaleMode != UpscaleMode::NATIVE && m_fsrPass) {
+        finalOutput = m_fsrPass->getOutputTexture();
+        // FSR doesn't have a framebuffer, need to use its output texture
+    } else {
+        finalOutput = m_compositePass->getOutputTexture();
+        sourceFramebuffer = m_compositePass->getFramebuffer();
+    }
+
+    if (finalOutput && m_device->getBackend() == RHI::Backend::OpenGL) {
+        // OpenGL: Blit the output to the default framebuffer
+        GLuint srcTexture = static_cast<GLuint>(reinterpret_cast<uintptr_t>(finalOutput->getNativeHandle()));
+
+        // Create temporary FBO for reading if needed
+        if (m_blitFBO == 0) {
+            glGenFramebuffers(1, &m_blitFBO);
+        }
+
+        // Attach source texture to read FBO
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, m_blitFBO);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, srcTexture, 0);
+
+        // Bind default framebuffer for drawing
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+
+        // Blit from RHI output to screen
+        glBlitFramebuffer(
+            0, 0, m_displayWidth, m_displayHeight,  // Source rect
+            0, 0, m_displayWidth, m_displayHeight,  // Dest rect (screen)
+            GL_COLOR_BUFFER_BIT,
+            GL_NEAREST  // Filtering
+        );
+
+        // Restore framebuffer binding
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
 
     // Copy accumulated stats
     m_stats = m_context.stats;
