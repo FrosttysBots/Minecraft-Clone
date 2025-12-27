@@ -7,6 +7,7 @@
 #include "../render/GPUCulling.h"
 #include "../render/VertexPool.h"
 #include "../core/CrashHandler.h"
+#include "WorldSaveLoad.h"
 #include <unordered_map>
 #include <memory>
 #include <vector>
@@ -307,6 +308,22 @@ public:
     bool meshletRegenerationNeeded = false;  // Flag to regenerate meshlets after burst mode
     int meshletRegenIndex = 0;  // Current mesh index for lazy regeneration
 
+    // ================================================================
+    // CHUNK CACHING (Bobby-style)
+    // ================================================================
+    std::string worldSavePath = "";      // Path to current world save folder
+    bool useChunkCaching = true;         // Enable loading/saving chunks from disk
+
+    // ================================================================
+    // PRE-GENERATION (Chunky-style)
+    // ================================================================
+    bool pregenerationActive = false;
+    int pregenerationProgress = 0;       // Chunks pre-generated so far
+    int pregenerationTotal = 0;          // Total chunks to pre-generate
+    std::vector<glm::ivec2> pregenerationQueue;  // Spiral queue of chunks
+    size_t pregenerationQueueIndex = 0;
+    glm::ivec2 pregenerationCenter{0, 0};  // Center chunk for pregeneration
+
     World(int worldSeed = 12345) : terrainGenerator(worldSeed), seed(worldSeed) {
         // Thread pool will be initialized later via initThreadPool()
     }
@@ -391,6 +408,129 @@ public:
         Chunk* ptr = chunk.get();
         chunks[pos] = std::move(chunk);
         return ptr;
+    }
+
+    // ================================================================
+    // CHUNK CACHING & PRE-GENERATION METHODS
+    // ================================================================
+
+    // Set the world save path for chunk caching
+    void setWorldSavePath(const std::string& path) {
+        worldSavePath = path;
+        std::cout << "[World] Chunk caching enabled, path: " << path << std::endl;
+    }
+
+    // Build spiral pre-generation queue from center outward
+    void buildPregenerationQueue(int radius, glm::ivec2 center) {
+        pregenerationQueue.clear();
+        pregenerationQueueIndex = 0;
+        pregenerationCenter = center;
+
+        // Spiral from center outward
+        for (int ring = 0; ring <= radius; ring++) {
+            if (ring == 0) {
+                pregenerationQueue.push_back(center);
+                continue;
+            }
+            // Top edge (left to right)
+            for (int x = -ring; x <= ring; x++) {
+                pregenerationQueue.push_back(center + glm::ivec2(x, -ring));
+            }
+            // Right edge (top+1 to bottom-1)
+            for (int z = -ring + 1; z < ring; z++) {
+                pregenerationQueue.push_back(center + glm::ivec2(ring, z));
+            }
+            // Bottom edge (right to left)
+            for (int x = ring; x >= -ring; x--) {
+                pregenerationQueue.push_back(center + glm::ivec2(x, ring));
+            }
+            // Left edge (bottom-1 to top+1)
+            for (int z = ring - 1; z > -ring; z--) {
+                pregenerationQueue.push_back(center + glm::ivec2(-ring, z));
+            }
+        }
+
+        pregenerationTotal = static_cast<int>(pregenerationQueue.size());
+        pregenerationProgress = 0;
+        pregenerationActive = true;
+
+        std::cout << "[World] Pre-generation started: " << radius << " chunk radius ("
+                  << pregenerationTotal << " total chunks)" << std::endl;
+    }
+
+    // Process pre-generation queue with lower priority than player chunks
+    void updatePregeneration() {
+        if (!pregenerationActive || pregenerationQueueIndex >= pregenerationQueue.size()) {
+            if (pregenerationActive) {
+                pregenerationActive = false;
+                std::cout << "[World] Pre-generation complete: " << pregenerationProgress
+                          << " chunks generated" << std::endl;
+            }
+            return;
+        }
+
+        // Lower priority than player chunks: 1-2 chunks per frame
+        int maxToQueue = burstMode ? 2 : 1;
+        int queued = 0;
+
+        while (pregenerationQueueIndex < pregenerationQueue.size() && queued < maxToQueue) {
+            glm::ivec2 chunkPos = pregenerationQueue[pregenerationQueueIndex++];
+
+            // Skip if already exists in memory
+            if (getChunk(chunkPos) != nullptr) {
+                pregenerationProgress++;
+                continue;
+            }
+
+            // Check disk cache first
+            if (useChunkCaching && !worldSavePath.empty() &&
+                WorldSaveLoad::chunkExists(worldSavePath, chunkPos)) {
+                auto chunk = std::make_unique<Chunk>(chunkPos);
+                if (WorldSaveLoad::loadChunk(worldSavePath, *chunk, chunkPos)) {
+                    chunk->isDirty = true;
+                    chunk->recalculateHeightmaps();
+                    chunks[chunkPos] = std::move(chunk);
+                    pregenerationProgress++;
+                    continue;
+                }
+            }
+
+            // Queue for generation via thread pool
+            if (chunkThreadPool && !chunkThreadPool->isGenerating(chunkPos)) {
+                chunkThreadPool->queueChunk(chunkPos);
+                queued++;
+            }
+        }
+    }
+
+    // Try to load chunk from disk cache, returns true if loaded
+    bool tryLoadChunkFromCache(glm::ivec2 chunkPos) {
+        if (!useChunkCaching || worldSavePath.empty()) {
+            return false;
+        }
+
+        if (WorldSaveLoad::chunkExists(worldSavePath, chunkPos)) {
+            auto chunk = std::make_unique<Chunk>(chunkPos);
+            if (WorldSaveLoad::loadChunk(worldSavePath, *chunk, chunkPos)) {
+                chunk->isDirty = true;
+                chunk->recalculateHeightmaps();
+                chunks[chunkPos] = std::move(chunk);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Save chunk to disk cache
+    void saveChunkToCache(const glm::ivec2& chunkPos) {
+        if (!useChunkCaching || worldSavePath.empty()) {
+            return;
+        }
+
+        Chunk* chunk = getChunk(chunkPos);
+        if (chunk) {
+            WorldSaveLoad::saveChunk(worldSavePath, *chunk);
+        }
     }
 
     // Get block at world position
@@ -738,6 +878,11 @@ public:
             regenerateMeshletsLazy(8);  // Regenerate 8 sub-chunks per frame
         }
 
+        // Process pre-generation queue (lower priority than player chunks)
+        if (pregenerationActive) {
+            updatePregeneration();
+        }
+
         lastPlayerChunk = playerChunk;
     }
 
@@ -899,6 +1044,14 @@ public:
                 markChunkDirty(glm::ivec2(result.position.x + 1, result.position.y));
                 markChunkDirty(glm::ivec2(result.position.x, result.position.y - 1));
                 markChunkDirty(glm::ivec2(result.position.x, result.position.y + 1));
+
+                // Save newly generated chunk to disk cache
+                saveChunkToCache(result.position);
+
+                // Update pregeneration progress
+                if (pregenerationActive) {
+                    pregenerationProgress++;
+                }
             }
             processed++;
         }
@@ -931,17 +1084,23 @@ public:
                 for (int dz = -renderDistance; dz <= renderDistance; dz++) {
                     glm::ivec2 chunkPos(playerChunk.x + dx, playerChunk.y + dz);
 
-                    if (getChunk(chunkPos) == nullptr &&
-                        (!chunkThreadPool || !chunkThreadPool->isGenerating(chunkPos))) {
-                        // Score: weighted combination of current and predicted distance
-                        float currentDistSq = static_cast<float>(dx * dx + dz * dz);
-                        int pdx = chunkPos.x - predictedChunk.x;
-                        int pdz = chunkPos.y - predictedChunk.y;
-                        float predictedDistSq = static_cast<float>(pdx * pdx + pdz * pdz);
+                    if (getChunk(chunkPos) == nullptr) {
+                        // Try loading from disk cache first
+                        if (tryLoadChunkFromCache(chunkPos)) {
+                            continue;  // Loaded from cache, no need to queue
+                        }
 
-                        // Priority: 40% current distance, 60% predicted distance
-                        float priority = currentDistSq * 0.4f + predictedDistSq * 0.6f;
-                        chunksToLoad.push_back({chunkPos, priority});
+                        if (!chunkThreadPool || !chunkThreadPool->isGenerating(chunkPos)) {
+                            // Score: weighted combination of current and predicted distance
+                            float currentDistSq = static_cast<float>(dx * dx + dz * dz);
+                            int pdx = chunkPos.x - predictedChunk.x;
+                            int pdz = chunkPos.y - predictedChunk.y;
+                            float predictedDistSq = static_cast<float>(pdx * pdx + pdz * pdz);
+
+                            // Priority: 40% current distance, 60% predicted distance
+                            float priority = currentDistSq * 0.4f + predictedDistSq * 0.6f;
+                            chunksToLoad.push_back({chunkPos, priority});
+                        }
                     }
                 }
             }
@@ -978,6 +1137,11 @@ public:
                         glm::ivec2 chunkPos(playerChunk.x + dx, playerChunk.y + dz);
 
                         if (getChunk(chunkPos) == nullptr) {
+                            // Try loading from disk cache first
+                            if (tryLoadChunkFromCache(chunkPos)) {
+                                continue;  // Loaded from cache, no need to generate
+                            }
+
                             if (useMultithreading && chunkThreadPool) {
                                 if (!chunkThreadPool->isGenerating(chunkPos)) {
                                     chunkThreadPool->queueChunk(chunkPos);
@@ -1933,3 +2097,17 @@ public:
         return meshes.size();
     }
 };
+
+// Implementation of WorldSaveLoad::saveAllChunks - defined here because it needs full World class
+inline int WorldSaveLoad::saveAllChunks(const std::string& worldPath, World& world) {
+    int savedCount = 0;
+    for (auto& [pos, chunk] : world.chunks) {
+        if (chunk && chunk->isModified) {
+            if (saveChunk(worldPath, *chunk)) {
+                chunk->isModified = false;
+                savedCount++;
+            }
+        }
+    }
+    return savedCount;
+}

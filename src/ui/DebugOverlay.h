@@ -69,12 +69,17 @@ public:
     int renderedChunks = 0;
     int renderedSubChunks = 0;
     size_t vertexMemory = 0;
+
+    // Pre-generation progress
+    bool pregenerationActive = false;
+    int pregenerationProgress = 0;
+    int pregenerationTotal = 0;
     bool isFlying = false;
     bool isInWater = false;
     bool isOnGround = false;
     std::string facingDirection = "North";
     std::string biome = "Plains";
-    std::string gameVersion = "VoxelEngine 1.0";
+    std::string gameVersion = "VoxelEngine Infdev";
 
     // GPU info
     std::string gpuName = "";
@@ -200,6 +205,11 @@ public:
         timeOfDay = currentTimeOfDay;
         loadedChunks = static_cast<int>(world.chunks.size());
         loadedMeshes = static_cast<int>(world.meshes.size());
+
+        // Pre-generation progress
+        pregenerationActive = world.pregenerationActive;
+        pregenerationProgress = world.pregenerationProgress;
+        pregenerationTotal = world.pregenerationTotal;
 
         // Facing direction based on yaw
         float normalizedYaw = std::fmod(yaw + 360.0f, 360.0f);
@@ -521,6 +531,20 @@ private:
 
         if (culledChunks > 0) {
             drawKeyValue("Culled", std::to_string(culledChunks), x, y, DebugColors::WARN);
+            y += LINE_HEIGHT;
+        }
+
+        // Pre-generation progress (if active)
+        if (pregenerationActive) {
+            float pct = pregenerationTotal > 0
+                ? 100.0f * pregenerationProgress / pregenerationTotal
+                : 0.0f;
+            std::string pregenStr = std::to_string(pregenerationProgress) + "/" +
+                                   std::to_string(pregenerationTotal) + " (" +
+                                   floatStr(pct, 0) + "%)";
+            glm::vec4 pregenColor = pct >= 100.0f ? DebugColors::GOOD :
+                                   (pct >= 50.0f ? DebugColors::TIME : DebugColors::WARN);
+            drawKeyValue("Pre-gen", pregenStr, x, y, pregenColor);
             y += LINE_HEIGHT;
         }
         y += SECTION_GAP;

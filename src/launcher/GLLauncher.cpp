@@ -1013,7 +1013,7 @@ public:
         ui.drawText("ENGINE", 1024 - 100 - 200, 130, Colors::ACCENT, 2.5f);
 
         // Version
-        ui.drawText("v0.1.0", 1024 - 100 - 200, 180, Colors::TEXT_DIM, 1.0f);
+        ui.drawText("Infdev", 1024 - 100 - 200, 180, Colors::TEXT_DIM, 1.0f);
 
         // Menu buttons
         playButton.render(ui);

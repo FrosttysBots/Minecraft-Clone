@@ -38,6 +38,8 @@ public:
     MenuSlider mountainScaleSlider;
     MenuSlider detailScaleSlider;
 
+    MenuSlider pregenerationRadiusSlider;
+
     MenuTextInput equationInput;
     MenuButton validateEquationButton;
     std::string equationValidationMessage;
@@ -207,6 +209,15 @@ public:
             [this](float val) { settings.detailScale = val; }
         };
         detailScaleSlider.showIntValue = false;
+        row++;
+
+        // Pre-generation radius slider
+        pregenerationRadiusSlider = {
+            col1X, startY + row * rowHeight + 10, inputWidth - 50, 28,
+            "Pre-generate Radius (chunks)",
+            0.0f, 64.0f, static_cast<float>(settings.pregenerationRadius),
+            [this](float val) { settings.pregenerationRadius = static_cast<int>(val); }
+        };
         row++;
 
         // Custom Equation (only visible when CUSTOM_EQUATION selected)
@@ -379,6 +390,7 @@ public:
         input.handleSlider(continentScaleSlider);
         input.handleSlider(mountainScaleSlider);
         input.handleSlider(detailScaleSlider);
+        input.handleSlider(pregenerationRadiusSlider);
 
         // Handle dropdowns
         input.handleDropdown(generationTypeDropdown, allDropdowns);
@@ -430,6 +442,7 @@ public:
         continentScaleSlider.render(*ui);
         mountainScaleSlider.render(*ui);
         detailScaleSlider.render(*ui);
+        pregenerationRadiusSlider.render(*ui);
 
         // Custom equation (if visible)
         if (equationInput.visible) {

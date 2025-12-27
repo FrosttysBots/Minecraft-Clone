@@ -4830,6 +4830,15 @@ int main() {
         world.burstMode = true;  // Enable burst mode for maximum loading speed
         glfwSwapInterval(0);     // Disable VSync during loading for max speed
 
+        // Enable chunk caching (Bobby-style)
+        world.setWorldSavePath(worldSaveLoad.currentWorldPath);
+
+        // Start pre-generation if enabled (Chunky-style)
+        if (!loadingExistingWorld && worldSettings.pregenerationRadius > 0) {
+            glm::ivec2 spawnChunk(0, 0);  // Pre-generate around spawn
+            world.buildPregenerationQueue(worldSettings.pregenerationRadius, spawnChunk);
+        }
+
         // Hide cursor for loading screen
         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
         cursorEnabled = false;
@@ -5166,6 +5175,22 @@ int main() {
         // LOADING STATE - Preload chunks before gameplay
         // ============================================================
         if (gameState == GameState::LOADING) {
+            // Try loading chunks from disk cache first (for existing worlds)
+            if (loadingExistingWorld && world.useChunkCaching && !world.worldSavePath.empty()) {
+                int cacheLoaded = 0;
+                for (int dx = -loadRadius; dx <= loadRadius && cacheLoaded < 32; dx++) {
+                    for (int dz = -loadRadius; dz <= loadRadius && cacheLoaded < 32; dz++) {
+                        glm::ivec2 chunkPos(dx, dz);
+                        if (world.getChunk(chunkPos) == nullptr) {
+                            if (world.tryLoadChunkFromCache(chunkPos)) {
+                                chunksLoaded++;
+                                cacheLoaded++;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Process completed chunks from thread pool - no limit during loading
             auto completed = world.chunkThreadPool->getCompletedChunks(1000);
             int chunksThisFrame = 0;
@@ -5173,6 +5198,10 @@ int main() {
                 if (world.getChunk(result.position) == nullptr) {
                     world.chunks[result.position] = std::move(result.chunk);
                     world.chunks[result.position]->isDirty = true;
+
+                    // Save to disk cache
+                    world.saveChunkToCache(result.position);
+
                     chunksLoaded++;
                     chunksThisFrame++;
                 }
