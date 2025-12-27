@@ -353,6 +353,10 @@ void GBufferPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context)
     cmd->endRenderPass();
 
     // Store G-Buffer texture handles in context for subsequent passes
+    storeTextureHandles(context);
+}
+
+void GBufferPassRHI::storeTextureHandles(RenderContext& context) {
     // Get native OpenGL handles from RHI textures for interop
     if (m_gPosition) {
         context.gPosition = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_gPosition->getNativeHandle()));
@@ -366,9 +370,67 @@ void GBufferPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context)
     if (m_gDepth) {
         context.gDepth = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_gDepth->getNativeHandle()));
     }
+}
 
-    // Update stats
-    context.stats.gbufferTime = m_executionTimeMs;
+void GBufferPassRHI::beginPass(RHI::RHICommandBuffer* cmd, RenderContext& context) {
+    if (!m_enabled || !m_framebuffer || !m_renderPass) return;
+
+    // Begin render pass with clear values
+    std::vector<RHI::ClearValue> clearValues;
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 0.0f));  // Position
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 0.0f));  // Normal
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 0.0f));  // Albedo
+    clearValues.push_back(RHI::ClearValue::DepthStencil(1.0f, 0));          // Depth
+
+    cmd->beginRenderPass(m_renderPass.get(), m_framebuffer.get(), clearValues);
+
+    // Set viewport
+    RHI::Viewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(m_width);
+    viewport.height = static_cast<float>(m_height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    cmd->setViewport(viewport);
+
+    // Set scissor
+    RHI::Scissor scissor{};
+    scissor.x = 0;
+    scissor.y = 0;
+    scissor.width = m_width;
+    scissor.height = m_height;
+    cmd->setScissor(scissor);
+
+    // Update camera uniform buffer
+    if (m_cameraUBO && context.camera) {
+        struct CameraUniforms {
+            glm::mat4 view;
+            glm::mat4 projection;
+            glm::vec4 position;
+            glm::vec4 params;
+        } uniforms;
+
+        uniforms.view = context.camera->view;
+        uniforms.projection = context.camera->projection;
+        uniforms.position = glm::vec4(context.camera->position, 1.0f);
+        uniforms.params = glm::vec4(
+            context.camera->nearPlane,
+            context.camera->farPlane,
+            context.camera->fov,
+            context.camera->aspectRatio
+        );
+
+        void* mapped = m_cameraUBO->map();
+        if (mapped) {
+            memcpy(mapped, &uniforms, sizeof(uniforms));
+            m_cameraUBO->unmap();
+        }
+    }
+}
+
+void GBufferPassRHI::endPass(RHI::RHICommandBuffer* cmd) {
+    cmd->endRenderPass();
 }
 
 void GBufferPassRHI::createGBuffer(uint32_t width, uint32_t height) {

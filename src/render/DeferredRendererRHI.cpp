@@ -345,10 +345,11 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         m_shadowPass->execute(cmd, m_context);
     }
 
-    // 2. G-Buffer Pass - includes world geometry rendering
-    m_gBufferPass->execute(cmd, m_context);
+    // 2. G-Buffer Pass - use split begin/end for hybrid World rendering
+    m_gBufferPass->beginPass(cmd, m_context);
 
     // Render world geometry into G-Buffer (hybrid path - uses OpenGL)
+    // The framebuffer is bound by beginPass, so World's GL calls render to RHI G-Buffer
     if (m_worldRenderer && m_context.world) {
         WorldRenderParams params;
         params.cameraPosition = camera.position;
@@ -362,6 +363,10 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         m_context.stats.chunksRendered = m_worldRenderer->getRenderedSubChunks();
         m_context.stats.chunksCulled = m_worldRenderer->getCulledSubChunks();
     }
+
+    // End G-Buffer pass and store texture handles
+    m_gBufferPass->endPass(cmd);
+    m_gBufferPass->storeTextureHandles(m_context);
 
     // 3. Hi-Z Pass (for occlusion culling)
     if (m_config.enableHiZCulling) {

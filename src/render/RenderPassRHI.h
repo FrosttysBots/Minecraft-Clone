@@ -115,6 +115,10 @@ public:
     void resize(uint32_t width, uint32_t height) override;
     void execute(RHI::RHICommandBuffer* cmd, RenderContext& context) override;
 
+    // Split pass execution for hybrid rendering (allows World to render between begin/end)
+    void beginPass(RHI::RHICommandBuffer* cmd, RenderContext& context);
+    void endPass(RHI::RHICommandBuffer* cmd);
+
     // Get G-Buffer textures
     RHI::RHITexture* getPositionTexture() const { return m_gPosition.get(); }
     RHI::RHITexture* getNormalTexture() const { return m_gNormal.get(); }
@@ -124,6 +128,9 @@ public:
     RHI::RHIRenderPass* getRenderPass() const { return m_renderPass.get(); }
 
     void setPipeline(RHI::RHIGraphicsPipeline* pipeline) { m_pipeline = pipeline; }
+
+    // Store texture handles in context (for interop)
+    void storeTextureHandles(RenderContext& context);
 
 private:
     void createGBuffer(uint32_t width, uint32_t height);

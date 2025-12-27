@@ -103,7 +103,7 @@ bool wireframeKeyPressed = false;
 // Deferred rendering toggles
 bool g_useDeferredRendering = true;  // Master toggle
 bool g_enableSSAO = true;            // SSAO toggle
-bool g_useRHIRenderer = false;       // Use RHI-based renderer (Vulkan path in future) - disabled until render loop connected
+bool g_useRHIRenderer = true;        // Use RHI-based renderer (Vulkan path in future)
 std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;
 
 // Benchmark system
@@ -5601,14 +5601,70 @@ int main() {
         // DEFERRED RENDERING PATH
         // ============================================================
         if (g_useDeferredRendering) {
-            // Sync culling flags with World
-            world.useHiZCulling = g_enableHiZCulling;
-            world.useSubChunkCulling = g_enableSubChunkCulling;
+            // ============================================================
+            // RHI RENDERING PATH (optional - uses abstracted renderer)
+            // ============================================================
+            if (g_useRHIRenderer && g_rhiRenderer) {
+                // Build camera data for RHI renderer
+                Render::CameraData cameraData;
+                cameraData.view = view;
+                cameraData.projection = projection;
+                cameraData.viewProjection = projection * view;
+                cameraData.invView = glm::inverse(view);
+                cameraData.invProjection = glm::inverse(projection);
+                cameraData.invViewProjection = glm::inverse(cameraData.viewProjection);
+                cameraData.position = camera.position;
+                cameraData.forward = camera.front;
+                cameraData.nearPlane = 0.1f;
+                cameraData.farPlane = 500.0f;
+                cameraData.fov = camera.fov;
+                cameraData.aspectRatio = aspectRatio;
 
-            // Calculate cascade shadow map matrices
-            float nearPlane = 0.1f;
-            float farPlane = 500.0f;
-            calculateCascadeSplits(nearPlane, farPlane, NUM_CASCADES, 0.5f, cascadeSplitDepths);
+                // Set lighting parameters
+                Render::LightingParams lighting;
+                lighting.lightDir = glm::normalize(lightDir);
+                lighting.lightColor = lightColor;
+                lighting.ambientColor = ambientColor;
+                lighting.skyColor = glm::vec3(0.5f, 0.7f, 1.0f);
+                lighting.shadowStrength = 0.6f;
+                lighting.time = timeOfDay;
+
+                // Set fog parameters
+                Render::FogParams fog;
+                fog.density = fogDensity;
+                fog.heightFalloff = 0.015f;
+                fog.baseHeight = 64.0f;
+                fog.renderDistance = static_cast<float>(world.renderDistance * 16);
+                fog.isUnderwater = false;
+
+                g_rhiRenderer->setLighting(lighting);
+                g_rhiRenderer->setFog(fog);
+
+                // Render frame using RHI
+                g_rhiRenderer->beginFrame();
+                g_rhiRenderer->render(world, cameraData);
+                g_rhiRenderer->endFrame();
+
+                // Get stats from RHI renderer
+                const auto& rhiStats = g_rhiRenderer->getStats();
+                g_perfStats.shadowPassMs = rhiStats.shadowTime;
+                g_perfStats.gBufferPassMs = rhiStats.gbufferTime;
+                g_perfStats.ssaoPassMs = rhiStats.ssaoTime;
+                g_perfStats.compositePassMs = rhiStats.compositeTime;
+
+            } else {
+                // ============================================================
+                // LEGACY OPENGL DEFERRED PATH (original inline code)
+                // ============================================================
+
+                // Sync culling flags with World
+                world.useHiZCulling = g_enableHiZCulling;
+                world.useSubChunkCulling = g_enableSubChunkCulling;
+
+                // Calculate cascade shadow map matrices
+                float nearPlane = 0.1f;
+                float farPlane = 500.0f;
+                calculateCascadeSplits(nearPlane, farPlane, NUM_CASCADES, 0.5f, cascadeSplitDepths);
 
             // OPTIMIZATION: Determine which cascades need updating this frame
             g_shadowFrameCounter++;
@@ -6172,6 +6228,7 @@ int main() {
             glActiveTexture(GL_TEXTURE0);
 
             glEndQuery(GL_TIME_ELAPSED);  // End composite timer
+            } // End of legacy OpenGL deferred path
         } else {
             // ============================================================
             // FORWARD RENDERING PATH (original code)
