@@ -4671,6 +4671,13 @@ int main() {
             g_useRHIRenderer = false;
         } else {
             std::cout << "[RHI] RHI renderer initialized successfully" << std::endl;
+
+            // Attach legacy VertexPool to RHI vertex pool for shared buffer
+            if (g_useVertexPool && g_rhiRenderer->getVertexPool()) {
+                if (VertexPool::getInstance().attachToRHI(g_rhiRenderer->getVertexPool())) {
+                    std::cout << "[RHI] VertexPool attached to RHI buffer" << std::endl;
+                }
+            }
         }
     }
 

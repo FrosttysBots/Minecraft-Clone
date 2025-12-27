@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ChunkMesh.h"
+#include "VertexPoolRHI.h"
 #include <glad/gl.h>
 #include <vector>
 #include <queue>
@@ -19,6 +20,7 @@
 // - Fixed-size buckets for predictable memory management
 // - FIFO allocation with immediate bucket reuse
 // - Lock-free bucket claiming for multi-threaded mesh generation
+// - Optional RHI integration (shares buffer with VertexPoolRHI)
 // ============================================================================
 
 // Configuration
@@ -118,24 +120,29 @@ public:
     void shutdown() {
         if (!m_initialized) return;
 
-        if (m_mappedPtr && m_vbo != 0) {
-            glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
-            glUnmapBuffer(GL_ARRAY_BUFFER);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
+        // Only unmap/delete buffer if we created it (not using RHI buffer)
+        if (!m_usingRHIBuffer) {
+            if (m_mappedPtr && m_vbo != 0) {
+                glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+                glUnmapBuffer(GL_ARRAY_BUFFER);
+                glBindBuffer(GL_ARRAY_BUFFER, 0);
+            }
+
+            if (m_vbo != 0) {
+                glDeleteBuffers(1, &m_vbo);
+            }
         }
 
+        // Always delete our VAO (we own it regardless of buffer source)
         if (m_vao != 0) {
             glDeleteVertexArrays(1, &m_vao);
             m_vao = 0;
         }
 
-        if (m_vbo != 0) {
-            glDeleteBuffers(1, &m_vbo);
-            m_vbo = 0;
-        }
-
+        m_vbo = 0;
         m_mappedPtr = nullptr;
         m_initialized = false;
+        m_usingRHIBuffer = false;
         m_freeBuckets.clear();
     }
 
@@ -213,6 +220,63 @@ public:
     bool isInitialized() const { return m_initialized; }
     GLuint getVAO() const { return m_vao; }
     GLuint getVBO() const { return m_vbo; }
+    bool isUsingRHI() const { return m_usingRHIBuffer; }
+
+    // Attach to RHI vertex pool - shares the same underlying buffer
+    // This allows RHI command buffers to reference the same geometry data
+    // Returns true if successfully attached
+    bool attachToRHI(Render::VertexPoolRHI* rhiPool) {
+        if (!rhiPool || !m_initialized) return false;
+
+        // Get the GL buffer ID from the RHI pool
+        uint32_t rhiBufferID = rhiPool->getGLBufferID();
+        uint8_t* rhiMappedPtr = rhiPool->getMappedPointer();
+
+        if (rhiBufferID == 0 || !rhiMappedPtr) {
+            std::cerr << "VertexPool: RHI buffer not valid" << std::endl;
+            return false;
+        }
+
+        // If we created our own buffer, we need to migrate data or just use RHI's buffer
+        // For simplicity, we'll switch to using RHI's buffer directly
+        // This works because both buffers have identical layout and size
+
+        // Unmap and delete our own buffer (if we created one)
+        if (m_mappedPtr && m_vbo != 0 && !m_usingRHIBuffer) {
+            glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glDeleteBuffers(1, &m_vbo);
+        }
+
+        // Use RHI buffer instead
+        m_vbo = rhiBufferID;
+        m_mappedPtr = rhiMappedPtr;
+        m_usingRHIBuffer = true;
+
+        // Rebind VAO to use new VBO
+        glBindVertexArray(m_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+
+        // Re-setup vertex attributes
+        glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, sizeof(PackedChunkVertex),
+                              (void*)offsetof(PackedChunkVertex, x));
+        glEnableVertexAttribArray(0);
+
+        glVertexAttribPointer(1, 2, GL_UNSIGNED_SHORT, GL_FALSE, sizeof(PackedChunkVertex),
+                              (void*)offsetof(PackedChunkVertex, u));
+        glEnableVertexAttribArray(1);
+
+        glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                               (void*)offsetof(PackedChunkVertex, normalIndex));
+        glEnableVertexAttribArray(2);
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindVertexArray(0);
+
+        std::cout << "VertexPool: Attached to RHI buffer (ID=" << rhiBufferID << ")" << std::endl;
+        return true;
+    }
 
 private:
     VertexPool() = default;
@@ -226,6 +290,7 @@ private:
     GLuint m_vao = 0;
     uint8_t* m_mappedPtr = nullptr;
     bool m_initialized = false;
+    bool m_usingRHIBuffer = false;  // True if using buffer from VertexPoolRHI
 
     std::vector<uint32_t> m_freeBuckets;
     mutable std::mutex m_mutex;

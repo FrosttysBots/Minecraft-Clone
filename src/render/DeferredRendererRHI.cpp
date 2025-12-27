@@ -179,6 +179,14 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
         return false;
     }
 
+    // Initialize RHI vertex pool
+    m_vertexPool = std::make_unique<VertexPoolRHI>();
+    if (!m_vertexPool->initialize(m_device.get())) {
+        std::cerr << "[DeferredRendererRHI] Failed to initialize vertex pool" << std::endl;
+        // Not fatal - World can still use legacy VertexPool
+        m_vertexPool.reset();
+    }
+
     std::cout << "[DeferredRendererRHI] Initialized with "
               << BackendSelector::getBackendName(g_config.renderer)
               << " backend" << std::endl;
@@ -195,6 +203,12 @@ void DeferredRendererRHI::shutdown() {
     if (m_worldRenderer) {
         m_worldRenderer->shutdown();
         m_worldRenderer.reset();
+    }
+
+    // Shutdown vertex pool
+    if (m_vertexPool) {
+        m_vertexPool->shutdown();
+        m_vertexPool.reset();
     }
 
     // Shutdown render passes

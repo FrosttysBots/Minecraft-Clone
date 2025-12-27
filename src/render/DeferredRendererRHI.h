@@ -7,6 +7,7 @@
 #include "RenderPassRHI.h"
 #include "ShaderCompiler.h"
 #include "WorldRendererRHI.h"
+#include "VertexPoolRHI.h"
 #include "rhi/RHI.h"
 #include <memory>
 #include <unordered_map>
@@ -47,6 +48,9 @@ public:
     SSAOPassRHI* getSSAOPass() { return m_ssaoPass.get(); }
     CompositePassRHI* getCompositePass() { return m_compositePass.get(); }
     FSRPassRHI* getFSRPass() { return m_fsrPass.get(); }
+
+    // Access RHI vertex pool
+    VertexPoolRHI* getVertexPool() { return m_vertexPool.get(); }
 
 private:
     bool createDevice(GLFWwindow* window);
@@ -119,6 +123,9 @@ private:
 
     // World renderer (bridges World rendering to RHI)
     std::unique_ptr<WorldRendererRHI> m_worldRenderer;
+
+    // RHI vertex pool (replacement for OpenGL VertexPool)
+    std::unique_ptr<VertexPoolRHI> m_vertexPool;
 
     // Dimensions
     uint32_t m_displayWidth = 0;
