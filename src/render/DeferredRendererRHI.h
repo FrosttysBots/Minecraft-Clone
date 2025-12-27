@@ -86,6 +86,7 @@ private:
     std::unique_ptr<GPUCullingPassRHI> m_gpuCullingPass;
     std::unique_ptr<CompositePassRHI> m_compositePass;
     std::unique_ptr<SkyPassRHI> m_skyPass;
+    std::unique_ptr<WaterPassRHI> m_waterPass;
     std::unique_ptr<FSRPassRHI> m_fsrPass;
 
     // Pipelines
@@ -93,6 +94,7 @@ private:
     std::unique_ptr<RHI::RHIGraphicsPipeline> m_gBufferPipeline;
     std::unique_ptr<RHI::RHIGraphicsPipeline> m_compositePipeline;
     std::unique_ptr<RHI::RHIGraphicsPipeline> m_skyPipeline;
+    std::unique_ptr<RHI::RHIGraphicsPipeline> m_waterPipeline;
     std::unique_ptr<RHI::RHIComputePipeline> m_hiZPipeline;
     std::unique_ptr<RHI::RHIComputePipeline> m_ssaoPipeline;
     std::unique_ptr<RHI::RHIComputePipeline> m_ssaoBlurPipeline;

@@ -1,4 +1,5 @@
 #include "RenderPassRHI.h"
+#include "WorldRendererRHI.h"
 
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -1295,6 +1296,105 @@ void SkyPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
     }
 
     context.stats.skyTime = m_executionTimeMs;
+}
+
+// ============================================================================
+// WaterPassRHI Implementation
+// ============================================================================
+
+WaterPassRHI::WaterPassRHI(RHI::RHIDevice* device)
+    : RenderPassRHI("WaterRHI", device) {}
+
+WaterPassRHI::~WaterPassRHI() {
+    shutdown();
+}
+
+bool WaterPassRHI::initialize(const RenderConfig& config) {
+    m_width = config.renderWidth;
+    m_height = config.renderHeight;
+
+    // Create water uniform buffer
+    RHI::BufferDesc uboDesc{};
+    uboDesc.size = 256;  // Enough for water uniforms
+    uboDesc.usage = RHI::BufferUsage::Uniform;
+    uboDesc.memory = RHI::MemoryUsage::CpuToGpu;
+    uboDesc.debugName = "Water_UBO";
+    m_waterUBO = m_device->createBuffer(uboDesc);
+
+    std::cout << "[WaterPassRHI] Initialized" << std::endl;
+    return true;
+}
+
+void WaterPassRHI::shutdown() {
+    m_waterUBO.reset();
+    m_descriptorSet.reset();
+}
+
+void WaterPassRHI::resize(uint32_t width, uint32_t height) {
+    m_width = width;
+    m_height = height;
+}
+
+void WaterPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
+    if (!m_enabled || !m_pipeline || !m_worldRenderer) return;
+
+    // Update water uniforms
+    if (m_waterUBO && context.camera && context.lighting) {
+        struct WaterUniforms {
+            glm::mat4 view;
+            glm::mat4 projection;
+            glm::vec4 lightDir;
+            glm::vec4 lightColor;
+            glm::vec4 ambientColor;
+            glm::vec4 skyColor;
+            glm::vec4 cameraPos;
+            glm::vec4 waterParams;  // time, fogDensity, isUnderwater, lodDistance
+            glm::vec4 waterTexBounds;  // u0, v0, u1, v1
+            glm::vec4 animParams;  // waterAnimationEnabled, 0, 0, 0
+        } uniforms;
+
+        uniforms.view = context.camera->view;
+        uniforms.projection = context.camera->projection;
+        uniforms.lightDir = glm::vec4(context.lighting->lightDir, 0.0f);
+        uniforms.lightColor = glm::vec4(context.lighting->lightColor, 1.0f);
+        uniforms.ambientColor = glm::vec4(context.lighting->ambientColor, 1.0f);
+        uniforms.skyColor = glm::vec4(context.lighting->skyColor, 1.0f);
+        uniforms.cameraPos = glm::vec4(context.camera->position, 1.0f);
+        uniforms.waterParams = glm::vec4(
+            context.time,
+            context.fog ? context.fog->density : 0.02f,
+            0.0f,  // isUnderwater - would need player state
+            100.0f  // lodDistance - default value
+        );
+        uniforms.waterTexBounds = glm::vec4(11.0f/16.0f, 0.0f, 12.0f/16.0f, 1.0f/16.0f);  // Water texture slot 11
+        uniforms.animParams = glm::vec4(1.0f, 0.0f, 0.0f, 0.0f);  // Animation enabled
+
+        void* mapped = m_waterUBO->map();
+        if (mapped) {
+            memcpy(mapped, &uniforms, sizeof(uniforms));
+            m_waterUBO->unmap();
+        }
+    }
+
+    // Bind water pipeline
+    cmd->bindGraphicsPipeline(m_pipeline);
+
+    // Bind descriptor set if available
+    if (m_descriptorSet) {
+        cmd->bindDescriptorSet(0, m_descriptorSet.get());
+    }
+
+    // In hybrid mode, render water using OpenGL calls
+    if (context.world && m_worldRenderer) {
+        WorldRenderParams waterParams{};
+        waterParams.cameraPosition = context.camera->position;
+        waterParams.viewProjection = context.camera->viewProjection;
+        waterParams.renderWater = true;
+
+        m_worldRenderer->renderWater(cmd, *context.world, waterParams);
+    }
+
+    context.stats.waterTime = m_executionTimeMs;
 }
 
 // ============================================================================

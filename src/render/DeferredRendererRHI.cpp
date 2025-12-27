@@ -103,6 +103,7 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
     m_gpuCullingPass = std::make_unique<GPUCullingPassRHI>(m_device.get());
     m_compositePass = std::make_unique<CompositePassRHI>(m_device.get());
     m_skyPass = std::make_unique<SkyPassRHI>(m_device.get());
+    m_waterPass = std::make_unique<WaterPassRHI>(m_device.get());
     m_fsrPass = std::make_unique<FSRPassRHI>(m_device.get());
 
     // Initialize render passes
@@ -138,6 +139,11 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 
     if (!m_skyPass->initialize(config)) {
         std::cerr << "[DeferredRendererRHI] Failed to initialize sky pass" << std::endl;
+        return false;
+    }
+
+    if (!m_waterPass->initialize(config)) {
+        std::cerr << "[DeferredRendererRHI] Failed to initialize water pass" << std::endl;
         return false;
     }
 
@@ -181,6 +187,9 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
         std::cerr << "[DeferredRendererRHI] Failed to initialize world renderer" << std::endl;
         return false;
     }
+
+    // Connect water pass to world renderer
+    m_waterPass->setWorldRenderer(m_worldRenderer.get());
 
     // Initialize RHI vertex pool
     m_vertexPool = std::make_unique<VertexPoolRHI>();
@@ -412,7 +421,10 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
     // 7. Sky Pass (rendered into composite output)
     m_skyPass->execute(cmd, m_context);
 
-    // 8. FSR Upscaling Pass
+    // 8. Water Pass (forward rendered, semi-transparent)
+    m_waterPass->execute(cmd, m_context);
+
+    // 9. FSR Upscaling Pass
     if (m_config.upscaleMode != UpscaleMode::NATIVE) {
         m_fsrPass->execute(cmd, m_context);
     }

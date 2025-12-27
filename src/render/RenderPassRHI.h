@@ -13,6 +13,7 @@ namespace Render {
 
 // Forward declarations
 class World;
+class WorldRendererRHI;
 
 // Base class for RHI-based render passes
 class RenderPassRHI {
@@ -366,6 +367,41 @@ private:
     std::unique_ptr<RHI::RHIDescriptorSet> m_descriptorSet;
     RHI::RHIGraphicsPipeline* m_pipeline = nullptr;
     RHI::RHIFramebuffer* m_targetFramebuffer = nullptr;
+};
+
+// ============================================================================
+// Water Pass - Forward-rendered transparent water
+// ============================================================================
+
+class WaterPassRHI : public RenderPassRHI {
+public:
+    WaterPassRHI(RHI::RHIDevice* device);
+    ~WaterPassRHI() override;
+
+    bool initialize(const RenderConfig& config) override;
+    void shutdown() override;
+    void resize(uint32_t width, uint32_t height) override;
+    void execute(RHI::RHICommandBuffer* cmd, RenderContext& context) override;
+
+    void setPipeline(RHI::RHIGraphicsPipeline* pipeline) { m_pipeline = pipeline; }
+    void setWorldRenderer(class WorldRendererRHI* worldRenderer) { m_worldRenderer = worldRenderer; }
+
+    // Set target framebuffer for water rendering (usually same as composite output)
+    void setTargetFramebuffer(RHI::RHIFramebuffer* fb) { m_targetFramebuffer = fb; }
+
+    // Set texture atlas binding
+    void setTextureAtlas(RHI::RHITexture* atlas) { m_textureAtlas = atlas; }
+
+private:
+    std::unique_ptr<RHI::RHIBuffer> m_waterUBO;
+    std::unique_ptr<RHI::RHIDescriptorSet> m_descriptorSet;
+    RHI::RHIGraphicsPipeline* m_pipeline = nullptr;
+    RHI::RHIFramebuffer* m_targetFramebuffer = nullptr;
+    RHI::RHITexture* m_textureAtlas = nullptr;
+    class WorldRendererRHI* m_worldRenderer = nullptr;
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
 };
 
 // ============================================================================
