@@ -13,6 +13,8 @@
 #include "render/Crosshair.h"
 #include "render/BlockHighlight.h"
 #include "render/ChunkBorderRenderer.h"
+#include "input/KeybindManager.h"
+#include "ui/ControlsScreen.h"
 #include "render/TextureAtlas.h"
 #include "render/VertexPool.h"
 #include "ui/MenuUI.h"
@@ -538,14 +540,15 @@ InputState processInput(GLFWwindow* window) {
 
     // ESC key handling moved to main loop for pause menu toggle
 
-    // Movement keys
-    input.forward = glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
-    input.backward = glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS;
-    input.left = glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS;
-    input.right = glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS;
-    input.jump = glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS;
-    input.descend = glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS;
-    input.sprint = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS;
+    // Movement keys (using KeybindManager for configurable bindings)
+    auto& keybinds = KeybindManager::getInstance();
+    input.forward = keybinds.isPressed(window, KeyAction::MoveForward);
+    input.backward = keybinds.isPressed(window, KeyAction::MoveBackward);
+    input.left = keybinds.isPressed(window, KeyAction::MoveLeft);
+    input.right = keybinds.isPressed(window, KeyAction::MoveRight);
+    input.jump = keybinds.isPressed(window, KeyAction::Jump);
+    input.descend = keybinds.isPressed(window, KeyAction::Sprint);
+    input.sprint = keybinds.isPressed(window, KeyAction::Sneak);
 
     // Fly mode toggle (F2)
     if (glfwGetKey(window, GLFW_KEY_F2) == GLFW_PRESS) {
@@ -910,9 +913,14 @@ InputState processInput(GLFWwindow* window) {
         gpuCullingTogglePressed = false;
     }
 
-    // Number keys for hotbar
+    // Number keys for hotbar (using KeybindManager)
+    KeyAction hotbarActions[] = {
+        KeyAction::Hotbar1, KeyAction::Hotbar2, KeyAction::Hotbar3,
+        KeyAction::Hotbar4, KeyAction::Hotbar5, KeyAction::Hotbar6,
+        KeyAction::Hotbar7, KeyAction::Hotbar8, KeyAction::Hotbar9
+    };
     for (int i = 0; i < HOTBAR_SIZE && i < 9; i++) {
-        if (glfwGetKey(window, GLFW_KEY_1 + i) == GLFW_PRESS) {
+        if (keybinds.isPressed(window, hotbarActions[i])) {
             selectedSlot = i;
             selectedBlock = hotbar[i];
         }
@@ -4720,6 +4728,13 @@ int main() {
     worldCreateScreen.init(&menuUI);
     pauseMenu.init(&menuUI);
     settingsMenu.init(&menuUI);
+
+    // Initialize keybind system
+    KeybindManager::getInstance().init();
+
+    // Controls screen (opened from settings)
+    ControlsScreen controlsScreen;
+    controlsScreen.init(&menuUI);
     loadingScreen3D.init(WINDOW_WIDTH, WINDOW_HEIGHT);
     debugOverlay.init(&menuUI);
     debugOverlay.setGPUInfo(
@@ -4912,10 +4927,27 @@ int main() {
             static bool mainMenuEscPressed = false;
             bool escPressed = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
 
-            if (showSettings) {
+            if (controlsScreen.visible) {
+                // Controls screen overlay - render settings behind it, then controls on top
+                settingsMenu.render();
+                controlsScreen.render();
+                controlsScreen.update(window, mx, my, mouseDown, deltaTime);
+
+                // ESC to close controls screen
+                if (escPressed && !mainMenuEscPressed) {
+                    controlsScreen.hide();
+                }
+            }
+            else if (showSettings) {
                 // Settings overlay on main menu
                 settingsMenu.update(mx, my, mouseDown);
                 SettingsAction settingsAction = settingsMenu.getAction();
+
+                // Check if user clicked "Key Bindings..." button
+                if (settingsMenu.openControlsScreen) {
+                    settingsMenu.openControlsScreen = false;
+                    controlsScreen.show();
+                }
 
                 if (settingsAction == SettingsAction::BACK) {
                     showSettings = false;
@@ -4965,7 +4997,18 @@ int main() {
             menuUI.beginFrame();
 
             // Render main menu or settings
-            if (showSettings) {
+            // Render main menu or settings
+            if (controlsScreen.visible) {
+                // Controls screen overlay - render settings behind it, then controls on top
+                settingsMenu.render();
+                controlsScreen.render();
+
+                // ESC to close controls screen
+                if (escPressed && !mainMenuEscPressed) {
+                    controlsScreen.hide();
+                }
+            }
+            else if (showSettings) {
                 settingsMenu.render();
             } else {
                 mainMenu.render();
@@ -5279,10 +5322,27 @@ int main() {
             }
             escWasPressedPlaying = escPressed;
 
-            if (showSettings) {
+            if (controlsScreen.visible) {
+                // Controls screen overlay - render settings behind it, then controls on top
+                settingsMenu.render();
+                controlsScreen.render();
+                controlsScreen.update(window, mx, my, mouseDown, deltaTime);
+
+                // ESC to close controls screen
+                if (escPressed && !escWasPressedPlaying) {
+                    controlsScreen.hide();
+                }
+            }
+            else if (showSettings) {
                 // Update and handle settings menu
                 settingsMenu.update(mx, my, mouseDown);
                 SettingsAction settingsAction = settingsMenu.getAction();
+
+                // Check if user clicked "Key Bindings..." button
+                if (settingsMenu.openControlsScreen) {
+                    settingsMenu.openControlsScreen = false;
+                    controlsScreen.show();
+                }
 
                 if (settingsAction == SettingsAction::BACK) {
                     showSettings = false;
@@ -5363,8 +5423,22 @@ int main() {
             // Don't clear - render over the game frame
 
             menuUI.beginFrame();
-            if (showSettings) {
+            if (controlsScreen.visible) {
+                // Controls screen overlay - render settings behind it, then controls on top
                 settingsMenu.render();
+                controlsScreen.render();
+                controlsScreen.update(window, mx, my, mouseDown, deltaTime);
+
+                // ESC to close controls screen
+                if (escPressed && !escWasPressedPlaying) {
+                    controlsScreen.hide();
+                }
+            }
+            else if (showSettings) {
+                settingsMenu.render();
+                if (controlsScreen.visible) {
+                    controlsScreen.render();
+                }
             } else {
                 pauseMenu.render();
             }
