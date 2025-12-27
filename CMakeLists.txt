@@ -48,6 +48,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(fastnoiselite)
 
+# meshoptimizer - GPU-friendly mesh optimization
+FetchContent_Declare(
+    meshoptimizer
+    GIT_REPOSITORY https://github.com/zeux/meshoptimizer.git
+    GIT_TAG v0.21
+)
+FetchContent_MakeAvailable(meshoptimizer)
+
 # Source files for main game (exclude launcher)
 file(GLOB_RECURSE GAME_SOURCES
     "src/*.cpp"
@@ -75,6 +83,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw
     glm::glm
     opengl32
+    meshoptimizer
 )
 
 # OpenGL Launcher executable (Windows only)

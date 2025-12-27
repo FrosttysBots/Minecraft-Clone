@@ -4,6 +4,8 @@
 #include "TerrainGenerator.h"
 #include "ChunkThreadPool.h"
 #include "../render/ChunkMesh.h"
+#include "../render/GPUCulling.h"
+#include "../render/VertexPool.h"
 #include <unordered_map>
 #include <memory>
 #include <vector>
@@ -239,6 +241,12 @@ public:
     bool indirectRenderingEnabled = true; // Toggle for indirect vs traditional
     size_t maxDrawCommands = 8192;       // Max sub-chunks to batch
 
+    // GPU-driven frustum culling (compute shader)
+    GPUCulling::GPUCuller gpuCuller;
+    bool gpuCullingEnabled = false;      // Enable GPU compute shader culling
+    bool gpuCullingInitialized = false;  // Track initialization state
+    std::vector<GPUCulling::SubChunkData> gpuSubChunkData;  // Cached sub-chunk data for GPU upload
+
     // Terrain generator (for main thread fallback)
     TerrainGenerator terrainGenerator;
 
@@ -325,6 +333,16 @@ public:
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
         std::cout << "Indirect rendering initialized (max " << maxDrawCommands << " draw commands)" << std::endl;
+
+        // Initialize GPU-driven frustum culling
+        if (gpuCuller.init(maxDrawCommands)) {
+            gpuCullingInitialized = true;
+            gpuCullingEnabled = true;  // Enable by default
+            gpuSubChunkData.reserve(maxDrawCommands);
+            std::cout << "[World] GPU frustum culling enabled" << std::endl;
+        } else {
+            std::cerr << "[World] GPU frustum culling failed to initialize, using CPU fallback" << std::endl;
+        }
     }
 
     ~World() {
@@ -1185,22 +1203,22 @@ public:
 
     // Calculate LOD level based on squared distance and render distance
     // Returns 0-3 (LOD 0 = full detail, LOD 3 = lowest detail)
-    // Tuned for performance: More aggressive LOD transitions where fog hides detail
+    // OPTIMIZED: More aggressive transitions for better performance
     int calculateLOD(float distSq) const {
         float maxDistSq = static_cast<float>(renderDistance * renderDistance);
         float ratio = distSq / maxDistSq;
 
-        // Full detail (LOD 0) for 60% of render distance
-        // This is where players spend most of their time looking
-        if (ratio < 0.36f) return 0;   // 0-60% of distance (0.6^2 = 0.36)
+        // Full detail (LOD 0) for 40% of render distance
+        // Close range where detail matters most
+        if (ratio < 0.16f) return 0;   // 0-40% of distance (0.4^2 = 0.16)
 
-        // LOD 1 (2x scale) for 60-75% - subtle reduction, fog starting
-        if (ratio < 0.5625f) return 1; // 60-75% (0.75^2 = 0.5625)
+        // LOD 1 (2x scale) for 40-60% - slight reduction, still looks good
+        if (ratio < 0.36f) return 1;   // 40-60% (0.6^2 = 0.36)
 
-        // LOD 2 (4x scale) for 75-87% - medium fog, detail hard to see
-        if (ratio < 0.7569f) return 2; // 75-87% (0.87^2 = 0.7569)
+        // LOD 2 (4x scale) for 60-80% - fog starting, detail hard to see
+        if (ratio < 0.64f) return 2;   // 60-80% (0.8^2 = 0.64)
 
-        // LOD 3 (8x scale) for 87-100% - heavy fog, silhouettes only
+        // LOD 3 (8x scale) for 80-100% - heavy fog, silhouettes only
         return 3;
     }
 
@@ -1563,6 +1581,156 @@ public:
         }
 
         lastRenderedChunks = static_cast<int>(columns.size());
+    }
+
+    // ================================================================
+    // GPU-DRIVEN FRUSTUM CULLING RENDER PATH
+    // ================================================================
+    // Uses compute shader to cull sub-chunks on GPU, then renders visible ones.
+    // This eliminates CPU-side frustum testing for thousands of sub-chunks.
+    void renderSubChunksGPUCulled(const glm::vec3& playerPos, const glm::mat4& viewProj, GLint chunkOffsetLoc) {
+        if (!gpuCullingInitialized || !gpuCullingEnabled) {
+            // Fall back to CPU-based batched rendering
+            renderSubChunksBatched(playerPos, chunkOffsetLoc);
+            return;
+        }
+
+        glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
+        lastRenderedSubChunks = 0;
+        lastCulledSubChunks = 0;
+
+        // Phase 1: Collect ALL sub-chunks within render distance (no CPU frustum culling!)
+        gpuSubChunkData.clear();
+
+        struct SubChunkRef {
+            ChunkMesh* mesh;
+            int subChunkY;
+            int lodLevel;
+            size_t dataIndex;  // Index in gpuSubChunkData
+        };
+        std::vector<SubChunkRef> subChunkRefs;
+        subChunkRefs.reserve(meshes.size() * SUB_CHUNKS_PER_COLUMN);
+
+        for (auto& [pos, mesh] : meshes) {
+            int dx = pos.x - playerChunk.x;
+            int dz = pos.y - playerChunk.y;
+
+            if (abs(dx) <= renderDistance && abs(dz) <= renderDistance) {
+                float distSq = static_cast<float>(dx * dx + dz * dz);
+                int baseLodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(distSq);
+
+                for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
+                    const auto& subChunk = mesh->subChunks[subY];
+                    if (subChunk.isEmpty) continue;
+
+                    // Calculate bounding sphere for this sub-chunk
+                    // Center is at chunk world position + sub-chunk center
+                    glm::vec3 subCenter(
+                        CHUNK_SIZE_X * 0.5f,
+                        subY * SUB_CHUNK_HEIGHT + SUB_CHUNK_HEIGHT * 0.5f,
+                        CHUNK_SIZE_Z * 0.5f
+                    );
+                    // Bounding sphere radius (diagonal of 16x16x16 cube / 2)
+                    float radius = sqrtf(CHUNK_SIZE_X * CHUNK_SIZE_X +
+                                        SUB_CHUNK_HEIGHT * SUB_CHUNK_HEIGHT +
+                                        CHUNK_SIZE_Z * CHUNK_SIZE_Z) * 0.5f;
+
+                    // Get vertex count from LOD mesh or face buckets
+                    uint32_t vertexCount = 0;
+                    if (baseLodLevel == 0 && subChunk.useFaceBuckets) {
+                        for (int b = 0; b < FACE_BUCKET_COUNT; b++) {
+                            vertexCount += subChunk.faceBucketVertexCounts[b];
+                        }
+                    } else {
+                        for (int level = baseLodLevel; level >= 0; level--) {
+                            if (subChunk.lodMeshes[level].vertexCount > 0) {
+                                vertexCount = subChunk.lodMeshes[level].vertexCount;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (vertexCount == 0) continue;
+
+                    // Add to GPU culling data
+                    GPUCulling::SubChunkData data;
+                    data.boundingSphere = glm::vec4(subCenter, radius);
+                    data.chunkOffset = glm::vec4(mesh->worldOffset, static_cast<float>(subY));
+                    data.baseVertex = 0;  // Not used for hybrid approach
+                    data.vertexCount = vertexCount;
+                    data.lodLevel = baseLodLevel;
+                    data.padding = 0;
+
+                    size_t dataIndex = gpuSubChunkData.size();
+                    gpuSubChunkData.push_back(data);
+                    subChunkRefs.push_back({mesh.get(), subY, baseLodLevel, dataIndex});
+                }
+            }
+        }
+
+        if (gpuSubChunkData.empty()) return;
+
+        // Phase 2: Upload data and run GPU culling
+        gpuCuller.uploadSubChunkData(gpuSubChunkData);
+        uint32_t visibleCount = gpuCuller.cull(viewProj);
+
+        if (visibleCount == 0) {
+            lastCulledSubChunks = static_cast<int>(gpuSubChunkData.size());
+            return;
+        }
+
+        // Phase 3: Read back visibility results and render
+        // Map the indirect draw buffer to get visibility info
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, gpuCuller.getIndirectBuffer());
+        GPUCulling::DrawArraysIndirectCommand* commands =
+            (GPUCulling::DrawArraysIndirectCommand*)glMapBufferRange(
+                GL_DRAW_INDIRECT_BUFFER, 0,
+                visibleCount * sizeof(GPUCulling::DrawArraysIndirectCommand),
+                GL_MAP_READ_BIT);
+
+        if (commands) {
+            // Build a visibility set from the indirect commands
+            // baseInstance contains the original sub-chunk index
+            std::vector<bool> isVisible(gpuSubChunkData.size(), false);
+            for (uint32_t i = 0; i < visibleCount; i++) {
+                uint32_t originalIndex = commands[i].baseInstance;
+                if (originalIndex < isVisible.size()) {
+                    isVisible[originalIndex] = true;
+                }
+            }
+            glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER);
+
+            // Render visible sub-chunks (sorted by chunk for better batching)
+            ChunkMesh* lastMesh = nullptr;
+            for (const auto& ref : subChunkRefs) {
+                if (!isVisible[ref.dataIndex]) {
+                    lastCulledSubChunks++;
+                    continue;
+                }
+
+                // Update chunk offset if mesh changed
+                if (ref.mesh != lastMesh && chunkOffsetLoc >= 0) {
+                    glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(ref.mesh->worldOffset));
+                    lastMesh = ref.mesh;
+                }
+
+                ref.mesh->renderSubChunk(ref.subChunkY, ref.lodLevel);
+                lastRenderedSubChunks++;
+            }
+        } else {
+            glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER);
+            // Fallback: render all (GPU cull failed)
+            for (const auto& ref : subChunkRefs) {
+                if (ref.mesh != nullptr && chunkOffsetLoc >= 0) {
+                    glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(ref.mesh->worldOffset));
+                }
+                ref.mesh->renderSubChunk(ref.subChunkY, ref.lodLevel);
+                lastRenderedSubChunks++;
+            }
+        }
+
+        glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
+        lastRenderedChunks = static_cast<int>(meshes.size());
     }
 
     // Render all water geometry - call this AFTER render() with depth write disabled

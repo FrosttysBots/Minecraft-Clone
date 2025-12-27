@@ -178,6 +178,7 @@ GLuint frustumPlanesUBO = 0;           // UBO for frustum planes (culling)
 
 // Sodium-style batched rendering
 bool g_enableBatchedRendering = true;  // Column-batched rendering (reduces uniform updates)
+bool g_enableGPUCulling = true;        // GPU compute shader frustum culling
 
 // GL_NV_mesh_shader extension constants (not in glad by default)
 #ifndef GL_TASK_SHADER_NV
@@ -752,6 +753,18 @@ InputState processInput(GLFWwindow* window) {
         }
     } else {
         batchedRenderingTogglePressed = false;
+    }
+
+    // GPU Culling toggle (G key) - Compute shader frustum culling
+    static bool gpuCullingTogglePressed = false;
+    if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS) {
+        if (!gpuCullingTogglePressed) {
+            g_enableGPUCulling = !g_enableGPUCulling;
+            std::cout << "GPU Frustum Culling: " << (g_enableGPUCulling ? "ON" : "OFF") << std::endl;
+            gpuCullingTogglePressed = true;
+        }
+    } else {
+        gpuCullingTogglePressed = false;
     }
 
     // Number keys for hotbar
@@ -5692,7 +5705,14 @@ int main() {
                 glUniformMatrix4fv(gBufferProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
                 glUniform1i(gBufferTexAtlasLoc, 0);
 
-                if (g_enableBatchedRendering) {
+                if (g_enableGPUCulling && world.gpuCullingInitialized) {
+                    // ============================================
+                    // GPU-DRIVEN FRUSTUM CULLING PATH
+                    // ============================================
+                    // Uses compute shader to cull sub-chunks on GPU
+                    glm::mat4 viewProj = projection * view;
+                    world.renderSubChunksGPUCulled(camera.position, viewProj, gBufferChunkOffsetLoc);
+                } else if (g_enableBatchedRendering) {
                     // ============================================
                     // SODIUM-STYLE BATCHED RENDERING PATH
                     // ============================================
@@ -5714,6 +5734,8 @@ int main() {
                           << " chunks (culled: " << world.lastCulledChunks << ")" << std::endl;
                 if (g_enableMeshShaders) {
                     std::cout << "  Using MESH SHADER rendering path" << std::endl;
+                } else if (g_enableGPUCulling && world.gpuCullingInitialized) {
+                    std::cout << "  Using GPU-DRIVEN CULLING rendering path" << std::endl;
                 } else if (g_enableBatchedRendering) {
                     std::cout << "  Using SODIUM-STYLE BATCHED rendering path" << std::endl;
                 } else {

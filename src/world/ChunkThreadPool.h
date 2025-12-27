@@ -5,6 +5,7 @@
 #include "Block.h"
 #include "../render/ChunkMesh.h"
 #include "../render/BinaryGreedyMesher.h"
+#include "../render/MeshOptimizer.h"
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -569,6 +570,14 @@ private:
 
                 // Expand to 6 face-orientation buckets for efficient backface culling
                 expandFaceBucketsToVertices(binaryResult, subData.faceBucketVertices);
+
+                // OPTIMIZATION: Apply meshoptimizer vertex cache optimization to each bucket
+                // This reorders vertices for better GPU cache utilization (+10-20% efficiency)
+                for (int bucket = 0; bucket < FACE_BUCKET_COUNT; bucket++) {
+                    if (subData.faceBucketVertices[bucket].size() >= 6) {
+                        MeshOpt::optimizeFast(subData.faceBucketVertices[bucket]);
+                    }
+                }
             }
 
             // Generate water/lava geometry on worker thread (not greedy meshed)
