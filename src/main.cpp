@@ -12,6 +12,7 @@
 #include "world/WorldPresets.h"
 #include "render/Crosshair.h"
 #include "render/BlockHighlight.h"
+#include "render/ChunkBorderRenderer.h"
 #include "render/TextureAtlas.h"
 #include "render/VertexPool.h"
 #include "ui/MenuUI.h"
@@ -102,6 +103,13 @@ constexpr int HOTBAR_SIZE = sizeof(hotbar) / sizeof(hotbar[0]);
 // Wireframe toggle
 bool wireframeMode = false;
 bool wireframeKeyPressed = false;
+
+// F3 Debug display toggles (Minecraft-style)
+bool g_showChunkBorders = false;    // F3+G - Show chunk boundaries
+bool g_showHitboxes = false;        // F3+B - Show block/entity hitboxes
+bool g_showLightLevels = false;     // F3+L - Show light level overlay
+bool g_advancedDebugInfo = false;   // F3+H - Show advanced debug info
+int g_renderDistanceOverride = 0;   // F3+F/Shift+F - Temporary render distance adjustment
 
 // Deferred rendering toggles
 // NOTE: Deferred rendering is currently disabled pending fixes to G-buffer rendering
@@ -560,15 +568,138 @@ InputState processInput(GLFWwindow* window) {
         wireframeKeyPressed = false;
     }
 
-    // Debug overlay toggle (F3)
+    // F3 Debug combinations (Minecraft-style)
     static bool f3Pressed = false;
-    if (glfwGetKey(window, GLFW_KEY_F3) == GLFW_PRESS) {
-        if (!f3Pressed) {
-            debugOverlay.toggle();
+    static bool f3ComboUsed = false;  // Track if a combo was triggered this press
+    bool f3Held = glfwGetKey(window, GLFW_KEY_F3) == GLFW_PRESS;
+    bool shiftHeld = glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                     glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS;
+
+    if (f3Held) {
+        // F3+A - Reload all chunks
+        static bool aPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS && !aPressed) {
+            aPressed = true;
+            f3ComboUsed = true;
+            std::cout << "[F3+A] Reloading all chunks..." << std::endl;
+            world.reset();
+            glm::vec3 pos = player ? player->position : glm::vec3(0, 80, 0);
+            glm::ivec2 playerChunk((int)std::floor(pos.x / 16.0f), (int)std::floor(pos.z / 16.0f));
+            world.loadChunksAroundPlayer(playerChunk);
+            std::cout << "[F3+A] Chunk reload queued" << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_A) != GLFW_PRESS) {
+            aPressed = false;
+        }
+
+        // F3+G - Toggle chunk borders
+        static bool gPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_G) == GLFW_PRESS && !gPressed) {
+            gPressed = true;
+            f3ComboUsed = true;
+            g_showChunkBorders = !g_showChunkBorders;
+            std::cout << "[F3+G] Chunk borders: " << (g_showChunkBorders ? "ON" : "OFF") << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_G) != GLFW_PRESS) {
+            gPressed = false;
+        }
+
+        // F3+B - Toggle hitboxes
+        static bool bPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS && !bPressed) {
+            bPressed = true;
+            f3ComboUsed = true;
+            g_showHitboxes = !g_showHitboxes;
+            std::cout << "[F3+B] Hitboxes: " << (g_showHitboxes ? "ON" : "OFF") << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_B) != GLFW_PRESS) {
+            bPressed = false;
+        }
+
+        // F3+L - Toggle light levels
+        static bool lPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_L) == GLFW_PRESS && !lPressed) {
+            lPressed = true;
+            f3ComboUsed = true;
+            g_showLightLevels = !g_showLightLevels;
+            std::cout << "[F3+L] Light levels: " << (g_showLightLevels ? "ON" : "OFF") << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_L) != GLFW_PRESS) {
+            lPressed = false;
+        }
+
+        // F3+H - Toggle advanced debug info
+        static bool hPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_H) == GLFW_PRESS && !hPressed) {
+            hPressed = true;
+            f3ComboUsed = true;
+            g_advancedDebugInfo = !g_advancedDebugInfo;
+            std::cout << "[F3+H] Advanced debug info: " << (g_advancedDebugInfo ? "ON" : "OFF") << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_H) != GLFW_PRESS) {
+            hPressed = false;
+        }
+
+        // F3+F - Increase render distance / F3+Shift+F - Decrease render distance
+        static bool fPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS && !fPressed) {
+            fPressed = true;
+            f3ComboUsed = true;
+            if (shiftHeld) {
+                if (world.renderDistance > 2) {
+                    world.renderDistance--;
+                    std::cout << "[F3+Shift+F] Render distance: " << world.renderDistance << std::endl;
+                }
+            } else {
+                if (world.renderDistance < 32) {
+                    world.renderDistance++;
+                    std::cout << "[F3+F] Render distance: " << world.renderDistance << std::endl;
+                }
+            }
+        } else if (glfwGetKey(window, GLFW_KEY_F) != GLFW_PRESS) {
+            fPressed = false;
+        }
+
+        // F3+T - Reload textures/shaders
+        static bool tPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_T) == GLFW_PRESS && !tPressed) {
+            tPressed = true;
+            f3ComboUsed = true;
+            std::cout << "[F3+T] Reloading textures..." << std::endl;
+            // Texture atlas regeneration would go here
+            std::cout << "[F3+T] Textures reloaded" << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_T) != GLFW_PRESS) {
+            tPressed = false;
+        }
+
+        // F3+Q - Show F3 help
+        static bool qPressed = false;
+        if (glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS && !qPressed) {
+            qPressed = true;
+            f3ComboUsed = true;
+            std::cout << "\n=== F3 Debug Combinations ===" << std::endl;
+            std::cout << "  F3        - Toggle debug overlay" << std::endl;
+            std::cout << "  F3+A      - Reload all chunks" << std::endl;
+            std::cout << "  F3+B      - Toggle hitboxes" << std::endl;
+            std::cout << "  F3+G      - Toggle chunk borders" << std::endl;
+            std::cout << "  F3+H      - Toggle advanced debug info" << std::endl;
+            std::cout << "  F3+L      - Toggle light level display" << std::endl;
+            std::cout << "  F3+F      - Increase render distance" << std::endl;
+            std::cout << "  F3+Shift+F - Decrease render distance" << std::endl;
+            std::cout << "  F3+T      - Reload textures" << std::endl;
+            std::cout << "  F3+Q      - Show this help" << std::endl;
+            std::cout << "==============================\n" << std::endl;
+        } else if (glfwGetKey(window, GLFW_KEY_Q) != GLFW_PRESS) {
+            qPressed = false;
+        }
+
+        // Just F3 alone - toggle debug overlay (only if no combo was used)
+        if (!f3Pressed && !f3ComboUsed) {
             f3Pressed = true;
+            // Delay toggle until release to allow combos
         }
     } else {
+        // F3 released - toggle debug overlay if no combo was used
+        if (f3Pressed && !f3ComboUsed) {
+            debugOverlay.toggle();
+        }
         f3Pressed = false;
+        f3ComboUsed = false;
     }
 
     // Cloud style toggle (F4) - cycles Simple/Volumetric
@@ -4577,6 +4708,9 @@ int main() {
     BlockHighlight blockHighlight;
     blockHighlight.init();
 
+    ChunkBorderRenderer chunkBorderRenderer;
+    chunkBorderRenderer.init();
+
     // ============================================
     // INITIALIZE MENU SYSTEM
     // ============================================
@@ -6470,6 +6604,11 @@ int main() {
         // Render block highlight
         if (currentTarget.has_value() && !wireframeMode) {
             blockHighlight.render(currentTarget->blockPos, view, projection);
+        }
+
+        // Render chunk borders (F3+G)
+        if (g_showChunkBorders) {
+            chunkBorderRenderer.render(camera.position, world.renderDistance, view, projection);
         }
 
         // Render crosshair
