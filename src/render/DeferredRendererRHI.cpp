@@ -434,25 +434,43 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         // OpenGL: Blit the output to the default framebuffer
         GLuint srcTexture = static_cast<GLuint>(reinterpret_cast<uintptr_t>(finalOutput->getNativeHandle()));
 
+        // Get depth texture from G-Buffer for forward pass compatibility
+        RHI::RHITexture* depthTexture = m_gBufferPass->getDepthTexture();
+        GLuint srcDepth = depthTexture ?
+            static_cast<GLuint>(reinterpret_cast<uintptr_t>(depthTexture->getNativeHandle())) : 0;
+
         // Create temporary FBO for reading if needed
         if (m_blitFBO == 0) {
             glGenFramebuffers(1, &m_blitFBO);
         }
 
-        // Attach source texture to read FBO
+        // Attach source textures to read FBO
         glBindFramebuffer(GL_READ_FRAMEBUFFER, m_blitFBO);
         glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, srcTexture, 0);
+        if (srcDepth != 0) {
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, srcDepth, 0);
+        }
 
         // Bind default framebuffer for drawing
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 
-        // Blit from RHI output to screen
+        // Blit color from RHI output to screen
         glBlitFramebuffer(
-            0, 0, m_displayWidth, m_displayHeight,  // Source rect
-            0, 0, m_displayWidth, m_displayHeight,  // Dest rect (screen)
+            0, 0, m_renderWidth, m_renderHeight,    // Source rect (render resolution)
+            0, 0, m_displayWidth, m_displayHeight,  // Dest rect (display resolution)
             GL_COLOR_BUFFER_BIT,
-            GL_NEAREST  // Filtering
+            GL_LINEAR  // Linear filtering for upscaling
         );
+
+        // Blit depth buffer for forward passes (water, particles, etc.)
+        if (srcDepth != 0) {
+            glBlitFramebuffer(
+                0, 0, m_renderWidth, m_renderHeight,    // Source rect
+                0, 0, m_displayWidth, m_displayHeight,  // Dest rect
+                GL_DEPTH_BUFFER_BIT,
+                GL_NEAREST  // Depth must use nearest filtering
+            );
+        }
 
         // Restore framebuffer binding
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
