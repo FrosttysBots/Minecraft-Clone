@@ -476,19 +476,265 @@ bool DeferredRendererRHI::createDescriptorPools() {
 }
 
 bool DeferredRendererRHI::createPipelines() {
-    // Pipeline creation requires shader compilation and descriptor set layout creation
-    // This is a placeholder - actual implementation would load and compile shaders
+    // Initialize shader compiler
+    ShaderCompiler::initialize();
 
-    // For now, we mark pipelines as needing to be set externally
-    // In a full implementation, we would:
-    // 1. Load shader source from files
-    // 2. Compile to SPIR-V using ShaderCompiler
-    // 3. Create shader modules
-    // 4. Create pipeline layouts with descriptor set layouts
-    // 5. Create graphics/compute pipelines
+    ShaderCompileOptions options;
+    options.glslVersion = 460;
+    options.vulkanSemantics = (g_config.renderer == RendererType::VULKAN);
+    options.optimizePerformance = true;
 
-    std::cout << "[DeferredRendererRHI] Pipelines would be created here" << std::endl;
+    // Helper lambda to load and create a shader program
+    auto loadShaderProgram = [this, &options](const std::string& name,
+                                               const std::filesystem::path& vertPath,
+                                               const std::filesystem::path& fragPath) -> RHI::RHIShaderProgram* {
+        auto vertShader = m_shaderCompiler.loadShader(vertPath, ShaderStage::Vertex, options);
+        auto fragShader = m_shaderCompiler.loadShader(fragPath, ShaderStage::Fragment, options);
 
+        if (!vertShader || !fragShader) {
+            std::cerr << "[DeferredRendererRHI] Failed to load shaders for " << name << std::endl;
+            std::cerr << "  Error: " << m_shaderCompiler.getLastError() << std::endl;
+            return nullptr;
+        }
+
+        // Convert SPIR-V from uint32_t to uint8_t
+        auto convertSpirvToBytes = [](const std::vector<uint32_t>& spirv) -> std::vector<uint8_t> {
+            std::vector<uint8_t> bytes(spirv.size() * sizeof(uint32_t));
+            memcpy(bytes.data(), spirv.data(), bytes.size());
+            return bytes;
+        };
+
+        RHI::ShaderModuleDesc vertDesc{};
+        vertDesc.code = convertSpirvToBytes(vertShader->spirv);
+        vertDesc.stage = RHI::ShaderStage::Vertex;
+        vertDesc.entryPoint = "main";
+        auto vertModule = m_device->createShaderModule(vertDesc);
+
+        RHI::ShaderModuleDesc fragDesc{};
+        fragDesc.code = convertSpirvToBytes(fragShader->spirv);
+        fragDesc.stage = RHI::ShaderStage::Fragment;
+        fragDesc.entryPoint = "main";
+        auto fragModule = m_device->createShaderModule(fragDesc);
+
+        if (!vertModule || !fragModule) {
+            std::cerr << "[DeferredRendererRHI] Failed to create shader modules for " << name << std::endl;
+            return nullptr;
+        }
+
+        RHI::ShaderProgramDesc progDesc{};
+        RHI::ShaderSource vertSrc;
+        vertSrc.stage = RHI::ShaderStage::Vertex;
+        vertSrc.type = RHI::ShaderSourceType::SPIRV;
+        vertSrc.spirv = convertSpirvToBytes(vertShader->spirv);
+        vertSrc.entryPoint = "main";
+
+        RHI::ShaderSource fragSrc;
+        fragSrc.stage = RHI::ShaderStage::Fragment;
+        fragSrc.type = RHI::ShaderSourceType::SPIRV;
+        fragSrc.spirv = convertSpirvToBytes(fragShader->spirv);
+        fragSrc.entryPoint = "main";
+
+        progDesc.stages = {vertSrc, fragSrc};
+        progDesc.debugName = name;
+
+        auto program = m_device->createShaderProgram(progDesc);
+        if (program) {
+            m_shaderPrograms[name] = std::move(program);
+        }
+        return m_shaderPrograms[name].get();
+    };
+
+    // Helper lambda to load compute shaders
+    auto loadComputeProgram = [this, &options](const std::string& name,
+                                                const std::filesystem::path& compPath) -> RHI::RHIShaderProgram* {
+        auto compShader = m_shaderCompiler.loadShader(compPath, ShaderStage::Compute, options);
+
+        if (!compShader) {
+            std::cerr << "[DeferredRendererRHI] Failed to load compute shader for " << name << std::endl;
+            std::cerr << "  Error: " << m_shaderCompiler.getLastError() << std::endl;
+            return nullptr;
+        }
+
+        // Convert SPIR-V from uint32_t to uint8_t
+        auto convertSpirvToBytes = [](const std::vector<uint32_t>& spirv) -> std::vector<uint8_t> {
+            std::vector<uint8_t> bytes(spirv.size() * sizeof(uint32_t));
+            memcpy(bytes.data(), spirv.data(), bytes.size());
+            return bytes;
+        };
+
+        RHI::ShaderModuleDesc compDesc{};
+        compDesc.code = convertSpirvToBytes(compShader->spirv);
+        compDesc.stage = RHI::ShaderStage::Compute;
+        compDesc.entryPoint = "main";
+        auto compModule = m_device->createShaderModule(compDesc);
+
+        if (!compModule) {
+            std::cerr << "[DeferredRendererRHI] Failed to create compute module for " << name << std::endl;
+            return nullptr;
+        }
+
+        RHI::ShaderProgramDesc progDesc{};
+        RHI::ShaderSource compSrc;
+        compSrc.stage = RHI::ShaderStage::Compute;
+        compSrc.type = RHI::ShaderSourceType::SPIRV;
+        compSrc.spirv = convertSpirvToBytes(compShader->spirv);
+        compSrc.entryPoint = "main";
+
+        progDesc.stages = {compSrc};
+        progDesc.debugName = name;
+
+        auto program = m_device->createShaderProgram(progDesc);
+        if (program) {
+            m_shaderPrograms[name] = std::move(program);
+        }
+        return m_shaderPrograms[name].get();
+    };
+
+    // Load all shader programs
+    std::cout << "[DeferredRendererRHI] Loading shaders..." << std::endl;
+
+    // G-Buffer shaders
+    auto gbufferProg = loadShaderProgram("gbuffer",
+        "shaders/deferred/gbuffer.vert",
+        "shaders/deferred/gbuffer.frag");
+
+    // Shadow shaders
+    auto shadowProg = loadShaderProgram("shadow",
+        "shaders/forward/shadow.vert",
+        "shaders/forward/shadow.frag");
+
+    // Composite shaders
+    auto compositeProg = loadShaderProgram("composite",
+        "shaders/deferred/composite.vert",
+        "shaders/deferred/composite.frag");
+
+    // SSAO shaders (using fragment shader approach)
+    auto ssaoProg = loadShaderProgram("ssao",
+        "shaders/postprocess/ssao.vert",
+        "shaders/postprocess/ssao.frag");
+
+    auto ssaoBlurProg = loadShaderProgram("ssao_blur",
+        "shaders/postprocess/ssao.vert",
+        "shaders/postprocess/ssao_blur.frag");
+
+    // FSR shaders
+    auto fsrEasuProg = loadShaderProgram("fsr_easu",
+        "shaders/postprocess/fsr_easu.vert",
+        "shaders/postprocess/fsr_easu.frag");
+
+    auto fsrRcasProg = loadShaderProgram("fsr_rcas",
+        "shaders/postprocess/fsr_easu.vert",
+        "shaders/postprocess/fsr_rcas.frag");
+
+    // Compute shaders
+    auto hiZProg = loadComputeProgram("hiz_downsample",
+        "shaders/compute/hiz_downsample.comp");
+
+    auto cullingProg = loadComputeProgram("occlusion_cull",
+        "shaders/compute/occlusion_cull.comp");
+
+    // Create vertex input layout for chunk geometry
+    RHI::VertexInputState chunkVertexInput{};
+    chunkVertexInput.bindings = {{
+        0,                              // binding
+        sizeof(float) * 3 + sizeof(float) * 2 + sizeof(uint32_t),  // stride (pos + uv + packed data)
+        RHI::VertexInputRate::Vertex
+    }};
+    chunkVertexInput.attributes = {
+        {0, 0, RHI::Format::RGB32_FLOAT, 0},                          // position
+        {1, 0, RHI::Format::RG32_FLOAT, sizeof(float) * 3},           // texcoord
+        {2, 0, RHI::Format::RGBA8_UINT, sizeof(float) * 5}            // packed data
+    };
+
+    // Create G-Buffer pipeline
+    if (gbufferProg && m_gBufferPass->getRenderPass()) {
+        RHI::GraphicsPipelineDesc gbufferPipeDesc{};
+        gbufferPipeDesc.shaderProgram = gbufferProg;
+        gbufferPipeDesc.vertexInput = chunkVertexInput;
+        gbufferPipeDesc.rasterizer.cullMode = RHI::CullMode::Back;
+        gbufferPipeDesc.rasterizer.frontFace = RHI::FrontFace::CounterClockwise;
+        gbufferPipeDesc.depthStencil.depthTestEnable = true;
+        gbufferPipeDesc.depthStencil.depthWriteEnable = true;
+        gbufferPipeDesc.depthStencil.depthCompareOp = RHI::CompareOp::LessOrEqual;
+        gbufferPipeDesc.colorBlendStates = {
+            {false},  // Position
+            {false},  // Normal
+            {false}   // Albedo
+        };
+        gbufferPipeDesc.renderPass = m_gBufferPass->getRenderPass();
+        gbufferPipeDesc.debugName = "GBufferPipeline";
+
+        m_gBufferPipeline = m_device->createGraphicsPipeline(gbufferPipeDesc);
+        if (m_gBufferPipeline) {
+            m_gBufferPass->setPipeline(m_gBufferPipeline.get());
+        }
+    }
+
+    // Create shadow pipeline
+    if (shadowProg && m_shadowPass->getRenderPass()) {
+        RHI::GraphicsPipelineDesc shadowPipeDesc{};
+        shadowPipeDesc.shaderProgram = shadowProg;
+        shadowPipeDesc.vertexInput = chunkVertexInput;
+        shadowPipeDesc.rasterizer.cullMode = RHI::CullMode::Front;  // Front face culling for shadows
+        shadowPipeDesc.rasterizer.depthBiasEnable = true;
+        shadowPipeDesc.depthStencil.depthTestEnable = true;
+        shadowPipeDesc.depthStencil.depthWriteEnable = true;
+        shadowPipeDesc.renderPass = m_shadowPass->getRenderPass();
+        shadowPipeDesc.debugName = "ShadowPipeline";
+
+        m_shadowPipeline = m_device->createGraphicsPipeline(shadowPipeDesc);
+        if (m_shadowPipeline) {
+            m_shadowPass->setPipeline(m_shadowPipeline.get());
+        }
+    }
+
+    // Create composite pipeline (fullscreen quad)
+    if (compositeProg && m_compositePass->getRenderPass()) {
+        RHI::VertexInputState quadVertexInput{};
+        quadVertexInput.bindings = {{0, sizeof(float) * 2, RHI::VertexInputRate::Vertex}};
+        quadVertexInput.attributes = {{0, 0, RHI::Format::RG32_FLOAT, 0}};
+
+        RHI::GraphicsPipelineDesc compositePipeDesc{};
+        compositePipeDesc.shaderProgram = compositeProg;
+        compositePipeDesc.vertexInput = quadVertexInput;
+        compositePipeDesc.rasterizer.cullMode = RHI::CullMode::None;
+        compositePipeDesc.depthStencil.depthTestEnable = false;
+        compositePipeDesc.depthStencil.depthWriteEnable = false;
+        compositePipeDesc.colorBlendStates = {{false}};
+        compositePipeDesc.renderPass = m_compositePass->getRenderPass();
+        compositePipeDesc.debugName = "CompositePipeline";
+
+        m_compositePipeline = m_device->createGraphicsPipeline(compositePipeDesc);
+        if (m_compositePipeline) {
+            m_compositePass->setPipeline(m_compositePipeline.get());
+        }
+    }
+
+    // Create Hi-Z compute pipeline
+    if (hiZProg) {
+        RHI::ComputePipelineDesc hiZPipeDesc{};
+        hiZPipeDesc.shaderProgram = hiZProg;
+        hiZPipeDesc.debugName = "HiZPipeline";
+
+        m_hiZPipeline = m_device->createComputePipeline(hiZPipeDesc);
+        if (m_hiZPipeline) {
+            m_hiZPass->setComputePipeline(m_hiZPipeline.get());
+        }
+    }
+
+    // Create GPU culling compute pipeline
+    if (cullingProg) {
+        RHI::ComputePipelineDesc cullingPipeDesc{};
+        cullingPipeDesc.shaderProgram = cullingProg;
+        cullingPipeDesc.debugName = "GPUCullingPipeline";
+
+        m_cullingPipeline = m_device->createComputePipeline(cullingPipeDesc);
+        if (m_cullingPipeline) {
+            m_gpuCullingPass->setComputePipeline(m_cullingPipeline.get());
+        }
+    }
+
+    std::cout << "[DeferredRendererRHI] Pipelines created successfully" << std::endl;
     return true;
 }
 

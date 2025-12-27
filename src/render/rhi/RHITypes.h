@@ -42,6 +42,8 @@ enum class Format {
     R32_SINT,
     RG16_FLOAT,
     RGBA8_UNORM,
+    RGBA8_UINT,
+    RGBA8_SINT,
     RGBA8_SRGB,
     BGRA8_UNORM,
     BGRA8_SRGB,
@@ -50,10 +52,16 @@ enum class Format {
 
     // 64-bit formats
     RG32_FLOAT,
+    RG32_UINT,
     RGBA16_FLOAT,
+
+    // 96-bit formats
+    RGB32_FLOAT,
+    RGB32_UINT,
 
     // 128-bit formats
     RGBA32_FLOAT,
+    RGBA32_UINT,
 
     // Depth/stencil formats
     D16_UNORM,
@@ -456,6 +464,8 @@ inline uint32_t getFormatSize(Format format) {
         case Format::R32_SINT:
         case Format::RG16_FLOAT:
         case Format::RGBA8_UNORM:
+        case Format::RGBA8_UINT:
+        case Format::RGBA8_SINT:
         case Format::RGBA8_SRGB:
         case Format::BGRA8_UNORM:
         case Format::BGRA8_SRGB:
@@ -463,9 +473,14 @@ inline uint32_t getFormatSize(Format format) {
         case Format::RG11B10_FLOAT:
             return 4;
         case Format::RG32_FLOAT:
+        case Format::RG32_UINT:
         case Format::RGBA16_FLOAT:
             return 8;
+        case Format::RGB32_FLOAT:
+        case Format::RGB32_UINT:
+            return 12;
         case Format::RGBA32_FLOAT:
+        case Format::RGBA32_UINT:
             return 16;
         case Format::D16_UNORM:
             return 2;

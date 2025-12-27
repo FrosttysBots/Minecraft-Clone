@@ -76,6 +76,9 @@ public:
     // Set the shadow shader pipeline
     void setPipeline(RHI::RHIGraphicsPipeline* pipeline) { m_pipeline = pipeline; }
 
+    // Get render pass for pipeline creation
+    RHI::RHIRenderPass* getRenderPass() const { return m_renderPass.get(); }
+
 private:
     void calculateCascadeSplits(float nearPlane, float farPlane);
     glm::mat4 calculateCascadeMatrix(const CameraData& camera, float nearSplit, float farSplit,
@@ -296,6 +299,7 @@ public:
 
     RHI::RHITexture* getOutputTexture() const { return m_sceneColor.get(); }
     RHI::RHIFramebuffer* getFramebuffer() const { return m_framebuffer.get(); }
+    RHI::RHIRenderPass* getRenderPass() const { return m_renderPass.get(); }
 
     void setPipeline(RHI::RHIGraphicsPipeline* pipeline) { m_pipeline = pipeline; }
     void setGBufferTextures(RHI::RHITexture* position, RHI::RHITexture* normal,
