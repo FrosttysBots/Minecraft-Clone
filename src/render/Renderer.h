@@ -84,6 +84,7 @@ struct RenderConfig {
     bool enableHiZCulling = true;
     bool enableGPUCulling = true;
     bool useDeferredRendering = true;
+    bool enableBloom = true;
 
     // Quality settings
     uint32_t shadowResolution = 2048;

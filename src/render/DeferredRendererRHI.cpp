@@ -105,6 +105,7 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
     m_skyPass = std::make_unique<SkyPassRHI>(m_device.get());
     m_waterPass = std::make_unique<WaterPassRHI>(m_device.get());
     m_precipitationPass = std::make_unique<PrecipitationPassRHI>(m_device.get());
+    m_bloomPass = std::make_unique<BloomPassRHI>(m_device.get());
     m_fsrPass = std::make_unique<FSRPassRHI>(m_device.get());
 
     // Initialize render passes
@@ -150,6 +151,11 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 
     if (!m_precipitationPass->initialize(config)) {
         std::cerr << "[DeferredRendererRHI] Failed to initialize precipitation pass" << std::endl;
+        return false;
+    }
+
+    if (!m_bloomPass->initialize(config)) {
+        std::cerr << "[DeferredRendererRHI] Failed to initialize bloom pass" << std::endl;
         return false;
     }
 
@@ -200,6 +206,9 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 
     // Connect precipitation pass to target framebuffer
     m_precipitationPass->setTargetFramebuffer(m_compositePass->getFramebuffer());
+
+    // Connect bloom pass to composite output
+    m_bloomPass->setInputTexture(m_compositePass->getOutputTexture());
 
     // Initialize RHI vertex pool
     m_vertexPool = std::make_unique<VertexPoolRHI>();
@@ -328,6 +337,7 @@ void DeferredRendererRHI::resize(uint32_t width, uint32_t height) {
     m_compositePass->resize(m_renderWidth, m_renderHeight);
     m_skyPass->resize(width, height);
     m_precipitationPass->resize(m_renderWidth, m_renderHeight);
+    m_bloomPass->resize(m_renderWidth, m_renderHeight);
     m_fsrPass->setDimensions(m_renderWidth, m_renderHeight, width, height);
 
     // Reconnect textures after resize
@@ -438,7 +448,12 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
     // 9. Precipitation Pass (rain/snow particles)
     m_precipitationPass->execute(cmd, m_context);
 
-    // 10. FSR Upscaling Pass
+    // 10. Bloom Pass (optional glow effect)
+    if (m_config.enableBloom) {
+        m_bloomPass->execute(cmd, m_context);
+    }
+
+    // 11. FSR Upscaling Pass
     if (m_config.upscaleMode != UpscaleMode::NATIVE) {
         m_fsrPass->execute(cmd, m_context);
     }

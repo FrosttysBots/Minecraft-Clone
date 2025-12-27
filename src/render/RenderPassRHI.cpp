@@ -1735,4 +1735,191 @@ void FSRPassRHI::destroyBuffers() {
     m_rcasDescriptorSet.reset();
 }
 
+// ============================================================================
+// BloomPassRHI Implementation
+// ============================================================================
+
+BloomPassRHI::BloomPassRHI(RHI::RHIDevice* device)
+    : RenderPassRHI("BloomRHI", device) {}
+
+BloomPassRHI::~BloomPassRHI() {
+    shutdown();
+}
+
+bool BloomPassRHI::initialize(const RenderConfig& config) {
+    m_width = config.renderWidth;
+    m_height = config.renderHeight;
+
+    // Create render pass for bloom output
+    RHI::RenderPassDesc rpDesc{};
+    RHI::AttachmentDesc colorAttachment{};
+    colorAttachment.format = RHI::Format::RGBA16_FLOAT;
+    colorAttachment.loadOp = RHI::LoadOp::Clear;
+    colorAttachment.storeOp = RHI::StoreOp::Store;
+    rpDesc.colorAttachments.push_back(colorAttachment);
+    rpDesc.hasDepthStencil = false;
+    m_renderPass = m_device->createRenderPass(rpDesc);
+
+    // Create uniform buffer for bloom parameters
+    RHI::BufferDesc uboDesc{};
+    uboDesc.size = 64;  // threshold, softThreshold, intensity, texelSize, etc.
+    uboDesc.usage = RHI::BufferUsage::Uniform;
+    uboDesc.memory = RHI::MemoryUsage::CpuToGpu;
+    uboDesc.debugName = "Bloom_UBO";
+    m_bloomUBO = m_device->createBuffer(uboDesc);
+
+    // Create mip chain for blur
+    createMipChain(m_width, m_height);
+
+    std::cout << "[BloomPassRHI] Initialized with " << m_mipLevels
+              << " mip levels (" << m_width << "x" << m_height << ")" << std::endl;
+
+    return true;
+}
+
+void BloomPassRHI::shutdown() {
+    destroyMipChain();
+    m_bloomUBO.reset();
+    m_renderPass.reset();
+    m_extractDescriptorSet.reset();
+    m_combineDescriptorSet.reset();
+}
+
+void BloomPassRHI::resize(uint32_t width, uint32_t height) {
+    if (width == m_width && height == m_height) return;
+
+    m_width = width;
+    m_height = height;
+
+    destroyMipChain();
+    createMipChain(width, height);
+}
+
+void BloomPassRHI::createMipChain(uint32_t width, uint32_t height) {
+    m_mipChain.clear();
+    m_mipFramebuffers.clear();
+    m_mipDescriptorSets.clear();
+
+    // Calculate number of mip levels based on resolution
+    int maxMips = static_cast<int>(std::floor(std::log2(std::min(width, height))));
+    int actualMips = std::min(m_mipLevels, std::min(maxMips, MAX_MIP_LEVELS));
+
+    uint32_t mipWidth = width / 2;
+    uint32_t mipHeight = height / 2;
+
+    for (int i = 0; i < actualMips; i++) {
+        // Create texture for this mip level
+        RHI::TextureDesc texDesc{};
+        texDesc.type = RHI::TextureType::Texture2D;
+        texDesc.format = RHI::Format::RGBA16_FLOAT;
+        texDesc.width = std::max(mipWidth, 1u);
+        texDesc.height = std::max(mipHeight, 1u);
+        texDesc.depth = 1;
+        texDesc.arrayLayers = 1;
+        texDesc.mipLevels = 1;
+        texDesc.samples = 1;
+        texDesc.usage = RHI::TextureUsage::RenderTarget | RHI::TextureUsage::Sampled;
+        texDesc.debugName = "Bloom_Mip" + std::to_string(i);
+
+        auto mipTexture = m_device->createTexture(texDesc);
+        if (!mipTexture) {
+            std::cerr << "[BloomPassRHI] Failed to create mip " << i << " texture" << std::endl;
+            break;
+        }
+
+        // Create framebuffer for this mip
+        if (m_renderPass) {
+            RHI::FramebufferDesc fbDesc{};
+            fbDesc.renderPass = m_renderPass.get();
+            fbDesc.width = texDesc.width;
+            fbDesc.height = texDesc.height;
+            fbDesc.colorAttachments.push_back({mipTexture.get(), 0, 0});
+
+            auto fb = m_device->createFramebuffer(fbDesc);
+            m_mipFramebuffers.push_back(std::move(fb));
+        }
+
+        m_mipChain.push_back(std::move(mipTexture));
+
+        mipWidth /= 2;
+        mipHeight /= 2;
+    }
+
+    // Create output texture at full resolution
+    RHI::TextureDesc outDesc{};
+    outDesc.type = RHI::TextureType::Texture2D;
+    outDesc.format = RHI::Format::RGBA16_FLOAT;
+    outDesc.width = width;
+    outDesc.height = height;
+    outDesc.depth = 1;
+    outDesc.arrayLayers = 1;
+    outDesc.mipLevels = 1;
+    outDesc.samples = 1;
+    outDesc.usage = RHI::TextureUsage::RenderTarget | RHI::TextureUsage::Sampled;
+    outDesc.debugName = "Bloom_Output";
+
+    m_outputTexture = m_device->createTexture(outDesc);
+
+    if (m_renderPass && m_outputTexture) {
+        RHI::FramebufferDesc fbDesc{};
+        fbDesc.renderPass = m_renderPass.get();
+        fbDesc.width = width;
+        fbDesc.height = height;
+        fbDesc.colorAttachments.push_back({m_outputTexture.get(), 0, 0});
+        m_outputFramebuffer = m_device->createFramebuffer(fbDesc);
+    }
+}
+
+void BloomPassRHI::destroyMipChain() {
+    m_mipChain.clear();
+    m_mipFramebuffers.clear();
+    m_mipDescriptorSets.clear();
+    m_outputTexture.reset();
+    m_outputFramebuffer.reset();
+}
+
+void BloomPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
+    if (!m_enabled || !m_inputTexture) return;
+    if (m_mipChain.empty()) return;
+
+    // Update bloom parameters
+    if (m_bloomUBO) {
+        struct BloomParams {
+            float threshold;
+            float softThreshold;
+            float intensity;
+            float exposure;
+            glm::vec2 texelSize;
+            float blendFactor;
+            float padding;
+        } params;
+
+        params.threshold = m_threshold;
+        params.softThreshold = m_softThreshold;
+        params.intensity = m_intensity;
+        params.exposure = 1.0f;
+        params.texelSize = glm::vec2(1.0f / m_width, 1.0f / m_height);
+        params.blendFactor = 0.5f;
+
+        void* mapped = m_bloomUBO->map();
+        if (mapped) {
+            memcpy(mapped, &params, sizeof(params));
+            m_bloomUBO->unmap();
+        }
+    }
+
+    // For now, this is a placeholder that copies input to output
+    // Full implementation would do:
+    // 1. Extract bright pixels from input
+    // 2. Downsample through mip chain
+    // 3. Upsample back up, blurring at each level
+    // 4. Combine with original scene
+
+    // In hybrid mode with OpenGL, the actual bloom work can be done via GL calls
+    // This pass structure supports future full-RHI implementation
+
+    // The bloom output will be the input scene with bloom applied
+    // For now, just mark it as available
+}
+
 } // namespace Render

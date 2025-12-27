@@ -511,4 +511,76 @@ private:
     uint32_t m_displayHeight = 0;
 };
 
+// ============================================================================
+// Bloom Pass - Glow effect for bright light sources
+// ============================================================================
+
+class BloomPassRHI : public RenderPassRHI {
+public:
+    BloomPassRHI(RHI::RHIDevice* device);
+    ~BloomPassRHI() override;
+
+    bool initialize(const RenderConfig& config) override;
+    void shutdown() override;
+    void resize(uint32_t width, uint32_t height) override;
+    void execute(RHI::RHICommandBuffer* cmd, RenderContext& context) override;
+
+    // Bloom settings
+    void setThreshold(float threshold) { m_threshold = threshold; }
+    void setSoftThreshold(float softThreshold) { m_softThreshold = softThreshold; }
+    void setIntensity(float intensity) { m_intensity = intensity; }
+    void setMipLevels(int levels) { m_mipLevels = std::clamp(levels, 1, 8); }
+
+    float getThreshold() const { return m_threshold; }
+    float getIntensity() const { return m_intensity; }
+
+    // Set input scene texture
+    void setInputTexture(RHI::RHITexture* input) { m_inputTexture = input; }
+    RHI::RHITexture* getOutputTexture() const { return m_outputTexture.get(); }
+
+    // Set pipelines (extract, downsample, upsample, combine)
+    void setExtractPipeline(RHI::RHIGraphicsPipeline* pipeline) { m_extractPipeline = pipeline; }
+    void setDownsamplePipeline(RHI::RHIGraphicsPipeline* pipeline) { m_downsamplePipeline = pipeline; }
+    void setUpsamplePipeline(RHI::RHIGraphicsPipeline* pipeline) { m_upsamplePipeline = pipeline; }
+    void setCombinePipeline(RHI::RHIGraphicsPipeline* pipeline) { m_combinePipeline = pipeline; }
+
+private:
+    void createMipChain(uint32_t width, uint32_t height);
+    void destroyMipChain();
+
+    // Pipelines
+    RHI::RHIGraphicsPipeline* m_extractPipeline = nullptr;
+    RHI::RHIGraphicsPipeline* m_downsamplePipeline = nullptr;
+    RHI::RHIGraphicsPipeline* m_upsamplePipeline = nullptr;
+    RHI::RHIGraphicsPipeline* m_combinePipeline = nullptr;
+
+    // Mip chain textures for progressive blur
+    static constexpr int MAX_MIP_LEVELS = 8;
+    std::vector<std::unique_ptr<RHI::RHITexture>> m_mipChain;
+    std::vector<std::unique_ptr<RHI::RHIFramebuffer>> m_mipFramebuffers;
+    std::vector<std::unique_ptr<RHI::RHIDescriptorSet>> m_mipDescriptorSets;
+
+    // Output texture (scene + bloom)
+    std::unique_ptr<RHI::RHITexture> m_outputTexture;
+    std::unique_ptr<RHI::RHIFramebuffer> m_outputFramebuffer;
+    std::unique_ptr<RHI::RHIRenderPass> m_renderPass;
+
+    // Uniform buffer for bloom parameters
+    std::unique_ptr<RHI::RHIBuffer> m_bloomUBO;
+    std::unique_ptr<RHI::RHIDescriptorSet> m_extractDescriptorSet;
+    std::unique_ptr<RHI::RHIDescriptorSet> m_combineDescriptorSet;
+
+    // Input scene texture
+    RHI::RHITexture* m_inputTexture = nullptr;
+
+    // Bloom settings
+    float m_threshold = 1.0f;        // Brightness threshold for bloom
+    float m_softThreshold = 0.5f;    // Soft knee for smooth transition
+    float m_intensity = 0.5f;        // Bloom intensity in final combine
+    int m_mipLevels = 5;             // Number of mip levels (blur iterations)
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+};
+
 } // namespace Render
