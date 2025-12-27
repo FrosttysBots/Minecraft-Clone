@@ -56,6 +56,41 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(meshoptimizer)
 
+# ============================================================================
+# VULKAN DEPENDENCIES
+# ============================================================================
+
+# Vulkan-Headers - Official Vulkan API headers
+FetchContent_Declare(
+    vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG vulkan-sdk-1.3.275.0
+)
+FetchContent_MakeAvailable(vulkan_headers)
+
+# volk - Meta-loader for Vulkan (loads all functions dynamically)
+FetchContent_Declare(
+    volk
+    GIT_REPOSITORY https://github.com/zeux/volk.git
+    GIT_TAG vulkan-sdk-1.3.275.0
+)
+set(VOLK_STATIC_DEFINES ON CACHE BOOL "" FORCE)
+set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
+set(VOLK_HEADERS_ONLY ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(volk)
+
+# VulkanMemoryAllocator - Efficient GPU memory management (header-only)
+FetchContent_Declare(
+    vma
+    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+    GIT_TAG v3.0.1
+)
+# VMA is header-only, just fetch the content without building
+FetchContent_GetProperties(vma)
+if(NOT vma_POPULATED)
+    FetchContent_Populate(vma)
+endif()
+
 # Source files for main game (exclude launcher)
 file(GLOB_RECURSE GAME_SOURCES
     "src/*.cpp"
@@ -131,3 +166,28 @@ if(MSVC)
 else()
     target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# ============================================================================
+# VULKAN TEST EXECUTABLE
+# ============================================================================
+add_executable(VulkanTest
+    tests/VulkanTest.cpp
+)
+
+target_include_directories(VulkanTest PRIVATE
+    ${vulkan_headers_SOURCE_DIR}/include
+    ${volk_SOURCE_DIR}
+)
+
+target_link_libraries(VulkanTest PRIVATE
+    glfw
+)
+
+# volk needs to link against the system's Vulkan loader on Windows
+if(WIN32)
+    target_compile_definitions(VulkanTest PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
+
+set_target_properties(VulkanTest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
