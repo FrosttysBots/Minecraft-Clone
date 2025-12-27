@@ -112,7 +112,16 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${GLAD_DIR}/include
     ${stb_SOURCE_DIR}
     ${fastnoiselite_SOURCE_DIR}/Cpp
+    # Vulkan includes
+    ${vulkan_headers_SOURCE_DIR}/include
+    ${volk_SOURCE_DIR}
+    ${vma_SOURCE_DIR}/include
 )
+
+# Vulkan platform defines
+if(WIN32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw

@@ -139,6 +139,32 @@ inline TextureUsage operator|(TextureUsage a, TextureUsage b) {
 inline TextureUsage operator&(TextureUsage a, TextureUsage b) {
     return static_cast<TextureUsage>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
+inline bool hasFlag(TextureUsage flags, TextureUsage flag) {
+    return (static_cast<uint32_t>(flags) & static_cast<uint32_t>(flag)) != 0;
+}
+
+// Helper functions for format queries
+inline bool isDepthFormat(Format format) {
+    switch (format) {
+        case Format::D16_UNORM:
+        case Format::D24_UNORM_S8_UINT:
+        case Format::D32_FLOAT:
+        case Format::D32_FLOAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline bool hasStencilComponent(Format format) {
+    switch (format) {
+        case Format::D24_UNORM_S8_UINT:
+        case Format::D32_FLOAT_S8_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
 
 struct TextureDesc {
     TextureType type = TextureType::Texture2D;
