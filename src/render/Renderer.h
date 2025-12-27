@@ -5,6 +5,8 @@
 #include <vector>
 #include <string>
 
+#include "../core/Config.h"  // For UpscaleMode enum
+
 // Forward declarations
 class World;
 class Camera;
@@ -80,6 +82,7 @@ struct RenderConfig {
     bool enableShadows = true;
     bool enableFSR = false;
     bool enableHiZCulling = true;
+    bool enableGPUCulling = true;
     bool useDeferredRendering = true;
 
     // Quality settings
@@ -88,6 +91,7 @@ struct RenderConfig {
     uint32_t ssaoSamples = 16;
     float ssaoRadius = 0.5f;
     float ssaoBias = 0.025f;
+    UpscaleMode upscaleMode = UpscaleMode::NATIVE;
 
     // Debug
     int debugMode = 0;  // 0=normal, 1-8=debug views

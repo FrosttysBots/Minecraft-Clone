@@ -37,6 +37,14 @@ extern GLuint frustumPlanesUBO;
 
 // Function pointer for glDrawMeshTasksNV (loaded in main.cpp)
 #ifndef GLAD_GL_NV_mesh_shader
+// APIENTRY may not be defined if windows.h wasn't included - use GLAD_API_PTR or __stdcall
+#ifndef APIENTRY
+  #ifdef _WIN32
+    #define APIENTRY __stdcall
+  #else
+    #define APIENTRY
+  #endif
+#endif
 typedef void (APIENTRY* PFNGLDRAWMESHTASKSNVPROC_LOCAL)(GLuint first, GLuint count);
 extern PFNGLDRAWMESHTASKSNVPROC_LOCAL pfn_glDrawMeshTasksNV;
 #define glDrawMeshTasksNV_ptr pfn_glDrawMeshTasksNV

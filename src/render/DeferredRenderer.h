@@ -1,5 +1,6 @@
 #pragma once
 
+#include <glad/gl.h>
 #include "Renderer.h"
 #include "RenderPass.h"
 #include "ShaderCompiler.h"

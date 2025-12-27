@@ -1,6 +1,7 @@
 #include "DeferredRenderer.h"
 
 #include <glad/gl.h>
+#include "../world/World.h"
 #include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>

@@ -3,6 +3,7 @@
 #include "rhi/RHI.h"
 #include "../core/Config.h"
 
+#define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 #include <string>
 #include <memory>
