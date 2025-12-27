@@ -6,6 +6,10 @@
 #include "GLFramebuffer.h"
 #include "GLDescriptorSet.h"
 #include "GLCommandBuffer.h"
+
+// Vulkan device for factory method
+#include "../vulkan/VKDevice.h"
+
 #include <iostream>
 #include <sstream>
 
@@ -18,11 +22,11 @@ namespace RHI {
 std::unique_ptr<RHIDevice> RHIDevice::create(Backend backend, void* window) {
     switch (backend) {
         case Backend::OpenGL:
+            std::cout << "[RHI] Creating OpenGL device" << std::endl;
             return std::make_unique<GLDevice>(static_cast<GLFWwindow*>(window));
         case Backend::Vulkan:
-            // TODO: Implement Vulkan device
-            std::cerr << "[RHI] Vulkan backend not yet implemented" << std::endl;
-            return nullptr;
+            std::cout << "[RHI] Creating Vulkan device" << std::endl;
+            return std::make_unique<VKDevice>(static_cast<GLFWwindow*>(window));
         default:
             std::cerr << "[RHI] Unknown backend" << std::endl;
             return nullptr;
