@@ -3598,8 +3598,9 @@ int main() {
         return -1;
     }
 
-    // Compile precipitation shader (with caching)
-    GLuint precipShaderProgram = ShaderCache::createCachedProgram("precipitation", precipVertexShaderSource, precipFragmentShaderSource);
+    // Compile precipitation shader from files (with caching)
+    GLuint precipShaderProgram = ShaderCache::createCachedProgramFromFiles(
+        "precipitation", "shaders/effects/precipitation.vert", "shaders/effects/precipitation.frag");
     if (precipShaderProgram == 0) {
         std::cerr << "Failed to create precipitation shader program" << std::endl;
         return -1;

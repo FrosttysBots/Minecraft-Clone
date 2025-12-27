@@ -1398,6 +1398,192 @@ void WaterPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
 }
 
 // ============================================================================
+// PrecipitationPassRHI Implementation
+// ============================================================================
+
+PrecipitationPassRHI::PrecipitationPassRHI(RHI::RHIDevice* device)
+    : RenderPassRHI("PrecipitationRHI", device) {}
+
+PrecipitationPassRHI::~PrecipitationPassRHI() {
+    shutdown();
+}
+
+bool PrecipitationPassRHI::initialize(const RenderConfig& config) {
+    m_width = config.renderWidth;
+    m_height = config.renderHeight;
+
+    // Reserve space for particles
+    m_particles.reserve(m_maxParticles);
+
+    createParticleBuffers();
+
+    std::cout << "[PrecipitationPassRHI] Initialized with max " << m_maxParticles << " particles" << std::endl;
+    return true;
+}
+
+void PrecipitationPassRHI::shutdown() {
+    destroyParticleBuffers();
+    m_particles.clear();
+}
+
+void PrecipitationPassRHI::resize(uint32_t width, uint32_t height) {
+    m_width = width;
+    m_height = height;
+}
+
+void PrecipitationPassRHI::createParticleBuffers() {
+    // Particle vertex buffer: position (vec3) + size (float) + alpha (float) = 20 bytes per particle
+    RHI::BufferDesc vboDesc{};
+    vboDesc.size = m_maxParticles * 20;
+    vboDesc.usage = RHI::BufferUsage::Vertex;
+    vboDesc.memory = RHI::MemoryUsage::CpuToGpu;  // Frequently updated
+    vboDesc.debugName = "Precipitation_VBO";
+    m_particleBuffer = m_device->createBuffer(vboDesc);
+
+    // Precipitation uniform buffer
+    RHI::BufferDesc uboDesc{};
+    uboDesc.size = 128;  // view, projection, time, weatherType, intensity, lightColor
+    uboDesc.usage = RHI::BufferUsage::Uniform;
+    uboDesc.memory = RHI::MemoryUsage::CpuToGpu;
+    uboDesc.debugName = "Precipitation_UBO";
+    m_precipUBO = m_device->createBuffer(uboDesc);
+}
+
+void PrecipitationPassRHI::destroyParticleBuffers() {
+    m_particleBuffer.reset();
+    m_precipUBO.reset();
+    m_descriptorSet.reset();
+}
+
+void PrecipitationPassRHI::spawnParticle(const glm::vec3& cameraPos) {
+    if (m_particles.size() >= m_maxParticles) return;
+
+    Particle p;
+
+    // Random position within spawn radius around camera
+    float radius = 40.0f;
+    float angle = static_cast<float>(rand()) / RAND_MAX * 6.28318f;
+    float distance = static_cast<float>(rand()) / RAND_MAX * radius;
+    p.position.x = cameraPos.x + cos(angle) * distance;
+    p.position.z = cameraPos.z + sin(angle) * distance;
+    p.position.y = cameraPos.y + 30.0f + static_cast<float>(rand()) / RAND_MAX * 20.0f;
+
+    // Set velocity based on weather type
+    if (m_weatherType == 2) {
+        // Snow - slow, gentle fall
+        p.velocity = glm::vec3(0.0f, -2.0f - static_cast<float>(rand()) / RAND_MAX * 1.0f, 0.0f);
+        p.size = 4.0f + static_cast<float>(rand()) / RAND_MAX * 3.0f;
+        p.lifetime = 15.0f + static_cast<float>(rand()) / RAND_MAX * 5.0f;
+    } else {
+        // Rain - fast fall
+        p.velocity = glm::vec3(0.0f, -15.0f - static_cast<float>(rand()) / RAND_MAX * 5.0f, 0.0f);
+        p.size = 2.0f + static_cast<float>(rand()) / RAND_MAX * 2.0f;
+        p.lifetime = 4.0f + static_cast<float>(rand()) / RAND_MAX * 2.0f;
+    }
+
+    p.alpha = 0.7f + static_cast<float>(rand()) / RAND_MAX * 0.3f;
+
+    m_particles.push_back(p);
+}
+
+void PrecipitationPassRHI::updateParticles(float deltaTime, const glm::vec3& cameraPos) {
+    // Spawn new particles based on intensity
+    if (m_weatherType > 0 && m_intensity > 0.0f) {
+        int spawnCount = static_cast<int>(m_intensity * 50.0f * deltaTime);
+        for (int i = 0; i < spawnCount && m_particles.size() < m_maxParticles; i++) {
+            spawnParticle(cameraPos);
+        }
+    }
+
+    // Update existing particles
+    for (auto it = m_particles.begin(); it != m_particles.end();) {
+        it->position += it->velocity * deltaTime;
+        it->lifetime -= deltaTime;
+
+        // Check for despawn conditions
+        if (it->lifetime <= 0.0f ||
+            it->position.y < cameraPos.y - 50.0f ||
+            glm::distance(glm::vec2(it->position.x, it->position.z),
+                         glm::vec2(cameraPos.x, cameraPos.z)) > 60.0f) {
+            it = m_particles.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    m_activeParticles = static_cast<uint32_t>(m_particles.size());
+}
+
+void PrecipitationPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
+    if (!m_enabled || m_weatherType == 0 || m_intensity <= 0.0f) return;
+    if (!m_pipeline || !m_particleBuffer) return;
+
+    // Update particles
+    float deltaTime = context.deltaTime > 0.0f ? context.deltaTime : 0.016f;
+    updateParticles(deltaTime, context.camera->position);
+
+    if (m_particles.empty()) return;
+
+    // Upload particle vertex data
+    struct ParticleVertex {
+        glm::vec3 position;
+        float size;
+        float alpha;
+    };
+
+    std::vector<ParticleVertex> vertices(m_particles.size());
+    for (size_t i = 0; i < m_particles.size(); i++) {
+        vertices[i].position = m_particles[i].position;
+        vertices[i].size = m_particles[i].size;
+        vertices[i].alpha = m_particles[i].alpha;
+    }
+
+    void* mapped = m_particleBuffer->map();
+    if (mapped) {
+        memcpy(mapped, vertices.data(), vertices.size() * sizeof(ParticleVertex));
+        m_particleBuffer->unmap();
+    }
+
+    // Update uniforms
+    if (m_precipUBO && context.camera) {
+        struct PrecipUniforms {
+            glm::mat4 view;
+            glm::mat4 projection;
+            float time;
+            int weatherType;
+            float intensity;
+            float padding1;
+            glm::vec3 lightColor;
+            float padding2;
+        } uniforms;
+
+        uniforms.view = context.camera->view;
+        uniforms.projection = context.camera->projection;
+        uniforms.time = context.time;
+        uniforms.weatherType = m_weatherType;
+        uniforms.intensity = m_intensity;
+        uniforms.lightColor = m_lightColor;
+
+        void* uboMapped = m_precipUBO->map();
+        if (uboMapped) {
+            memcpy(uboMapped, &uniforms, sizeof(uniforms));
+            m_precipUBO->unmap();
+        }
+    }
+
+    // Bind pipeline and draw
+    cmd->bindGraphicsPipeline(m_pipeline);
+
+    if (m_descriptorSet) {
+        cmd->bindDescriptorSet(0, m_descriptorSet.get());
+    }
+
+    // Draw particles as points
+    cmd->bindVertexBuffer(0, m_particleBuffer.get());
+    cmd->draw(static_cast<uint32_t>(m_particles.size()), 1, 0, 0);
+}
+
+// ============================================================================
 // FSRPassRHI Implementation
 // ============================================================================
 

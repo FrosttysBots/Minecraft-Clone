@@ -104,6 +104,7 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
     m_compositePass = std::make_unique<CompositePassRHI>(m_device.get());
     m_skyPass = std::make_unique<SkyPassRHI>(m_device.get());
     m_waterPass = std::make_unique<WaterPassRHI>(m_device.get());
+    m_precipitationPass = std::make_unique<PrecipitationPassRHI>(m_device.get());
     m_fsrPass = std::make_unique<FSRPassRHI>(m_device.get());
 
     // Initialize render passes
@@ -144,6 +145,11 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 
     if (!m_waterPass->initialize(config)) {
         std::cerr << "[DeferredRendererRHI] Failed to initialize water pass" << std::endl;
+        return false;
+    }
+
+    if (!m_precipitationPass->initialize(config)) {
+        std::cerr << "[DeferredRendererRHI] Failed to initialize precipitation pass" << std::endl;
         return false;
     }
 
@@ -188,8 +194,12 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
         return false;
     }
 
-    // Connect water pass to world renderer
+    // Connect water pass to world renderer and target framebuffer
     m_waterPass->setWorldRenderer(m_worldRenderer.get());
+    m_waterPass->setTargetFramebuffer(m_compositePass->getFramebuffer());
+
+    // Connect precipitation pass to target framebuffer
+    m_precipitationPass->setTargetFramebuffer(m_compositePass->getFramebuffer());
 
     // Initialize RHI vertex pool
     m_vertexPool = std::make_unique<VertexPoolRHI>();
@@ -317,6 +327,7 @@ void DeferredRendererRHI::resize(uint32_t width, uint32_t height) {
     m_gpuCullingPass->resize(m_renderWidth, m_renderHeight);
     m_compositePass->resize(m_renderWidth, m_renderHeight);
     m_skyPass->resize(width, height);
+    m_precipitationPass->resize(m_renderWidth, m_renderHeight);
     m_fsrPass->setDimensions(m_renderWidth, m_renderHeight, width, height);
 
     // Reconnect textures after resize
@@ -424,7 +435,10 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
     // 8. Water Pass (forward rendered, semi-transparent)
     m_waterPass->execute(cmd, m_context);
 
-    // 9. FSR Upscaling Pass
+    // 9. Precipitation Pass (rain/snow particles)
+    m_precipitationPass->execute(cmd, m_context);
+
+    // 10. FSR Upscaling Pass
     if (m_config.upscaleMode != UpscaleMode::NATIVE) {
         m_fsrPass->execute(cmd, m_context);
     }

@@ -47,6 +47,7 @@ public:
     GBufferPassRHI* getGBufferPass() { return m_gBufferPass.get(); }
     SSAOPassRHI* getSSAOPass() { return m_ssaoPass.get(); }
     CompositePassRHI* getCompositePass() { return m_compositePass.get(); }
+    PrecipitationPassRHI* getPrecipitationPass() { return m_precipitationPass.get(); }
     FSRPassRHI* getFSRPass() { return m_fsrPass.get(); }
 
     // Access RHI vertex pool
@@ -87,6 +88,7 @@ private:
     std::unique_ptr<CompositePassRHI> m_compositePass;
     std::unique_ptr<SkyPassRHI> m_skyPass;
     std::unique_ptr<WaterPassRHI> m_waterPass;
+    std::unique_ptr<PrecipitationPassRHI> m_precipitationPass;
     std::unique_ptr<FSRPassRHI> m_fsrPass;
 
     // Pipelines
@@ -95,6 +97,7 @@ private:
     std::unique_ptr<RHI::RHIGraphicsPipeline> m_compositePipeline;
     std::unique_ptr<RHI::RHIGraphicsPipeline> m_skyPipeline;
     std::unique_ptr<RHI::RHIGraphicsPipeline> m_waterPipeline;
+    std::unique_ptr<RHI::RHIGraphicsPipeline> m_precipitationPipeline;
     std::unique_ptr<RHI::RHIComputePipeline> m_hiZPipeline;
     std::unique_ptr<RHI::RHIComputePipeline> m_ssaoPipeline;
     std::unique_ptr<RHI::RHIComputePipeline> m_ssaoBlurPipeline;

@@ -405,6 +405,68 @@ private:
 };
 
 // ============================================================================
+// Precipitation Pass - Rain and Snow particle effects
+// ============================================================================
+
+class PrecipitationPassRHI : public RenderPassRHI {
+public:
+    PrecipitationPassRHI(RHI::RHIDevice* device);
+    ~PrecipitationPassRHI() override;
+
+    bool initialize(const RenderConfig& config) override;
+    void shutdown() override;
+    void resize(uint32_t width, uint32_t height) override;
+    void execute(RHI::RHICommandBuffer* cmd, RenderContext& context) override;
+
+    void setPipeline(RHI::RHIGraphicsPipeline* pipeline) { m_pipeline = pipeline; }
+    void setTargetFramebuffer(RHI::RHIFramebuffer* fb) { m_targetFramebuffer = fb; }
+
+    // Weather control
+    void setWeatherType(int type) { m_weatherType = type; }  // 1=rain, 2=snow, 3=thunderstorm
+    void setIntensity(float intensity) { m_intensity = intensity; }
+    void setLightColor(const glm::vec3& color) { m_lightColor = color; }
+
+    // Particle count and spawning
+    void setMaxParticles(uint32_t count) { m_maxParticles = count; }
+    uint32_t getActiveParticles() const { return m_activeParticles; }
+
+private:
+    void createParticleBuffers();
+    void destroyParticleBuffers();
+    void updateParticles(float deltaTime, const glm::vec3& cameraPos);
+    void spawnParticle(const glm::vec3& cameraPos);
+
+    // Particle vertex buffer (position, size, alpha)
+    std::unique_ptr<RHI::RHIBuffer> m_particleBuffer;
+    std::unique_ptr<RHI::RHIBuffer> m_precipUBO;
+    std::unique_ptr<RHI::RHIDescriptorSet> m_descriptorSet;
+
+    RHI::RHIGraphicsPipeline* m_pipeline = nullptr;
+    RHI::RHIFramebuffer* m_targetFramebuffer = nullptr;
+
+    // Particle system data (CPU-side)
+    struct Particle {
+        glm::vec3 position;
+        glm::vec3 velocity;
+        float size;
+        float alpha;
+        float lifetime;
+    };
+    std::vector<Particle> m_particles;
+
+    // Weather settings
+    int m_weatherType = 0;  // 0=none, 1=rain, 2=snow, 3=thunderstorm
+    float m_intensity = 0.0f;
+    glm::vec3 m_lightColor = glm::vec3(1.0f);
+
+    uint32_t m_maxParticles = 10000;
+    uint32_t m_activeParticles = 0;
+
+    uint32_t m_width = 0;
+    uint32_t m_height = 0;
+};
+
+// ============================================================================
 // FSR Pass - AMD FidelityFX Super Resolution upscaling
 // ============================================================================
 
