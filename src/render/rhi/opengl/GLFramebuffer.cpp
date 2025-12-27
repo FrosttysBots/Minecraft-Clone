@@ -116,6 +116,17 @@ bool GLSwapchain::acquireNextImage() {
 
 bool GLSwapchain::present() {
     auto* window = static_cast<GLFWwindow*>(m_window);
+
+    // Check for GL errors before swap
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        std::cerr << "[GLSwapchain] OpenGL error before swap: 0x" << std::hex << err << std::dec << std::endl;
+    }
+
+    // Make sure we have a valid framebuffer bound
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFlush();  // Ensure all commands are submitted
+
     glfwSwapBuffers(window);
 
     // Check if window was resized

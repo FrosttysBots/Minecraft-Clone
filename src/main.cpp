@@ -29,9 +29,11 @@
 #include "render/ShaderCache.h"
 #include "render/DeferredRendererRHI.h"
 #include "render/BackendSelector.h"
+#include "core/CrashHandler.h"
 
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <string>
 #include <optional>
 #include <cstdio>
@@ -102,10 +104,12 @@ bool wireframeMode = false;
 bool wireframeKeyPressed = false;
 
 // Deferred rendering toggles
-bool g_useDeferredRendering = true;  // Master toggle
-bool g_enableSSAO = true;            // SSAO toggle
-bool g_useRHIRenderer = true;        // Use RHI-based renderer (Vulkan path in future)
-std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;
+// NOTE: Deferred rendering is currently disabled pending fixes to G-buffer rendering
+// Set to false to use forward rendering path (more stable, better performance for voxel scenes)
+bool g_useDeferredRendering = false;  // Master toggle - DISABLED
+bool g_enableSSAO = true;             // SSAO toggle (only works with deferred)
+bool g_useRHIRenderer = false;        // Use RHI-based renderer - DISABLED
+std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;  // Kept for future use
 
 // Benchmark system
 Benchmark::BenchmarkSystem g_benchmark;
@@ -608,7 +612,10 @@ InputState processInput(GLFWwindow* window) {
         noclipTogglePressed = false;
     }
 
-    // Deferred rendering toggle (F7)
+    // Deferred rendering toggle (F7) - DISABLED
+    // Deferred rendering has G-buffer issues and is disabled for now
+    // Uncomment to re-enable toggle functionality
+    /*
     static bool deferredTogglePressed = false;
     if (glfwGetKey(window, GLFW_KEY_F7) == GLFW_PRESS) {
         if (!deferredTogglePressed) {
@@ -619,22 +626,23 @@ InputState processInput(GLFWwindow* window) {
     } else {
         deferredTogglePressed = false;
     }
+    */
 
     // Benchmark mode toggle (B key)
     static bool benchmarkKeyPressed = false;
     if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
         if (!benchmarkKeyPressed) {
             if (!g_benchmark.isRunning) {
-                // Start benchmark - first run Deferred, then Forward
+                // Start benchmark - Forward rendering only (deferred is disabled)
                 g_benchmark.init();
                 g_benchmarkMode = true;
 
-                // Run deferred benchmark first
-                g_useDeferredRendering = true;
-                g_benchmark.startBenchmark("Deferred");
+                // Run forward benchmark (deferred is disabled)
+                g_useDeferredRendering = false;  // Keep disabled
+                g_benchmark.startBenchmark("Forward");
                 std::cout << "\n=== BENCHMARK MODE STARTED ===" << std::endl;
                 std::cout << "Press B again to cancel" << std::endl;
-                std::cout << "Running Deferred rendering benchmark..." << std::endl;
+                std::cout << "Running Forward rendering benchmark..." << std::endl;
             } else {
                 // Cancel benchmark
                 g_benchmark.stopBenchmark();
@@ -3420,8 +3428,14 @@ glm::mat4 calculateCascadeLightSpaceMatrix(const glm::vec3& lightDir,
 }
 
 int main() {
+    // Initialize crash handler FIRST - before anything else
+    Core::CrashHandler::instance().initialize("VoxelEngine", "1.0.0");
+    Core::Logger::instance().setFileOutput(true, "engine.log");
+    LOG_INFO("Engine", "VoxelEngine starting up...");
+
     // Load configuration
     g_config.load("settings.cfg");
+    LOG_INFO("Config", "Configuration loaded from settings.cfg");
 
     // Apply config to globals
     WINDOW_WIDTH = g_config.windowWidth;
@@ -3491,6 +3505,16 @@ int main() {
 
     std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
     std::cout << "Renderer: " << glGetString(GL_RENDERER) << std::endl;
+
+    // Set GPU info for crash reports
+    {
+        std::stringstream gpuInfo;
+        gpuInfo << "OpenGL Version: " << glGetString(GL_VERSION) << "\n";
+        gpuInfo << "Renderer: " << glGetString(GL_RENDERER) << "\n";
+        gpuInfo << "Vendor: " << glGetString(GL_VENDOR);
+        Core::CrashHandler::instance().setGPUInfo(gpuInfo.str());
+        LOG_INFO("OpenGL", std::string("Initialized: ") + reinterpret_cast<const char*>(glGetString(GL_RENDERER)));
+    }
 
     // ============================================
     // HARDWARE DETECTION & AUTO-TUNING
@@ -4611,8 +4635,12 @@ int main() {
 
     // Lambda to start world generation (called when user clicks "Create World")
     auto startWorldGeneration = [&]() {
+        LOG_INFO("World", "Starting world generation...");
+        Core::Logger::instance().setContext("World Generation");
+
         // Reset the world first (clear all existing chunks and meshes)
         std::cout << "\nResetting world for new generation..." << std::endl;
+        LOG_INFO("World", "Resetting world state");
         world.reset();
 
         // Apply world settings from menu
@@ -4643,6 +4671,7 @@ int main() {
             }
         }
         std::cout << "Queued " << totalChunksToLoad << " chunks for generation" << std::endl;
+        LOG_INFO("World", "Queued " + std::to_string(totalChunksToLoad) + " chunks for generation (seed: " + std::to_string(newSeed) + ")");
 
         // Set loading state
         gameState = GameState::LOADING;
@@ -4657,7 +4686,12 @@ int main() {
         cursorEnabled = false;
     };
 
-    // Initialize RHI renderer (optional path for Vulkan backend)
+    // =========================================================================
+    // RHI/Deferred Renderer Initialization - CURRENTLY DISABLED
+    // The deferred rendering path has G-buffer issues that need to be fixed.
+    // Forward rendering is more performant for voxel scenes with few lights.
+    // To re-enable: set g_useRHIRenderer = true at top of file
+    // =========================================================================
     if (g_useRHIRenderer) {
         std::cout << "\n=== Initializing RHI Renderer ===" << std::endl;
         g_rhiRenderer = std::make_unique<Render::DeferredRendererRHI>();
@@ -4957,19 +4991,36 @@ int main() {
         if (gameState == GameState::LOADING) {
             // Process completed chunks from thread pool - no limit during loading
             auto completed = world.chunkThreadPool->getCompletedChunks(1000);
+            int chunksThisFrame = 0;
             for (auto& result : completed) {
                 if (world.getChunk(result.position) == nullptr) {
                     world.chunks[result.position] = std::move(result.chunk);
                     world.chunks[result.position]->isDirty = true;
                     chunksLoaded++;
+                    chunksThisFrame++;
                 }
+            }
+
+            // Log progress every 10% or when significant chunks loaded
+            static int lastLoggedPercent = -1;
+            int currentPercent = (totalChunksToLoad > 0) ? (chunksLoaded * 100 / totalChunksToLoad) : 0;
+            if (currentPercent / 10 != lastLoggedPercent / 10) {
+                LOG_INFO("World", "Chunk generation: " + std::to_string(chunksLoaded) + "/" +
+                         std::to_string(totalChunksToLoad) + " (" + std::to_string(currentPercent) + "%)");
+                lastLoggedPercent = currentPercent;
             }
 
             // Calculate progress
             float chunkProgress = static_cast<float>(chunksLoaded) / static_cast<float>(totalChunksToLoad);
 
             // Once all chunks are loaded, build meshes using thread pool
+            static bool loggedMeshPhase = false;
             if (chunksLoaded >= totalChunksToLoad) {
+                if (!loggedMeshPhase) {
+                    LOG_INFO("World", "All chunks generated, starting mesh building...");
+                    Core::Logger::instance().setContext("Mesh Building");
+                    loggedMeshPhase = true;
+                }
                 loadingMessage = "Building meshes...";
 
                 // Use world.update() with burst mode - this properly uses the thread pool
@@ -5030,6 +5081,12 @@ int main() {
 
                     std::cout << "Loading complete! " << chunksLoaded << " chunks, " << meshesBuilt << " meshes" << std::endl;
                     std::cout << "Player at: " << player->position.x << ", " << player->position.y << ", " << player->position.z << std::endl;
+
+                    LOG_INFO("World", "Loading complete! " + std::to_string(chunksLoaded) + " chunks, " +
+                             std::to_string(meshesBuilt) + " meshes");
+                    Core::Logger::instance().setContext("Playing");
+                    loggedMeshPhase = false;  // Reset for next world load
+                    lastLoggedPercent = -1;
 
                     world.burstMode = false;  // Disable burst mode for smoother gameplay
                     glfwSwapInterval(g_config.vsync ? 1 : 0);  // Restore VSync setting
@@ -5209,6 +5266,7 @@ int main() {
             glfwSetWindowTitle(window, "Voxel Engine");
             std::cout << "Entering PLAYING state - deferred rendering: " << (g_useDeferredRendering ? "ON" : "OFF") << std::endl;
             std::cout << std::flush;
+            LOG_INFO("Game", "Entered PLAYING state");
             titleReset = true;
         }
 
@@ -5481,9 +5539,17 @@ int main() {
             }
         } else {
             // Normal player update
+            static bool loggedFirstFrame = false;
+            if (!loggedFirstFrame) {
+                LOG_DEBUG("Game", "First frame player update starting");
+            }
             player->update(deltaTime, world,
                            input.forward, input.backward, input.left, input.right,
                            input.jump, input.descend, input.sprint);
+            if (!loggedFirstFrame) {
+                LOG_DEBUG("Game", "First frame player update complete");
+                loggedFirstFrame = true;
+            }
         }
 
         // Raycast to find target block
@@ -5501,7 +5567,15 @@ int main() {
 
         // Update world - loads/unloads chunks and updates meshes (timed)
         auto worldUpdateStart = std::chrono::high_resolution_clock::now();
+        static bool loggedFirstWorldUpdate = false;
+        if (!loggedFirstWorldUpdate) {
+            LOG_DEBUG("Game", "First frame world.update starting");
+        }
         world.update(camera.position, deltaTime);
+        if (!loggedFirstWorldUpdate) {
+            LOG_DEBUG("Game", "First frame world.update complete");
+            loggedFirstWorldUpdate = true;
+        }
         auto worldUpdateEnd = std::chrono::high_resolution_clock::now();
         g_perfStats.worldUpdateMs = std::chrono::duration<double, std::milli>(worldUpdateEnd - worldUpdateStart).count();
 
@@ -5654,9 +5728,20 @@ int main() {
                 g_rhiRenderer->setFog(fog);
 
                 // Render frame using RHI
+                static bool loggedFirstRender = false;
+                if (!loggedFirstRender) {
+                    LOG_DEBUG("Render", "First frame RHI render starting");
+                }
                 g_rhiRenderer->beginFrame();
                 g_rhiRenderer->render(world, cameraData);
+                if (!loggedFirstRender) {
+                    LOG_DEBUG("Render", "First frame RHI render() returned");
+                }
                 g_rhiRenderer->endFrame();
+                if (!loggedFirstRender) {
+                    LOG_DEBUG("Render", "First frame RHI endFrame() returned");
+                    loggedFirstRender = true;
+                }
 
                 // Get stats from RHI renderer
                 const auto& rhiStats = g_rhiRenderer->getStats();
@@ -5664,6 +5749,12 @@ int main() {
                 g_perfStats.gBufferPassMs = rhiStats.gbufferTime;
                 g_perfStats.ssaoPassMs = rhiStats.ssaoTime;
                 g_perfStats.compositePassMs = rhiStats.compositeTime;
+
+                static bool loggedRHIComplete = false;
+                if (!loggedRHIComplete) {
+                    LOG_DEBUG("Render", "RHI render path complete, continuing main loop");
+                    loggedRHIComplete = true;
+                }
 
             } else {
                 // ============================================================
@@ -6495,7 +6586,10 @@ int main() {
         }
 
         // Swap buffers (poll events is at the start of the loop)
-        glfwSwapBuffers(window);
+        // Skip if RHI renderer is active - it handles its own swap in endFrame()
+        if (!(g_useRHIRenderer && g_rhiRenderer && g_useDeferredRendering)) {
+            glfwSwapBuffers(window);
+        }
     }
 
     // Cleanup
@@ -6547,6 +6641,9 @@ int main() {
 
     glfwDestroyWindow(window);
     glfwTerminate();
+
+    LOG_INFO("Engine", "Engine shutting down normally");
+    Core::CrashHandler::instance().shutdown();
 
     std::cout << "Engine shut down successfully." << std::endl;
     return 0;

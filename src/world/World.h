@@ -6,12 +6,14 @@
 #include "../render/ChunkMesh.h"
 #include "../render/GPUCulling.h"
 #include "../render/VertexPool.h"
+#include "../core/CrashHandler.h"
 #include <unordered_map>
 #include <memory>
 #include <vector>
 #include <algorithm>
 #include <thread>
 #include <iostream>
+#include <sstream>
 #include <array>
 #include <chrono>
 #include <glm/glm.hpp>
@@ -1132,6 +1134,15 @@ public:
 
             ChunkMesh* mesh = meshes[pos].get();
             mesh->worldOffset = meshResult.worldOffset;
+
+            // Update world info for crash reports
+            if (burstMode && (processed % 10 == 0)) {
+                std::stringstream worldInfo;
+                worldInfo << "Meshes processed: " << processed << "\n";
+                worldInfo << "Current chunk: (" << pos.x << ", " << pos.y << ")\n";
+                worldInfo << "Total meshes: " << meshes.size();
+                Core::CrashHandler::instance().setWorldInfo(worldInfo.str());
+            }
 
             // Upload each sub-chunk's data to GPU
             for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {

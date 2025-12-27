@@ -1,6 +1,7 @@
 #include "DeferredRendererRHI.h"
 #include "BackendSelector.h"
 #include "../core/Config.h"
+#include "../core/CrashHandler.h"
 
 #include <glad/gl.h>
 #include <iostream>
@@ -379,7 +380,16 @@ void DeferredRendererRHI::beginFrame() {
 }
 
 void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
+    static bool firstFrame = true;
+    if (firstFrame) {
+        LOG_DEBUG("RHI", "DeferredRendererRHI::render starting first frame");
+    }
+
     auto* cmd = m_commandBuffers[m_currentFrame].get();
+    if (!cmd) {
+        LOG_ERROR("RHI", "Command buffer is null!");
+        return;
+    }
 
     // Setup render context
     m_context.world = &world;
@@ -392,18 +402,26 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
     // Reset stats for this frame
     m_context.stats = RenderStats{};
 
+    if (firstFrame) LOG_DEBUG("RHI", "Context setup complete");
+
     // Execute render passes
     // 1. Shadow Pass
     if (m_config.enableShadows) {
+        if (firstFrame) LOG_DEBUG("RHI", "Starting Shadow Pass");
+        if (!m_shadowPass) { LOG_ERROR("RHI", "m_shadowPass is null!"); return; }
         m_shadowPass->execute(cmd, m_context);
+        if (firstFrame) LOG_DEBUG("RHI", "Shadow Pass complete");
     }
 
     // 2. G-Buffer Pass - use split begin/end for hybrid World rendering
+    if (firstFrame) LOG_DEBUG("RHI", "Starting G-Buffer Pass");
+    if (!m_gBufferPass) { LOG_ERROR("RHI", "m_gBufferPass is null!"); return; }
     m_gBufferPass->beginPass(cmd, m_context);
 
     // Render world geometry into G-Buffer (hybrid path - uses OpenGL)
     // The framebuffer is bound by beginPass, so World's GL calls render to RHI G-Buffer
     if (m_worldRenderer && m_context.world) {
+        if (firstFrame) LOG_DEBUG("RHI", "Starting WorldRenderer::renderSolid");
         WorldRenderParams params;
         params.cameraPosition = camera.position;
         params.viewProjection = camera.viewProjection;
@@ -411,6 +429,7 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         params.renderWater = false;  // Water rendered in separate pass
 
         m_worldRenderer->renderSolid(cmd, *m_context.world, params);
+        if (firstFrame) LOG_DEBUG("RHI", "WorldRenderer::renderSolid complete");
 
         // Update stats from world renderer
         m_context.stats.chunksRendered = m_worldRenderer->getRenderedSubChunks();
@@ -420,37 +439,62 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
     // End G-Buffer pass and store texture handles
     m_gBufferPass->endPass(cmd);
     m_gBufferPass->storeTextureHandles(m_context);
+    if (firstFrame) LOG_DEBUG("RHI", "G-Buffer Pass complete");
 
     // 3. Hi-Z Pass (for occlusion culling)
     if (m_config.enableHiZCulling) {
+        if (firstFrame) LOG_DEBUG("RHI", "Starting Hi-Z Pass");
+        if (!m_hiZPass) { LOG_ERROR("RHI", "m_hiZPass is null!"); return; }
         m_hiZPass->execute(cmd, m_context);
+        if (firstFrame) LOG_DEBUG("RHI", "Hi-Z Pass complete");
     }
 
     // 4. GPU Culling Pass
     if (m_config.enableGPUCulling) {
+        if (firstFrame) LOG_DEBUG("RHI", "Starting GPU Culling Pass");
+        if (!m_gpuCullingPass) { LOG_ERROR("RHI", "m_gpuCullingPass is null!"); return; }
         m_gpuCullingPass->execute(cmd, m_context);
+        if (firstFrame) LOG_DEBUG("RHI", "GPU Culling Pass complete");
     }
 
     // 5. SSAO Pass
     if (m_config.enableSSAO) {
+        if (firstFrame) LOG_DEBUG("RHI", "Starting SSAO Pass");
+        if (!m_ssaoPass) { LOG_ERROR("RHI", "m_ssaoPass is null!"); return; }
         m_ssaoPass->execute(cmd, m_context);
+        if (firstFrame) LOG_DEBUG("RHI", "SSAO Pass complete");
     }
 
     // 6. Composite Pass (lighting calculation)
+    if (firstFrame) LOG_DEBUG("RHI", "Starting Composite Pass");
+    if (!m_compositePass) { LOG_ERROR("RHI", "m_compositePass is null!"); return; }
     m_compositePass->execute(cmd, m_context);
+    if (firstFrame) LOG_DEBUG("RHI", "Composite Pass complete");
 
     // 7. Sky Pass (rendered into composite output)
+    if (firstFrame) LOG_DEBUG("RHI", "Starting Sky Pass");
+    if (!m_skyPass) { LOG_ERROR("RHI", "m_skyPass is null!"); return; }
     m_skyPass->execute(cmd, m_context);
+    if (firstFrame) LOG_DEBUG("RHI", "Sky Pass complete");
 
     // 8. Water Pass (forward rendered, semi-transparent)
+    if (firstFrame) LOG_DEBUG("RHI", "Starting Water Pass");
+    if (!m_waterPass) { LOG_ERROR("RHI", "m_waterPass is null!"); return; }
     m_waterPass->execute(cmd, m_context);
+    if (firstFrame) LOG_DEBUG("RHI", "Water Pass complete");
 
     // 9. Precipitation Pass (rain/snow particles)
+    if (firstFrame) LOG_DEBUG("RHI", "Starting Precipitation Pass");
+    if (!m_precipitationPass) { LOG_ERROR("RHI", "m_precipitationPass is null!"); return; }
     m_precipitationPass->execute(cmd, m_context);
+    if (firstFrame) LOG_DEBUG("RHI", "Precipitation Pass complete");
 
     // 10. Bloom Pass (optional glow effect)
     if (m_config.enableBloom) {
+        if (firstFrame) LOG_DEBUG("RHI", "Starting Bloom Pass");
+        if (!m_bloomPass) { LOG_ERROR("RHI", "m_bloomPass is null!"); return; }
         m_bloomPass->execute(cmd, m_context);
+        if (firstFrame) LOG_DEBUG("RHI", "Bloom Pass complete");
     }
 
     // 11. FSR Upscaling Pass
@@ -517,20 +561,31 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
     }
 
+    if (firstFrame) {
+        LOG_DEBUG("RHI", "First frame render complete");
+        firstFrame = false;
+    }
+
     // Copy accumulated stats
     m_stats = m_context.stats;
 }
 
 void DeferredRendererRHI::endFrame() {
+    static bool firstEndFrame = true;
+    if (firstEndFrame) LOG_DEBUG("RHI", "endFrame starting");
+
     auto* cmd = m_commandBuffers[m_currentFrame].get();
 
     // End command buffer recording
+    if (firstEndFrame) LOG_DEBUG("RHI", "Ending command buffer");
     cmd->end();
 
     // Submit command buffer
+    if (firstEndFrame) LOG_DEBUG("RHI", "Submitting command buffer");
     m_device->getGraphicsQueue()->submit({cmd});
 
     // Present
+    if (firstEndFrame) LOG_DEBUG("RHI", "Presenting swapchain");
     if (!m_swapchain->present()) {
         // Swapchain out of date
         int width, height;
@@ -540,6 +595,10 @@ void DeferredRendererRHI::endFrame() {
 
     // Advance frame
     m_currentFrame = (m_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    if (firstEndFrame) {
+        LOG_DEBUG("RHI", "endFrame complete");
+        firstEndFrame = false;
+    }
 }
 
 void DeferredRendererRHI::setConfig(const RenderConfig& config) {
@@ -615,6 +674,7 @@ bool DeferredRendererRHI::createSwapchain() {
     swapDesc.format = RHI::Format::BGRA8_SRGB;
     swapDesc.vsync = g_config.vsync;
     swapDesc.imageCount = 3;  // Triple buffering
+    swapDesc.windowHandle = m_window;  // CRITICAL: Pass the GLFW window handle!
 
     m_swapchain = m_device->createSwapchain(swapDesc);
     return m_swapchain != nullptr;

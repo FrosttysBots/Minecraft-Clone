@@ -1,6 +1,10 @@
 #include "RenderPassRHI.h"
 #include "WorldRendererRHI.h"
+#include "rhi/opengl/GLTexture.h"
+#include "rhi/opengl/GLPipeline.h"
+#include "rhi/opengl/GLBuffer.h"
 
+#include <glad/gl.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
@@ -403,29 +407,43 @@ void GBufferPassRHI::beginPass(RHI::RHICommandBuffer* cmd, RenderContext& contex
     scissor.height = m_height;
     cmd->setScissor(scissor);
 
-    // Update camera uniform buffer
-    if (m_cameraUBO && context.camera) {
-        struct CameraUniforms {
-            glm::mat4 view;
-            glm::mat4 projection;
-            glm::vec4 position;
-            glm::vec4 params;
-        } uniforms;
+    // Bind pipeline and set uniforms for G-buffer shader
+    if (m_pipeline) {
+        cmd->bindGraphicsPipeline(m_pipeline);
 
-        uniforms.view = context.camera->view;
-        uniforms.projection = context.camera->projection;
-        uniforms.position = glm::vec4(context.camera->position, 1.0f);
-        uniforms.params = glm::vec4(
-            context.camera->nearPlane,
-            context.camera->farPlane,
-            context.camera->fov,
-            context.camera->aspectRatio
-        );
+        // OpenGL-specific: Set view/projection uniforms directly
+        // The G-buffer shader uses individual uniforms, not a UBO
+        if (m_device->getBackend() == RHI::Backend::OpenGL && context.camera) {
+            auto* glPipeline = static_cast<RHI::GLGraphicsPipeline*>(m_pipeline);
+            if (glPipeline && glPipeline->getProgram()) {
+                GLuint shaderProgram = glPipeline->getProgram()->getGLProgram();
+                glUseProgram(shaderProgram);
 
-        void* mapped = m_cameraUBO->map();
-        if (mapped) {
-            memcpy(mapped, &uniforms, sizeof(uniforms));
-            m_cameraUBO->unmap();
+                // CRITICAL: Disable blending for G-buffer pass (per StackOverflow answer)
+                // Alpha blending can cause G-buffer to appear empty if alpha = 0
+                glDisable(GL_BLEND);
+
+                // Ensure depth testing is properly configured
+                glEnable(GL_DEPTH_TEST);
+                glDepthMask(GL_TRUE);
+                glDepthFunc(GL_LEQUAL);
+
+                // Enable color writes for all attachments
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+                // Set view and projection matrices
+                glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE,
+                                   glm::value_ptr(context.camera->view));
+                glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE,
+                                   glm::value_ptr(context.camera->projection));
+
+                // Bind texture atlas to texture unit 0
+                if (context.textureAtlas != 0) {
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, context.textureAtlas);
+                    // Note: Shader uses layout(binding = 0), so no glUniform1i needed
+                }
+            }
         }
     }
 }
@@ -1001,49 +1019,85 @@ void CompositePassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& contex
         cmd->bindGraphicsPipeline(m_pipeline);
     }
 
-    // Update lighting uniform buffer
-    if (m_lightingUBO && context.lighting && context.camera && context.fog) {
-        struct LightingUniforms {
-            glm::mat4 invViewProj;
-            glm::vec4 lightDir;
-            glm::vec4 lightColor;
-            glm::vec4 ambientColor;
-            glm::vec4 skyColor;
-            glm::vec4 cameraPos;
-            glm::vec4 fogParams;      // density, isUnderwater, renderDistance, time
-            glm::vec4 cascadeSplits;
-            glm::ivec4 flags;         // enableSSAO, debugMode, 0, 0
-        } uniforms;
+    // OpenGL-specific: Bind G-buffer textures directly to texture units
+    // The RHI descriptor set is not fully set up, so we use direct OpenGL binding
+    if (m_device->getBackend() == RHI::Backend::OpenGL) {
+        // Get shader program from pipeline for setting uniforms
+        auto* glPipeline = static_cast<RHI::GLGraphicsPipeline*>(m_pipeline);
+        if (glPipeline && glPipeline->getProgram()) {
+            GLuint shaderProgram = glPipeline->getProgram()->getGLProgram();
+            glUseProgram(shaderProgram);
 
-        glm::mat4 invViewProj = glm::inverse(context.camera->viewProjection);
-        uniforms.invViewProj = invViewProj;
-        uniforms.lightDir = glm::vec4(context.lighting->lightDir, 0.0f);
-        uniforms.lightColor = glm::vec4(context.lighting->lightColor, context.lighting->shadowStrength);
-        uniforms.ambientColor = glm::vec4(context.lighting->ambientColor, 0.0f);
-        uniforms.skyColor = glm::vec4(context.lighting->skyColor, 0.0f);
-        uniforms.cameraPos = glm::vec4(context.camera->position, 1.0f);
-        uniforms.fogParams = glm::vec4(
-            context.fog->density,
-            context.fog->isUnderwater ? 1.0f : 0.0f,
-            context.fog->renderDistance,
-            context.lighting->time
-        );
-        uniforms.cascadeSplits = glm::vec4(
-            context.cascadeSplits[0],
-            context.cascadeSplits[1],
-            context.cascadeSplits[2],
-            0.0f
-        );
-        uniforms.flags = glm::ivec4(
-            context.config->enableSSAO ? 1 : 0,
-            context.config->debugMode,
-            0, 0
-        );
+            // Bind G-buffer textures
+            if (m_gPosition) {
+                auto* glTex = static_cast<RHI::GLTexture*>(m_gPosition);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, glTex->getGLTexture());
+                glUniform1i(glGetUniformLocation(shaderProgram, "gPosition"), 0);
+            }
 
-        void* mapped = m_lightingUBO->map();
-        if (mapped) {
-            memcpy(mapped, &uniforms, sizeof(uniforms));
-            m_lightingUBO->unmap();
+            if (m_gNormal) {
+                auto* glTex = static_cast<RHI::GLTexture*>(m_gNormal);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, glTex->getGLTexture());
+                glUniform1i(glGetUniformLocation(shaderProgram, "gNormal"), 1);
+            }
+
+            if (m_gAlbedo) {
+                auto* glTex = static_cast<RHI::GLTexture*>(m_gAlbedo);
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, glTex->getGLTexture());
+                glUniform1i(glGetUniformLocation(shaderProgram, "gAlbedo"), 2);
+            }
+
+            if (m_gDepth) {
+                auto* glTex = static_cast<RHI::GLTexture*>(m_gDepth);
+                glActiveTexture(GL_TEXTURE3);
+                glBindTexture(GL_TEXTURE_2D, glTex->getGLTexture());
+                glUniform1i(glGetUniformLocation(shaderProgram, "gDepth"), 3);
+            }
+
+            // Bind SSAO texture if available
+            if (m_ssaoTexture) {
+                auto* glTex = static_cast<RHI::GLTexture*>(m_ssaoTexture);
+                glActiveTexture(GL_TEXTURE4);
+                glBindTexture(GL_TEXTURE_2D, glTex->getGLTexture());
+                glUniform1i(glGetUniformLocation(shaderProgram, "ssaoTexture"), 4);
+            }
+
+            // Bind shadow map if available
+            if (m_shadowMap) {
+                auto* glTex = static_cast<RHI::GLTexture*>(m_shadowMap);
+                glActiveTexture(GL_TEXTURE5);
+                glBindTexture(GL_TEXTURE_2D_ARRAY, glTex->getGLTexture());
+            }
+
+            // Set lighting uniforms directly (shader uses individual uniforms, not UBO)
+            if (context.lighting && context.camera && context.fog) {
+                glm::mat4 invViewProj = glm::inverse(context.camera->viewProjection);
+
+                glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "invViewProj"), 1, GL_FALSE, glm::value_ptr(invViewProj));
+                glUniform3fv(glGetUniformLocation(shaderProgram, "lightDir"), 1, glm::value_ptr(context.lighting->lightDir));
+                glUniform3fv(glGetUniformLocation(shaderProgram, "lightColor"), 1, glm::value_ptr(context.lighting->lightColor));
+                glUniform3fv(glGetUniformLocation(shaderProgram, "ambientColor"), 1, glm::value_ptr(context.lighting->ambientColor));
+                glUniform3fv(glGetUniformLocation(shaderProgram, "skyColor"), 1, glm::value_ptr(context.lighting->skyColor));
+                glUniform3fv(glGetUniformLocation(shaderProgram, "cameraPos"), 1, glm::value_ptr(context.camera->position));
+                glUniform1f(glGetUniformLocation(shaderProgram, "time"), context.lighting->time);
+                glUniform1f(glGetUniformLocation(shaderProgram, "shadowStrength"), context.lighting->shadowStrength);
+
+                // Fog parameters
+                glUniform1f(glGetUniformLocation(shaderProgram, "fogDensity"), context.fog->density);
+                glUniform1f(glGetUniformLocation(shaderProgram, "isUnderwater"), context.fog->isUnderwater ? 1.0f : 0.0f);
+                glUniform1f(glGetUniformLocation(shaderProgram, "renderDistanceBlocks"), context.fog->renderDistance);
+
+                // Cascade shadow splits and matrices
+                glUniform1fv(glGetUniformLocation(shaderProgram, "cascadeSplits"), 3, context.cascadeSplits);
+                glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "cascadeMatrices"), 3, GL_FALSE, glm::value_ptr(context.cascadeMatrices[0]));
+
+                // Misc
+                glUniform1i(glGetUniformLocation(shaderProgram, "enableSSAO"), context.config->enableSSAO ? 1 : 0);
+                glUniform1i(glGetUniformLocation(shaderProgram, "debugMode"), context.config->debugMode);
+            }
         }
     }
 
