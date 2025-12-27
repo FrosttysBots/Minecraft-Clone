@@ -179,13 +179,30 @@ struct LODMesh {
     }
 
     // Wait for GPU to finish using this buffer (blocking - use sparingly!)
-    void waitForGPU() {
-        if (fence != nullptr) {
-            // Wait up to 100ms (blocking)
-            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000);
-            glDeleteSync(fence);
-            fence = nullptr;
+    // Returns true if GPU is ready, false if timeout/failure occurred
+    bool waitForGPU() {
+        if (fence == nullptr) return true;
+
+        // Try multiple short waits to avoid long stalls
+        for (int attempt = 0; attempt < 10; attempt++) {
+            GLenum result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 10000000);  // 10ms per attempt
+            if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
+                glDeleteSync(fence);
+                fence = nullptr;
+                return true;
+            }
+            if (result == GL_WAIT_FAILED) {
+                // Sync object is invalid - clean up and report failure
+                glDeleteSync(fence);
+                fence = nullptr;
+                return false;
+            }
+            // GL_TIMEOUT_EXPIRED - try again
         }
+
+        // All attempts timed out - GPU is severely behind
+        // Don't delete fence, let caller handle this
+        return false;
     }
 
     // Signal that CPU is done writing (call after memcpy)
@@ -2240,13 +2257,17 @@ private:
         if (g_usePersistentMapping && lod.mappedPtr != nullptr && dataSize <= lod.capacity) {
             // Non-blocking check - if GPU isn't ready, wait (can't orphan glBufferStorage)
             if (!lod.isGPUReady()) {
-                lod.waitForGPU();
+                if (!lod.waitForGPU()) {
+                    // GPU severely behind - fall through to recreate buffer
+                    goto recreate_buffer_gpu;
+                }
             }
             std::memcpy(lod.mappedPtr, vertices.data(), dataSize);
             lod.signalCPUDone();
             return;
         }
 
+    recreate_buffer_gpu:
         // ============================================================
         // BUFFER REALLOCATION NEEDED
         // ============================================================
@@ -2254,7 +2275,13 @@ private:
 
         // Clean up old persistent mapping if exists
         if (lod.mappedPtr != nullptr && lod.VBO != 0) {
-            lod.waitForGPU();  // Must wait when unmapping
+            if (!lod.waitForGPU()) {
+                // GPU severely behind - force cleanup anyway
+                if (lod.fence != nullptr) {
+                    glDeleteSync(lod.fence);
+                    lod.fence = nullptr;
+                }
+            }
             glBindBuffer(GL_ARRAY_BUFFER, lod.VBO);
             glUnmapBuffer(GL_ARRAY_BUFFER);
             glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -2437,20 +2464,31 @@ public:
             // The isGPUReady() call is fast and usually succeeds
             if (!lod.isGPUReady()) {
                 // GPU still using buffer - wait briefly for it to finish
-                // This is rare since we're usually 2-3 frames ahead
-                lod.waitForGPU();
+                if (!lod.waitForGPU()) {
+                    // GPU severely behind - fall through to recreate buffer
+                    // This prevents writing to a buffer GPU is still using
+                    goto recreate_buffer;
+                }
             }
             std::memcpy(lod.mappedPtr, vertices.data(), dataSize);
             lod.signalCPUDone();
             return;
         }
 
+    recreate_buffer:
         // ============================================================
         // BUFFER REALLOCATION NEEDED
         // ============================================================
         if (lod.mappedPtr != nullptr && lod.VBO != 0) {
             // Must wait here because we're unmapping the buffer
-            lod.waitForGPU();
+            if (!lod.waitForGPU()) {
+                // GPU severely behind - force cleanup anyway (may cause visual glitch)
+                // Better than crashing
+                if (lod.fence != nullptr) {
+                    glDeleteSync(lod.fence);
+                    lod.fence = nullptr;
+                }
+            }
             glBindBuffer(GL_ARRAY_BUFFER, lod.VBO);
             glUnmapBuffer(GL_ARRAY_BUFFER);
             glBindBuffer(GL_ARRAY_BUFFER, 0);

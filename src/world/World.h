@@ -1098,7 +1098,8 @@ public:
 
         // OPTIMIZATION: Limit mesh uploads to prevent GPU stalls
         // GPU uploads are slow and can cause frame spikes
-        int maxToProcess = burstMode ? 16 : maxMeshesPerFrame;  // Reduced burst from 10000
+        // During burst mode, limit to 8 meshes to avoid overwhelming GPU
+        int maxToProcess = burstMode ? 8 : maxMeshesPerFrame;
         auto completedMeshes = chunkThreadPool->getCompletedMeshes(maxToProcess);
         int processed = 0;
 
@@ -1110,6 +1111,11 @@ public:
                 if (elapsedMs > frameTimeBudgetMs * 0.5f) {
                     break;  // Leave remaining meshes for next frame
                 }
+            }
+
+            // During burst mode, let GPU catch up every few meshes to prevent stalls
+            if (burstMode && processed > 0 && (processed % 4) == 0) {
+                glFlush();  // Submit commands, don't block
             }
 
             glm::ivec2 pos = meshResult.position;
