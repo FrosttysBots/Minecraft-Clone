@@ -5416,7 +5416,7 @@ int main() {
                 // Current benchmark pass complete
                 if (g_benchmark.renderMode == "Deferred") {
                     // Save deferred results
-                    g_benchmark.saveResults("benchmark_deferred.txt");
+                    g_benchmark.saveResults("benchmark_deferred_OpenGL.txt");
 
                     // Now run forward benchmark
                     g_benchmark.init();
@@ -5425,15 +5425,15 @@ int main() {
                     std::cout << "\nNow running Forward rendering benchmark..." << std::endl;
                 } else {
                     // Forward complete - save and finish
-                    g_benchmark.saveResults("benchmark_forward.txt");
+                    g_benchmark.saveResults("benchmark_forward_OpenGL.txt");
                     g_benchmarkMode = false;
                     g_useDeferredRendering = true;  // Restore to deferred
 
                     std::cout << "\n========================================" << std::endl;
                     std::cout << "BENCHMARK COMPLETE!" << std::endl;
                     std::cout << "Results saved to:" << std::endl;
-                    std::cout << "  - benchmark_deferred.txt" << std::endl;
-                    std::cout << "  - benchmark_forward.txt" << std::endl;
+                    std::cout << "  - benchmark_deferred_OpenGL.txt" << std::endl;
+                    std::cout << "  - benchmark_forward_OpenGL.txt" << std::endl;
                     std::cout << "========================================\n" << std::endl;
                 }
             }

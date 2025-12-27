@@ -575,6 +575,7 @@ public:
         file << "VOXEL ENGINE BENCHMARK RESULTS\n";
         file << "================================================================================\n";
         file << "Date: " << std::ctime(&nowTime);
+        file << "Rendering API: OpenGL 4.6\n";
         file << "Rendering Mode: " << renderMode << "\n";
         file << "Total Tests: " << allResults.size() << "\n";
         file << "================================================================================\n\n";
