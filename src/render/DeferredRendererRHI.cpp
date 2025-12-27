@@ -172,6 +172,13 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 
     m_fsrPass->setInputTexture(m_compositePass->getOutputTexture());
 
+    // Initialize world renderer
+    m_worldRenderer = std::make_unique<WorldRendererRHI>();
+    if (!m_worldRenderer->initialize(m_device.get())) {
+        std::cerr << "[DeferredRendererRHI] Failed to initialize world renderer" << std::endl;
+        return false;
+    }
+
     std::cout << "[DeferredRendererRHI] Initialized with "
               << BackendSelector::getBackendName(g_config.renderer)
               << " backend" << std::endl;
@@ -182,6 +189,12 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
 void DeferredRendererRHI::shutdown() {
     if (m_device) {
         m_device->waitIdle();
+    }
+
+    // Shutdown world renderer
+    if (m_worldRenderer) {
+        m_worldRenderer->shutdown();
+        m_worldRenderer.reset();
     }
 
     // Shutdown render passes
@@ -332,8 +345,23 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
         m_shadowPass->execute(cmd, m_context);
     }
 
-    // 2. G-Buffer Pass
+    // 2. G-Buffer Pass - includes world geometry rendering
     m_gBufferPass->execute(cmd, m_context);
+
+    // Render world geometry into G-Buffer (hybrid path - uses OpenGL)
+    if (m_worldRenderer && m_context.world) {
+        WorldRenderParams params;
+        params.cameraPosition = camera.position;
+        params.viewProjection = camera.viewProjection;
+        params.mode = m_config.enableGPUCulling ? WorldRenderMode::GPUCulled : WorldRenderMode::Batched;
+        params.renderWater = false;  // Water rendered in separate pass
+
+        m_worldRenderer->renderSolid(cmd, *m_context.world, params);
+
+        // Update stats from world renderer
+        m_context.stats.chunksRendered = m_worldRenderer->getRenderedSubChunks();
+        m_context.stats.chunksCulled = m_worldRenderer->getCulledSubChunks();
+    }
 
     // 3. Hi-Z Pass (for occlusion culling)
     if (m_config.enableHiZCulling) {
@@ -429,7 +457,18 @@ void DeferredRendererRHI::setDebugMode(int mode) {
 }
 
 bool DeferredRendererRHI::createDevice(GLFWwindow* window) {
+    // Check if window has OpenGL context - if so, we must use OpenGL backend
+    // Vulkan requires GLFW_NO_API and won't work with an OpenGL window
     RHI::Backend backend = BackendSelector::toRHIBackend(g_config.renderer);
+
+    // If requested Vulkan but window has OpenGL context, fallback to OpenGL
+    if (backend == RHI::Backend::Vulkan) {
+        if (glfwGetWindowAttrib(window, GLFW_CLIENT_API) != GLFW_NO_API) {
+            std::cout << "[DeferredRendererRHI] Window has OpenGL context, using OpenGL backend" << std::endl;
+            backend = RHI::Backend::OpenGL;
+        }
+    }
+
     m_device = RHI::RHIDevice::create(backend, window);
 
     if (!m_device) {

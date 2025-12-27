@@ -6,6 +6,7 @@
 #include "Renderer.h"
 #include "RenderPassRHI.h"
 #include "ShaderCompiler.h"
+#include "WorldRendererRHI.h"
 #include "rhi/RHI.h"
 #include <memory>
 #include <unordered_map>
@@ -115,6 +116,9 @@ private:
     std::unique_ptr<RHI::RHISampler> m_linearSampler;
     std::unique_ptr<RHI::RHISampler> m_nearestSampler;
     std::unique_ptr<RHI::RHISampler> m_shadowSampler;
+
+    // World renderer (bridges World rendering to RHI)
+    std::unique_ptr<WorldRendererRHI> m_worldRenderer;
 
     // Dimensions
     uint32_t m_displayWidth = 0;

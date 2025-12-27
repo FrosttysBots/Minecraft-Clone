@@ -27,6 +27,7 @@
 #include "world/WorldSaveLoad.h"
 #include "render/Screenshot.h"
 #include "render/ShaderCache.h"
+#include "render/DeferredRendererRHI.h"
 
 #include <iostream>
 #include <iomanip>
@@ -102,6 +103,8 @@ bool wireframeKeyPressed = false;
 // Deferred rendering toggles
 bool g_useDeferredRendering = true;  // Master toggle
 bool g_enableSSAO = true;            // SSAO toggle
+bool g_useRHIRenderer = false;       // Use RHI-based renderer (Vulkan path in future) - disabled until render loop connected
+std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;
 
 // Benchmark system
 Benchmark::BenchmarkSystem g_benchmark;
@@ -4647,6 +4650,29 @@ int main() {
         glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
         cursorEnabled = false;
     };
+
+    // Initialize RHI renderer (optional path for Vulkan backend)
+    if (g_useRHIRenderer) {
+        std::cout << "\n=== Initializing RHI Renderer ===" << std::endl;
+        g_rhiRenderer = std::make_unique<Render::DeferredRendererRHI>();
+
+        Render::RenderConfig rhiConfig;
+        rhiConfig.enableShadows = g_config.enableShadows;
+        rhiConfig.enableSSAO = g_enableSSAO;
+        rhiConfig.enableGPUCulling = world.gpuCullingEnabled;
+        rhiConfig.enableHiZCulling = g_enableHiZCulling;
+        rhiConfig.shadowResolution = g_config.shadowResolution;
+        rhiConfig.ssaoSamples = g_config.ssaoSamples;
+        rhiConfig.debugMode = g_deferredDebugMode;
+
+        if (!g_rhiRenderer->initialize(window, rhiConfig)) {
+            std::cerr << "[RHI] Failed to initialize RHI renderer, falling back to OpenGL" << std::endl;
+            g_rhiRenderer.reset();
+            g_useRHIRenderer = false;
+        } else {
+            std::cout << "[RHI] RHI renderer initialized successfully" << std::endl;
+        }
+    }
 
     std::cout << "\n=== Voxel Engine Started ===" << std::endl;
     std::cout << "Controls:" << std::endl;
