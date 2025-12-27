@@ -6,6 +6,8 @@
 #include <random>
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <vector>
 
 namespace Render {
 
@@ -101,10 +103,79 @@ void ShadowPassRHI::resize(uint32_t /*width*/, uint32_t /*height*/) {
 }
 
 void ShadowPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    // TODO: Implement shadow pass execution
-    (void)cmd;
-    (void)context;
+    if (!m_enabled || !context.lighting || context.lighting->lightDir.y <= 0.05f) {
+        return;
+    }
+
+    // Calculate cascade splits
+    calculateCascadeSplits(context.camera->nearPlane, context.camera->farPlane);
+
+    // Set viewport for shadow map resolution
+    RHI::Viewport shadowViewport{};
+    shadowViewport.width = static_cast<float>(m_resolution);
+    shadowViewport.height = static_cast<float>(m_resolution);
+    shadowViewport.minDepth = 0.0f;
+    shadowViewport.maxDepth = 1.0f;
+
+    RHI::Scissor shadowScissor{};
+    shadowScissor.width = m_resolution;
+    shadowScissor.height = m_resolution;
+
+    // Render each cascade
+    for (uint32_t cascade = 0; cascade < m_numCascades && cascade < m_cascadeFramebuffers.size(); cascade++) {
+        if (!m_cascadeFramebuffers[cascade]) continue;
+
+        float nearSplit = (cascade == 0) ? context.camera->nearPlane : m_cascadeSplits[cascade - 1];
+        float farSplit = m_cascadeSplits[cascade];
+
+        m_cascadeMatrices[cascade] = calculateCascadeMatrix(
+            *context.camera, nearSplit, farSplit, context.lighting->lightDir);
+
+        // Begin shadow render pass for this cascade
+        std::vector<RHI::ClearValue> clearValues;
+        clearValues.push_back(RHI::ClearValue::DepthStencil(1.0f, 0));
+
+        cmd->beginRenderPass(m_renderPass.get(), m_cascadeFramebuffers[cascade].get(), clearValues);
+        cmd->setViewport(shadowViewport);
+        cmd->setScissor(shadowScissor);
+
+        // Bind shadow pipeline
+        if (m_pipeline) {
+            cmd->bindGraphicsPipeline(m_pipeline);
+        }
+
+        // Update cascade uniform buffer with light-space matrix
+        if (m_cascadeUBO) {
+            void* mapped = m_cascadeUBO->map();
+            if (mapped) {
+                // Write light space matrix for this cascade
+                memcpy(mapped, glm::value_ptr(m_cascadeMatrices[cascade]), sizeof(glm::mat4));
+                m_cascadeUBO->unmap();
+            }
+        }
+
+        // Bind descriptor set
+        if (m_descriptorSet) {
+            cmd->bindDescriptorSet(0, m_descriptorSet.get());
+        }
+
+        // World shadow rendering would happen here
+        // For now, the World class still uses OpenGL for rendering
+        // TODO: Refactor World to support RHI shadow rendering
+
+        cmd->endRenderPass();
+    }
+
+    // Store results in context
+    if (m_shadowMapArray) {
+        context.cascadeShadowMaps = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_shadowMapArray->getNativeHandle()));
+    }
+    for (uint32_t i = 0; i < m_numCascades && i < 4; i++) {
+        context.cascadeMatrices[i] = m_cascadeMatrices[i];
+        context.cascadeSplits[i] = m_cascadeSplits[i];
+    }
+
+    context.stats.shadowTime = m_executionTimeMs;
 }
 
 void ShadowPassRHI::calculateCascadeSplits(float nearPlane, float farPlane) {
@@ -122,11 +193,58 @@ void ShadowPassRHI::calculateCascadeSplits(float nearPlane, float farPlane) {
 
 glm::mat4 ShadowPassRHI::calculateCascadeMatrix(const CameraData& camera, float nearSplit, float farSplit,
                                                  const glm::vec3& lightDir) {
-    (void)camera;
-    (void)nearSplit;
-    (void)farSplit;
-    (void)lightDir;
-    return glm::mat4(1.0f);  // TODO: Implement cascade matrix calculation
+    // Get frustum corners in world space
+    glm::mat4 proj = glm::perspective(glm::radians(camera.fov), camera.aspectRatio, nearSplit, farSplit);
+    glm::mat4 invViewProj = glm::inverse(proj * camera.view);
+
+    std::vector<glm::vec4> corners;
+    for (int x = 0; x < 2; x++) {
+        for (int y = 0; y < 2; y++) {
+            for (int z = 0; z < 2; z++) {
+                glm::vec4 pt = invViewProj * glm::vec4(
+                    2.0f * x - 1.0f, 2.0f * y - 1.0f, 2.0f * z - 1.0f, 1.0f);
+                corners.push_back(pt / pt.w);
+            }
+        }
+    }
+
+    // Find frustum center
+    glm::vec3 center(0.0f);
+    for (const auto& corner : corners) {
+        center += glm::vec3(corner);
+    }
+    center /= static_cast<float>(corners.size());
+
+    // Light view matrix
+    glm::mat4 lightView = glm::lookAt(center + lightDir * 50.0f, center, glm::vec3(0, 1, 0));
+
+    // Find bounding box in light space
+    float minX = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float minY = std::numeric_limits<float>::max();
+    float maxY = std::numeric_limits<float>::lowest();
+    float minZ = std::numeric_limits<float>::max();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    for (const auto& corner : corners) {
+        glm::vec4 lightSpaceCorner = lightView * corner;
+        minX = std::min(minX, lightSpaceCorner.x);
+        maxX = std::max(maxX, lightSpaceCorner.x);
+        minY = std::min(minY, lightSpaceCorner.y);
+        maxY = std::max(maxY, lightSpaceCorner.y);
+        minZ = std::min(minZ, lightSpaceCorner.z);
+        maxZ = std::max(maxZ, lightSpaceCorner.z);
+    }
+
+    // Add some padding and extend shadow distance
+    float zMult = 10.0f;
+    if (minZ < 0) minZ *= zMult;
+    else minZ /= zMult;
+    if (maxZ < 0) maxZ /= zMult;
+    else maxZ *= zMult;
+
+    glm::mat4 lightProj = glm::ortho(minX, maxX, minY, maxY, minZ, maxZ);
+    return lightProj * lightView;
 }
 
 // ============================================================================
@@ -157,9 +275,100 @@ void GBufferPassRHI::resize(uint32_t width, uint32_t height) {
 }
 
 void GBufferPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+    if (!m_enabled || !m_framebuffer || !m_renderPass) return;
+
+    // Begin render pass with clear values
+    std::vector<RHI::ClearValue> clearValues;
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 0.0f));  // Position
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 0.0f));  // Normal
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 0.0f));  // Albedo
+    clearValues.push_back(RHI::ClearValue::DepthStencil(1.0f, 0));          // Depth
+
+    cmd->beginRenderPass(m_renderPass.get(), m_framebuffer.get(), clearValues);
+
+    // Set viewport
+    RHI::Viewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(m_width);
+    viewport.height = static_cast<float>(m_height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    cmd->setViewport(viewport);
+
+    // Set scissor
+    RHI::Scissor scissor{};
+    scissor.x = 0;
+    scissor.y = 0;
+    scissor.width = m_width;
+    scissor.height = m_height;
+    cmd->setScissor(scissor);
+
+    // Bind pipeline if available
+    if (m_pipeline) {
+        cmd->bindGraphicsPipeline(m_pipeline);
+    }
+
+    // Update camera uniform buffer
+    if (m_cameraUBO && context.camera) {
+        struct CameraUniforms {
+            glm::mat4 view;
+            glm::mat4 projection;
+            glm::vec4 position;
+            glm::vec4 params;  // nearPlane, farPlane, fov, aspectRatio
+        } uniforms;
+
+        uniforms.view = context.camera->view;
+        uniforms.projection = context.camera->projection;
+        uniforms.position = glm::vec4(context.camera->position, 1.0f);
+        uniforms.params = glm::vec4(
+            context.camera->nearPlane,
+            context.camera->farPlane,
+            context.camera->fov,
+            context.camera->aspectRatio
+        );
+
+        void* mapped = m_cameraUBO->map();
+        if (mapped) {
+            memcpy(mapped, &uniforms, sizeof(uniforms));
+            m_cameraUBO->unmap();
+        }
+    }
+
+    // Bind descriptor set with camera UBO and texture atlas
+    if (m_descriptorSet) {
+        cmd->bindDescriptorSet(0, m_descriptorSet.get());
+    }
+
+    // World rendering happens here
+    // For now, the World class still uses raw OpenGL calls internally
+    // This will be refactored later to use RHI command buffer
+    // The OpenGL backend executes commands immediately, so this works
+    if (context.world) {
+        // World::renderSubChunks will be called by the main renderer
+        // which still uses the OpenGL-based path
+        // TODO: Refactor World to accept RHI command buffer
+    }
+
+    cmd->endRenderPass();
+
+    // Store G-Buffer texture handles in context for subsequent passes
+    // Get native OpenGL handles from RHI textures for interop
+    if (m_gPosition) {
+        context.gPosition = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_gPosition->getNativeHandle()));
+    }
+    if (m_gNormal) {
+        context.gNormal = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_gNormal->getNativeHandle()));
+    }
+    if (m_gAlbedo) {
+        context.gAlbedo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_gAlbedo->getNativeHandle()));
+    }
+    if (m_gDepth) {
+        context.gDepth = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_gDepth->getNativeHandle()));
+    }
+
+    // Update stats
+    context.stats.gbufferTime = m_executionTimeMs;
 }
 
 void GBufferPassRHI::createGBuffer(uint32_t width, uint32_t height) {
@@ -275,9 +484,52 @@ void HiZPassRHI::resize(uint32_t width, uint32_t height) {
 }
 
 void HiZPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+    if (!m_enabled || !m_hiZTexture) return;
+
+    // Hi-Z buffer is generated by downsampling the depth buffer through mip levels
+    // Each mip level contains the maximum depth of the 2x2 region from previous level
+
+    if (m_computePipeline && m_mipDescriptorSets.size() > 0) {
+        cmd->bindComputePipeline(m_computePipeline);
+
+        uint32_t currentWidth = m_width;
+        uint32_t currentHeight = m_height;
+
+        // Generate each mip level
+        for (size_t mip = 1; mip < static_cast<size_t>(m_mipLevels) && mip <= m_mipDescriptorSets.size(); mip++) {
+            // Bind descriptor set for this mip level transition
+            cmd->bindDescriptorSet(0, m_mipDescriptorSets[mip - 1].get());
+
+            // Calculate output dimensions for this mip level
+            uint32_t outWidth = std::max(1u, currentWidth / 2);
+            uint32_t outHeight = std::max(1u, currentHeight / 2);
+
+            // Push constants with dimensions
+            struct HiZPushConstants {
+                uint32_t srcWidth;
+                uint32_t srcHeight;
+                uint32_t dstWidth;
+                uint32_t dstHeight;
+            } pushConstants = {currentWidth, currentHeight, outWidth, outHeight};
+
+            cmd->pushConstants(RHI::ShaderStage::Compute, 0, sizeof(pushConstants), &pushConstants);
+
+            // Dispatch compute shader
+            uint32_t groupsX = (outWidth + 7) / 8;
+            uint32_t groupsY = (outHeight + 7) / 8;
+            cmd->dispatch(groupsX, groupsY, 1);
+
+            currentWidth = outWidth;
+            currentHeight = outHeight;
+        }
+    }
+
+    // Store Hi-Z texture handle in context
+    if (m_hiZTexture) {
+        context.hiZTexture = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_hiZTexture->getNativeHandle()));
+    }
+
+    context.stats.hizTime = m_executionTimeMs;
 }
 
 void HiZPassRHI::createHiZBuffer(uint32_t width, uint32_t height) {
@@ -345,9 +597,65 @@ void SSAOPassRHI::resize(uint32_t width, uint32_t height) {
 }
 
 void SSAOPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+    if (!m_enabled || !m_ssaoTexture || !m_ssaoBlurred) return;
+
+    // Update SSAO parameters buffer if needed
+    if (m_kernelBuffer && context.camera) {
+        struct SSAOParams {
+            glm::mat4 projection;
+            glm::mat4 view;
+            glm::vec4 params;  // radius, bias, noiseScale.x, noiseScale.y
+        } params;
+
+        params.projection = context.camera->projection;
+        params.view = context.camera->view;
+        params.params = glm::vec4(
+            m_radius,
+            m_bias,
+            static_cast<float>(m_width) / 4.0f,
+            static_cast<float>(m_height) / 4.0f
+        );
+
+        void* mapped = m_kernelBuffer->map();
+        if (mapped) {
+            // Write params first, then kernel samples
+            memcpy(mapped, &params, sizeof(params));
+            memcpy(static_cast<char*>(mapped) + sizeof(params),
+                   m_ssaoKernel.data(),
+                   m_ssaoKernel.size() * sizeof(glm::vec4));
+            m_kernelBuffer->unmap();
+        }
+    }
+
+    // SSAO pass - compute ambient occlusion
+    if (m_ssaoPipeline && m_ssaoDescriptorSet) {
+        cmd->bindComputePipeline(m_ssaoPipeline);
+        cmd->bindDescriptorSet(0, m_ssaoDescriptorSet.get());
+
+        // Dispatch compute shader - one thread per pixel, 8x8 workgroups
+        uint32_t groupsX = (m_width + 7) / 8;
+        uint32_t groupsY = (m_height + 7) / 8;
+        cmd->dispatch(groupsX, groupsY, 1);
+    }
+
+    // Memory barrier between SSAO and blur (handled by command buffer)
+
+    // Blur pass - smooth the SSAO result
+    if (m_blurPipeline && m_blurDescriptorSet) {
+        cmd->bindComputePipeline(m_blurPipeline);
+        cmd->bindDescriptorSet(0, m_blurDescriptorSet.get());
+
+        uint32_t groupsX = (m_width + 7) / 8;
+        uint32_t groupsY = (m_height + 7) / 8;
+        cmd->dispatch(groupsX, groupsY, 1);
+    }
+
+    // Store result in context
+    if (m_ssaoBlurred) {
+        context.ssaoTexture = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_ssaoBlurred->getNativeHandle()));
+    }
+
+    context.stats.ssaoTime = m_executionTimeMs;
 }
 
 void SSAOPassRHI::createSSAOBuffers(uint32_t width, uint32_t height) {
@@ -376,6 +684,30 @@ void SSAOPassRHI::createSSAOBuffers(uint32_t width, uint32_t height) {
         return;
     }
 
+    // Create 4x4 noise texture
+    RHI::TextureDesc noiseDesc{};
+    noiseDesc.type = RHI::TextureType::Texture2D;
+    noiseDesc.format = RHI::Format::RGBA16_FLOAT;
+    noiseDesc.width = 4;
+    noiseDesc.height = 4;
+    noiseDesc.depth = 1;
+    noiseDesc.arrayLayers = 1;
+    noiseDesc.mipLevels = 1;
+    noiseDesc.samples = 1;
+    noiseDesc.usage = RHI::TextureUsage::Sampled;
+    noiseDesc.debugName = "SSAO_Noise";
+    m_noiseTexture = m_device->createTexture(noiseDesc);
+
+    // Create kernel buffer (params + kernel samples)
+    size_t paramsSize = sizeof(glm::mat4) * 2 + sizeof(glm::vec4);  // projection, view, params
+    size_t kernelDataSize = m_kernelSize * sizeof(glm::vec4);
+    RHI::BufferDesc kernelDesc{};
+    kernelDesc.size = paramsSize + kernelDataSize;
+    kernelDesc.usage = RHI::BufferUsage::Uniform;
+    kernelDesc.memory = RHI::MemoryUsage::CpuToGpu;
+    kernelDesc.debugName = "SSAO_KernelBuffer";
+    m_kernelBuffer = m_device->createBuffer(kernelDesc);
+
     generateKernelAndNoise();
 
     std::cout << "[SSAOPassRHI] Created SSAO buffer (" << width << "x" << height
@@ -387,6 +719,8 @@ void SSAOPassRHI::destroySSAOBuffers() {
     m_ssaoBlurred.reset();
     m_noiseTexture.reset();
     m_kernelBuffer.reset();
+    m_ssaoDescriptorSet.reset();
+    m_blurDescriptorSet.reset();
     m_width = 0;
     m_height = 0;
 }
@@ -464,9 +798,79 @@ void GPUCullingPassRHI::resize(uint32_t /*width*/, uint32_t /*height*/) {
 }
 
 void GPUCullingPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+    if (!m_enabled || m_chunkCount == 0 || !m_chunkAABBBuffer) return;
+
+    // Reset atomic counter to 0
+    if (m_counterBuffer) {
+        uint32_t zero = 0;
+        void* mapped = m_counterBuffer->map();
+        if (mapped) {
+            memcpy(mapped, &zero, sizeof(zero));
+            m_counterBuffer->unmap();
+        }
+    }
+
+    // Update culling uniform buffer with frustum planes
+    if (m_cullingUBO && context.camera) {
+        struct CullingUniforms {
+            glm::mat4 viewProj;
+            glm::vec4 frustumPlanes[6];  // Frustum planes in world space
+            glm::vec4 cameraPos;
+            glm::uvec4 params;           // chunkCount, hiZWidth, hiZHeight, hiZMipLevels
+        } uniforms;
+
+        uniforms.viewProj = context.camera->viewProjection;
+        uniforms.cameraPos = glm::vec4(context.camera->position, 1.0f);
+        uniforms.params = glm::uvec4(m_chunkCount, 0, 0, 0);
+
+        // Extract frustum planes from view-projection matrix
+        glm::mat4 vp = context.camera->viewProjection;
+        // Left plane
+        uniforms.frustumPlanes[0] = glm::vec4(vp[0][3] + vp[0][0], vp[1][3] + vp[1][0],
+                                               vp[2][3] + vp[2][0], vp[3][3] + vp[3][0]);
+        // Right plane
+        uniforms.frustumPlanes[1] = glm::vec4(vp[0][3] - vp[0][0], vp[1][3] - vp[1][0],
+                                               vp[2][3] - vp[2][0], vp[3][3] - vp[3][0]);
+        // Bottom plane
+        uniforms.frustumPlanes[2] = glm::vec4(vp[0][3] + vp[0][1], vp[1][3] + vp[1][1],
+                                               vp[2][3] + vp[2][1], vp[3][3] + vp[3][1]);
+        // Top plane
+        uniforms.frustumPlanes[3] = glm::vec4(vp[0][3] - vp[0][1], vp[1][3] - vp[1][1],
+                                               vp[2][3] - vp[2][1], vp[3][3] - vp[3][1]);
+        // Near plane
+        uniforms.frustumPlanes[4] = glm::vec4(vp[0][3] + vp[0][2], vp[1][3] + vp[1][2],
+                                               vp[2][3] + vp[2][2], vp[3][3] + vp[3][2]);
+        // Far plane
+        uniforms.frustumPlanes[5] = glm::vec4(vp[0][3] - vp[0][2], vp[1][3] - vp[1][2],
+                                               vp[2][3] - vp[2][2], vp[3][3] - vp[3][2]);
+
+        // Normalize frustum planes
+        for (int i = 0; i < 6; i++) {
+            float len = glm::length(glm::vec3(uniforms.frustumPlanes[i]));
+            if (len > 0.0001f) {
+                uniforms.frustumPlanes[i] /= len;
+            }
+        }
+
+        void* mapped = m_cullingUBO->map();
+        if (mapped) {
+            memcpy(mapped, &uniforms, sizeof(uniforms));
+            m_cullingUBO->unmap();
+        }
+    }
+
+    // Dispatch GPU culling compute shader
+    if (m_computePipeline && m_descriptorSet) {
+        cmd->bindComputePipeline(m_computePipeline);
+        cmd->bindDescriptorSet(0, m_descriptorSet.get());
+
+        // One thread per chunk, 64 chunks per workgroup
+        uint32_t groupsX = (m_chunkCount + 63) / 64;
+        cmd->dispatch(groupsX, 1, 1);
+    }
+
+    // Visible count will be read back after GPU execution
+    context.stats.chunksCulled = m_chunkCount - m_visibleCount;
 }
 
 void GPUCullingPassRHI::setChunkData(RHI::RHIBuffer* chunkAABBs, uint32_t chunkCount) {
@@ -502,9 +906,106 @@ void CompositePassRHI::resize(uint32_t width, uint32_t height) {
 }
 
 void CompositePassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+    if (!m_enabled || !m_framebuffer || !m_renderPass) return;
+
+    // Begin render pass
+    std::vector<RHI::ClearValue> clearValues;
+    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 1.0f));
+    clearValues.push_back(RHI::ClearValue::DepthStencil(1.0f, 0));
+
+    cmd->beginRenderPass(m_renderPass.get(), m_framebuffer.get(), clearValues);
+
+    // Set viewport
+    RHI::Viewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(m_width);
+    viewport.height = static_cast<float>(m_height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    cmd->setViewport(viewport);
+
+    // Set scissor
+    RHI::Scissor scissor{};
+    scissor.x = 0;
+    scissor.y = 0;
+    scissor.width = m_width;
+    scissor.height = m_height;
+    cmd->setScissor(scissor);
+
+    // Bind pipeline
+    if (m_pipeline) {
+        cmd->bindGraphicsPipeline(m_pipeline);
+    }
+
+    // Update lighting uniform buffer
+    if (m_lightingUBO && context.lighting && context.camera && context.fog) {
+        struct LightingUniforms {
+            glm::mat4 invViewProj;
+            glm::vec4 lightDir;
+            glm::vec4 lightColor;
+            glm::vec4 ambientColor;
+            glm::vec4 skyColor;
+            glm::vec4 cameraPos;
+            glm::vec4 fogParams;      // density, isUnderwater, renderDistance, time
+            glm::vec4 cascadeSplits;
+            glm::ivec4 flags;         // enableSSAO, debugMode, 0, 0
+        } uniforms;
+
+        glm::mat4 invViewProj = glm::inverse(context.camera->viewProjection);
+        uniforms.invViewProj = invViewProj;
+        uniforms.lightDir = glm::vec4(context.lighting->lightDir, 0.0f);
+        uniforms.lightColor = glm::vec4(context.lighting->lightColor, context.lighting->shadowStrength);
+        uniforms.ambientColor = glm::vec4(context.lighting->ambientColor, 0.0f);
+        uniforms.skyColor = glm::vec4(context.lighting->skyColor, 0.0f);
+        uniforms.cameraPos = glm::vec4(context.camera->position, 1.0f);
+        uniforms.fogParams = glm::vec4(
+            context.fog->density,
+            context.fog->isUnderwater ? 1.0f : 0.0f,
+            context.fog->renderDistance,
+            context.lighting->time
+        );
+        uniforms.cascadeSplits = glm::vec4(
+            context.cascadeSplits[0],
+            context.cascadeSplits[1],
+            context.cascadeSplits[2],
+            0.0f
+        );
+        uniforms.flags = glm::ivec4(
+            context.config->enableSSAO ? 1 : 0,
+            context.config->debugMode,
+            0, 0
+        );
+
+        void* mapped = m_lightingUBO->map();
+        if (mapped) {
+            memcpy(mapped, &uniforms, sizeof(uniforms));
+            m_lightingUBO->unmap();
+        }
+    }
+
+    // Bind descriptor set with G-buffer textures, SSAO, shadows
+    if (m_descriptorSet) {
+        cmd->bindDescriptorSet(0, m_descriptorSet.get());
+    }
+
+    // Draw fullscreen quad (6 vertices for 2 triangles)
+    if (m_quadVertexBuffer) {
+        cmd->bindVertexBuffer(0, m_quadVertexBuffer.get());
+        cmd->draw(6, 1, 0, 0);
+    }
+
+    cmd->endRenderPass();
+
+    // Store output texture handles in context
+    if (m_sceneColor) {
+        context.sceneColor = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_sceneColor->getNativeHandle()));
+    }
+    if (m_sceneDepth) {
+        context.sceneDepth = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(m_sceneDepth->getNativeHandle()));
+    }
+
+    context.stats.compositeTime = m_executionTimeMs;
 }
 
 void CompositePassRHI::createSceneBuffer(uint32_t width, uint32_t height) {
@@ -559,6 +1060,44 @@ void CompositePassRHI::createSceneBuffer(uint32_t width, uint32_t height) {
 
     m_framebuffer = m_device->createFramebuffer(fbDesc);
 
+    // Create lighting uniform buffer
+    if (!m_lightingUBO) {
+        RHI::BufferDesc uboDesc{};
+        uboDesc.size = 256;  // Large enough for LightingUniforms
+        uboDesc.usage = RHI::BufferUsage::Uniform;
+        uboDesc.memory = RHI::MemoryUsage::CpuToGpu;
+        uboDesc.debugName = "Composite_LightingUBO";
+        m_lightingUBO = m_device->createBuffer(uboDesc);
+    }
+
+    // Create fullscreen quad vertex buffer
+    if (!m_quadVertexBuffer) {
+        float quadVertices[] = {
+            // Position (x, y)
+            -1.0f,  1.0f,
+            -1.0f, -1.0f,
+             1.0f, -1.0f,
+            -1.0f,  1.0f,
+             1.0f, -1.0f,
+             1.0f,  1.0f
+        };
+
+        RHI::BufferDesc vbDesc{};
+        vbDesc.size = sizeof(quadVertices);
+        vbDesc.usage = RHI::BufferUsage::Vertex;
+        vbDesc.memory = RHI::MemoryUsage::CpuToGpu;
+        vbDesc.debugName = "Composite_QuadVB";
+        m_quadVertexBuffer = m_device->createBuffer(vbDesc);
+
+        if (m_quadVertexBuffer) {
+            void* mapped = m_quadVertexBuffer->map();
+            if (mapped) {
+                memcpy(mapped, quadVertices, sizeof(quadVertices));
+                m_quadVertexBuffer->unmap();
+            }
+        }
+    }
+
     std::cout << "[CompositePassRHI] Created scene buffer (" << width << "x" << height << ")" << std::endl;
 }
 
@@ -567,6 +1106,9 @@ void CompositePassRHI::destroySceneBuffer() {
     m_renderPass.reset();
     m_sceneColor.reset();
     m_sceneDepth.reset();
+    m_lightingUBO.reset();
+    m_quadVertexBuffer.reset();
+    m_descriptorSet.reset();
     m_width = 0;
     m_height = 0;
 }
@@ -591,8 +1133,9 @@ SkyPassRHI::~SkyPassRHI() {
 }
 
 bool SkyPassRHI::initialize(const RenderConfig& /*config*/) {
+    // Create sky UBO
     RHI::BufferDesc uboDesc{};
-    uboDesc.size = sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 4;
+    uboDesc.size = sizeof(glm::mat4) * 2 + sizeof(glm::vec4) * 5;  // 2 matrices + 5 vec4s
     uboDesc.usage = RHI::BufferUsage::Uniform;
     uboDesc.memory = RHI::MemoryUsage::CpuToGpu;
     uboDesc.debugName = "SkyUBO";
@@ -601,6 +1144,31 @@ bool SkyPassRHI::initialize(const RenderConfig& /*config*/) {
     if (!m_skyUBO) {
         std::cerr << "[SkyPassRHI] Failed to create sky UBO" << std::endl;
         return false;
+    }
+
+    // Create fullscreen quad vertex buffer
+    float skyVertices[] = {
+        -1.0f,  1.0f,
+        -1.0f, -1.0f,
+         1.0f, -1.0f,
+        -1.0f,  1.0f,
+         1.0f, -1.0f,
+         1.0f,  1.0f
+    };
+
+    RHI::BufferDesc vbDesc{};
+    vbDesc.size = sizeof(skyVertices);
+    vbDesc.usage = RHI::BufferUsage::Vertex;
+    vbDesc.memory = RHI::MemoryUsage::CpuToGpu;
+    vbDesc.debugName = "Sky_QuadVB";
+    m_skyVertexBuffer = m_device->createBuffer(vbDesc);
+
+    if (m_skyVertexBuffer) {
+        void* mapped = m_skyVertexBuffer->map();
+        if (mapped) {
+            memcpy(mapped, skyVertices, sizeof(skyVertices));
+            m_skyVertexBuffer->unmap();
+        }
     }
 
     std::cout << "[SkyPassRHI] Initialized" << std::endl;
@@ -618,8 +1186,53 @@ void SkyPassRHI::resize(uint32_t /*width*/, uint32_t /*height*/) {
 
 void SkyPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
     if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+
+    // Update sky uniform buffer
+    if (m_skyUBO && context.camera && context.lighting) {
+        struct SkyUniforms {
+            glm::mat4 invView;
+            glm::mat4 invProjection;
+            glm::vec4 cameraPos;
+            glm::vec4 sunDir;
+            glm::vec4 skyTop;
+            glm::vec4 skyBottom;
+            glm::vec4 params;  // time, 0, 0, 0
+        } uniforms;
+
+        uniforms.invView = context.camera->invView;
+        uniforms.invProjection = context.camera->invProjection;
+        uniforms.cameraPos = glm::vec4(context.camera->position, 1.0f);
+        uniforms.sunDir = glm::vec4(context.lighting->lightDir, 0.0f);
+        uniforms.skyTop = glm::vec4(context.lighting->skyColor, 1.0f);
+        glm::vec3 skyBottom = glm::mix(context.lighting->skyColor,
+                                        glm::vec3(0.9f, 0.85f, 0.8f), 0.3f);
+        uniforms.skyBottom = glm::vec4(skyBottom, 1.0f);
+        uniforms.params = glm::vec4(context.time, 0.0f, 0.0f, 0.0f);
+
+        void* mapped = m_skyUBO->map();
+        if (mapped) {
+            memcpy(mapped, &uniforms, sizeof(uniforms));
+            m_skyUBO->unmap();
+        }
+    }
+
+    // Bind sky pipeline (should have depth write disabled, LEQUAL compare)
+    if (m_pipeline) {
+        cmd->bindGraphicsPipeline(m_pipeline);
+    }
+
+    // Bind descriptor set
+    if (m_descriptorSet) {
+        cmd->bindDescriptorSet(0, m_descriptorSet.get());
+    }
+
+    // Draw fullscreen quad
+    if (m_skyVertexBuffer) {
+        cmd->bindVertexBuffer(0, m_skyVertexBuffer.get());
+        cmd->draw(6, 1, 0, 0);
+    }
+
+    context.stats.skyTime = m_executionTimeMs;
 }
 
 // ============================================================================
@@ -657,9 +1270,70 @@ void FSRPassRHI::resize(uint32_t width, uint32_t height) {
 }
 
 void FSRPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
-    if (!m_enabled) return;
-    (void)cmd;
-    (void)context;
+    (void)context;  // FSR doesn't need render context data
+    if (!m_enabled || !m_outputTexture) return;
+
+    // Update FSR constants buffer
+    if (m_fsrConstantsBuffer) {
+        struct FSRConstants {
+            glm::uvec4 const0;  // renderWidth, renderHeight, 1.0/renderWidth, 1.0/renderHeight (packed as uint)
+            glm::uvec4 const1;  // displayWidth, displayHeight, 1.0/displayWidth, 1.0/displayHeight (packed as uint)
+            glm::uvec4 const2;  // EASU specific constants
+            glm::uvec4 const3;  // RCAS specific constants
+        } constants;
+
+        // Pack float as uint for shader
+        auto packFloat = [](float f) -> uint32_t {
+            uint32_t result;
+            memcpy(&result, &f, sizeof(float));
+            return result;
+        };
+
+        constants.const0 = glm::uvec4(
+            m_renderWidth, m_renderHeight,
+            packFloat(1.0f / static_cast<float>(m_renderWidth)),
+            packFloat(1.0f / static_cast<float>(m_renderHeight))
+        );
+        constants.const1 = glm::uvec4(
+            m_displayWidth, m_displayHeight,
+            packFloat(1.0f / static_cast<float>(m_displayWidth)),
+            packFloat(1.0f / static_cast<float>(m_displayHeight))
+        );
+        constants.const2 = glm::uvec4(0);  // EASU constants (calculated in shader)
+        constants.const3 = glm::uvec4(packFloat(0.25f), 0, 0, 0);  // RCAS sharpness
+
+        void* mapped = m_fsrConstantsBuffer->map();
+        if (mapped) {
+            memcpy(mapped, &constants, sizeof(constants));
+            m_fsrConstantsBuffer->unmap();
+        }
+    }
+
+    // EASU pass - Edge Adaptive Spatial Upsampling
+    if (m_easuPipeline && m_easuDescriptorSet) {
+        cmd->bindComputePipeline(m_easuPipeline);
+        cmd->bindDescriptorSet(0, m_easuDescriptorSet.get());
+
+        // Dispatch EASU - one thread per output pixel, 16x16 workgroups
+        uint32_t groupsX = (m_displayWidth + 15) / 16;
+        uint32_t groupsY = (m_displayHeight + 15) / 16;
+        cmd->dispatch(groupsX, groupsY, 1);
+    }
+
+    // Memory barrier between EASU and RCAS
+
+    // RCAS pass - Robust Contrast Adaptive Sharpening
+    if (m_rcasPipeline && m_rcasDescriptorSet) {
+        cmd->bindComputePipeline(m_rcasPipeline);
+        cmd->bindDescriptorSet(0, m_rcasDescriptorSet.get());
+
+        uint32_t groupsX = (m_displayWidth + 15) / 16;
+        uint32_t groupsY = (m_displayHeight + 15) / 16;
+        cmd->dispatch(groupsX, groupsY, 1);
+    }
+
+    // FSR output texture is available via getOutputTexture()
+    // The calling code will use the output directly
 }
 
 void FSRPassRHI::setDimensions(uint32_t renderWidth, uint32_t renderHeight,
