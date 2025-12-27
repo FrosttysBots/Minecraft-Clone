@@ -4,6 +4,8 @@
 
 #include <iostream>
 #include <chrono>
+#include <fstream>
+#include <sstream>
 
 // Global config from main
 extern GameConfig g_config;
@@ -187,9 +189,9 @@ bool DeferredRendererRHI::initialize(GLFWwindow* window, const RenderConfig& con
         m_vertexPool.reset();
     }
 
-    std::cout << "[DeferredRendererRHI] Initialized with "
-              << BackendSelector::getBackendName(g_config.renderer)
-              << " backend" << std::endl;
+    // Report actual backend being used (may differ from config if fallback occurred)
+    const char* backendName = (m_device->getBackend() == RHI::Backend::Vulkan) ? "Vulkan" : "OpenGL 4.6";
+    std::cout << "[DeferredRendererRHI] Initialized with " << backendName << " backend" << std::endl;
 
     return true;
 }
@@ -537,62 +539,77 @@ bool DeferredRendererRHI::createPipelines() {
     // Initialize shader compiler
     ShaderCompiler::initialize();
 
+    // Determine backend from actual device (may differ from config if fallback occurred)
+    bool isVulkanBackend = (m_device->getBackend() == RHI::Backend::Vulkan);
+
     ShaderCompileOptions options;
     options.glslVersion = 460;
-    options.vulkanSemantics = (g_config.renderer == RendererType::VULKAN);
+    options.vulkanSemantics = isVulkanBackend;
     options.optimizePerformance = true;
 
+    bool useSpirv = isVulkanBackend;
+
+    // Helper to read file contents
+    auto readFileContents = [](const std::filesystem::path& path) -> std::string {
+        std::ifstream file(path);
+        if (!file.is_open()) return "";
+        std::stringstream ss;
+        ss << file.rdbuf();
+        return ss.str();
+    };
+
     // Helper lambda to load and create a shader program
-    auto loadShaderProgram = [this, &options](const std::string& name,
+    auto loadShaderProgram = [this, &options, useSpirv, &readFileContents](const std::string& name,
                                                const std::filesystem::path& vertPath,
                                                const std::filesystem::path& fragPath) -> RHI::RHIShaderProgram* {
-        auto vertShader = m_shaderCompiler.loadShader(vertPath, ShaderStage::Vertex, options);
-        auto fragShader = m_shaderCompiler.loadShader(fragPath, ShaderStage::Fragment, options);
-
-        if (!vertShader || !fragShader) {
-            std::cerr << "[DeferredRendererRHI] Failed to load shaders for " << name << std::endl;
-            std::cerr << "  Error: " << m_shaderCompiler.getLastError() << std::endl;
-            return nullptr;
-        }
-
-        // Convert SPIR-V from uint32_t to uint8_t
-        auto convertSpirvToBytes = [](const std::vector<uint32_t>& spirv) -> std::vector<uint8_t> {
-            std::vector<uint8_t> bytes(spirv.size() * sizeof(uint32_t));
-            memcpy(bytes.data(), spirv.data(), bytes.size());
-            return bytes;
-        };
-
-        RHI::ShaderModuleDesc vertDesc{};
-        vertDesc.code = convertSpirvToBytes(vertShader->spirv);
-        vertDesc.stage = RHI::ShaderStage::Vertex;
-        vertDesc.entryPoint = "main";
-        auto vertModule = m_device->createShaderModule(vertDesc);
-
-        RHI::ShaderModuleDesc fragDesc{};
-        fragDesc.code = convertSpirvToBytes(fragShader->spirv);
-        fragDesc.stage = RHI::ShaderStage::Fragment;
-        fragDesc.entryPoint = "main";
-        auto fragModule = m_device->createShaderModule(fragDesc);
-
-        if (!vertModule || !fragModule) {
-            std::cerr << "[DeferredRendererRHI] Failed to create shader modules for " << name << std::endl;
-            return nullptr;
-        }
-
         RHI::ShaderProgramDesc progDesc{};
-        RHI::ShaderSource vertSrc;
-        vertSrc.stage = RHI::ShaderStage::Vertex;
-        vertSrc.type = RHI::ShaderSourceType::SPIRV;
-        vertSrc.spirv = convertSpirvToBytes(vertShader->spirv);
-        vertSrc.entryPoint = "main";
 
-        RHI::ShaderSource fragSrc;
-        fragSrc.stage = RHI::ShaderStage::Fragment;
-        fragSrc.type = RHI::ShaderSourceType::SPIRV;
-        fragSrc.spirv = convertSpirvToBytes(fragShader->spirv);
-        fragSrc.entryPoint = "main";
+        if (useSpirv) {
+            // Vulkan: compile to SPIR-V
+            auto vertShader = m_shaderCompiler.loadShader(vertPath, ShaderStage::Vertex, options);
+            auto fragShader = m_shaderCompiler.loadShader(fragPath, ShaderStage::Fragment, options);
 
-        progDesc.stages = {vertSrc, fragSrc};
+            if (!vertShader || !fragShader) {
+                std::cerr << "[DeferredRendererRHI] Failed to load shaders for " << name << std::endl;
+                std::cerr << "  Error: " << m_shaderCompiler.getLastError() << std::endl;
+                return nullptr;
+            }
+
+            auto convertSpirvToBytes = [](const std::vector<uint32_t>& spirv) -> std::vector<uint8_t> {
+                std::vector<uint8_t> bytes(spirv.size() * sizeof(uint32_t));
+                memcpy(bytes.data(), spirv.data(), bytes.size());
+                return bytes;
+            };
+
+            RHI::ShaderSource vertSrc;
+            vertSrc.stage = RHI::ShaderStage::Vertex;
+            vertSrc.type = RHI::ShaderSourceType::SPIRV;
+            vertSrc.spirv = convertSpirvToBytes(vertShader->spirv);
+            vertSrc.entryPoint = "main";
+
+            RHI::ShaderSource fragSrc;
+            fragSrc.stage = RHI::ShaderStage::Fragment;
+            fragSrc.type = RHI::ShaderSourceType::SPIRV;
+            fragSrc.spirv = convertSpirvToBytes(fragShader->spirv);
+            fragSrc.entryPoint = "main";
+
+            progDesc.stages = {vertSrc, fragSrc};
+        } else {
+            // OpenGL: use GLSL source directly
+            std::string vertGlsl = readFileContents(vertPath);
+            std::string fragGlsl = readFileContents(fragPath);
+
+            if (vertGlsl.empty() || fragGlsl.empty()) {
+                std::cerr << "[DeferredRendererRHI] Failed to read shader files for " << name << std::endl;
+                return nullptr;
+            }
+
+            RHI::ShaderSource vertSrc = RHI::ShaderSource::fromGLSL(RHI::ShaderStage::Vertex, vertGlsl);
+            RHI::ShaderSource fragSrc = RHI::ShaderSource::fromGLSL(RHI::ShaderStage::Fragment, fragGlsl);
+
+            progDesc.stages = {vertSrc, fragSrc};
+        }
+
         progDesc.debugName = name;
 
         auto program = m_device->createShaderProgram(progDesc);
@@ -603,42 +620,46 @@ bool DeferredRendererRHI::createPipelines() {
     };
 
     // Helper lambda to load compute shaders
-    auto loadComputeProgram = [this, &options](const std::string& name,
+    auto loadComputeProgram = [this, &options, useSpirv, &readFileContents](const std::string& name,
                                                 const std::filesystem::path& compPath) -> RHI::RHIShaderProgram* {
-        auto compShader = m_shaderCompiler.loadShader(compPath, ShaderStage::Compute, options);
-
-        if (!compShader) {
-            std::cerr << "[DeferredRendererRHI] Failed to load compute shader for " << name << std::endl;
-            std::cerr << "  Error: " << m_shaderCompiler.getLastError() << std::endl;
-            return nullptr;
-        }
-
-        // Convert SPIR-V from uint32_t to uint8_t
-        auto convertSpirvToBytes = [](const std::vector<uint32_t>& spirv) -> std::vector<uint8_t> {
-            std::vector<uint8_t> bytes(spirv.size() * sizeof(uint32_t));
-            memcpy(bytes.data(), spirv.data(), bytes.size());
-            return bytes;
-        };
-
-        RHI::ShaderModuleDesc compDesc{};
-        compDesc.code = convertSpirvToBytes(compShader->spirv);
-        compDesc.stage = RHI::ShaderStage::Compute;
-        compDesc.entryPoint = "main";
-        auto compModule = m_device->createShaderModule(compDesc);
-
-        if (!compModule) {
-            std::cerr << "[DeferredRendererRHI] Failed to create compute module for " << name << std::endl;
-            return nullptr;
-        }
-
         RHI::ShaderProgramDesc progDesc{};
-        RHI::ShaderSource compSrc;
-        compSrc.stage = RHI::ShaderStage::Compute;
-        compSrc.type = RHI::ShaderSourceType::SPIRV;
-        compSrc.spirv = convertSpirvToBytes(compShader->spirv);
-        compSrc.entryPoint = "main";
 
-        progDesc.stages = {compSrc};
+        if (useSpirv) {
+            // Vulkan: compile to SPIR-V
+            auto compShader = m_shaderCompiler.loadShader(compPath, ShaderStage::Compute, options);
+
+            if (!compShader) {
+                std::cerr << "[DeferredRendererRHI] Failed to load compute shader for " << name << std::endl;
+                std::cerr << "  Error: " << m_shaderCompiler.getLastError() << std::endl;
+                return nullptr;
+            }
+
+            auto convertSpirvToBytes = [](const std::vector<uint32_t>& spirv) -> std::vector<uint8_t> {
+                std::vector<uint8_t> bytes(spirv.size() * sizeof(uint32_t));
+                memcpy(bytes.data(), spirv.data(), bytes.size());
+                return bytes;
+            };
+
+            RHI::ShaderSource compSrc;
+            compSrc.stage = RHI::ShaderStage::Compute;
+            compSrc.type = RHI::ShaderSourceType::SPIRV;
+            compSrc.spirv = convertSpirvToBytes(compShader->spirv);
+            compSrc.entryPoint = "main";
+
+            progDesc.stages = {compSrc};
+        } else {
+            // OpenGL: use GLSL source directly
+            std::string compGlsl = readFileContents(compPath);
+
+            if (compGlsl.empty()) {
+                std::cerr << "[DeferredRendererRHI] Failed to read compute shader for " << name << std::endl;
+                return nullptr;
+            }
+
+            RHI::ShaderSource compSrc = RHI::ShaderSource::fromGLSL(RHI::ShaderStage::Compute, compGlsl);
+            progDesc.stages = {compSrc};
+        }
+
         progDesc.debugName = name;
 
         auto program = m_device->createShaderProgram(progDesc);

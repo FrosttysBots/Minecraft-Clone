@@ -14,7 +14,7 @@ layout (std430, binding = 1) buffer VisibilityBuffer {
     uint visible[];
 };
 
-uniform sampler2D hiZBuffer;
+layout(binding = 2) uniform sampler2D hiZBuffer;
 uniform mat4 viewProj;
 uniform int numMipLevels;
 uniform vec2 screenSize;

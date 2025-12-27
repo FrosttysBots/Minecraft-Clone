@@ -1,8 +1,8 @@
 #version 460 core
-out vec4 FragColor;
-in vec2 TexCoords;
+layout(location = 0) out vec4 FragColor;
+layout(location = 0) in vec2 TexCoords;
 
-uniform sampler2D inputTexture;
+layout(binding = 0) uniform sampler2D inputTexture;
 uniform vec2 texelSize;     // 1.0 / resolution
 uniform float sharpness;    // 0.0 = no sharpening, 2.0 = max (default 0.5)
 

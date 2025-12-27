@@ -1,12 +1,12 @@
 #version 460 core
-out float FragColor;
+layout(location = 0) out float FragColor;
 
-in vec2 TexCoords;
+layout(location = 0) in vec2 TexCoords;
 
-uniform sampler2D gPosition;
-uniform sampler2D gNormal;
-uniform sampler2D gDepth;
-uniform sampler2D noiseTexture;
+layout(binding = 1) uniform sampler2D gPosition;
+layout(binding = 2) uniform sampler2D gNormal;
+layout(binding = 3) uniform sampler2D gDepth;
+layout(binding = 4) uniform sampler2D noiseTexture;
 
 // OPTIMIZATION: Use UBO for kernel samples (uploaded once, not per-frame)
 // Reduced from 32 to 16 samples for 2x performance

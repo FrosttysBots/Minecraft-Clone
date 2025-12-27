@@ -1,9 +1,9 @@
 #version 460 core
 layout (local_size_x = 8, local_size_y = 8) in;
 
-uniform sampler2D srcDepth;
+layout(binding = 0) uniform sampler2D srcDepth;
 uniform int srcLevel;
-layout (r32f, binding = 0) uniform writeonly image2D dstDepth;
+layout (r32f, binding = 1) uniform writeonly image2D dstDepth;
 
 void main() {
     ivec2 dstCoord = ivec2(gl_GlobalInvocationID.xy);

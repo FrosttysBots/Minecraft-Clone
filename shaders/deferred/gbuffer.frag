@@ -3,15 +3,15 @@ layout (location = 0) out vec4 gPosition;  // xyz = world pos, w = AO
 layout (location = 1) out vec4 gNormal;    // xyz = normal, w = light level
 layout (location = 2) out vec4 gAlbedo;    // rgb = albedo, a = emission
 
-in vec3 fragPos;
-in vec3 fragNormal;
-in vec2 texCoord;
-in vec2 texSlotBase;
-in float aoFactor;
-in float lightLevel;
-in float viewDepth;
+layout(location = 0) in vec3 fragPos;
+layout(location = 1) in vec3 fragNormal;
+layout(location = 2) in vec2 texCoord;
+layout(location = 3) in vec2 texSlotBase;
+layout(location = 4) in float aoFactor;
+layout(location = 5) in float lightLevel;
+layout(location = 6) in float viewDepth;
 
-uniform sampler2D texAtlas;
+layout(binding = 0) uniform sampler2D texAtlas;
 
 const float ATLAS_SIZE = 16.0;
 const float SLOT_SIZE = 1.0 / ATLAS_SIZE;

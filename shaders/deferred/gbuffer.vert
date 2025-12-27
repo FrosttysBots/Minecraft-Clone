@@ -3,13 +3,13 @@ layout (location = 0) in vec3 aPackedPos;
 layout (location = 1) in vec2 aPackedTexCoord;
 layout (location = 2) in uvec4 aPackedData;
 
-out vec3 fragPos;
-out vec3 fragNormal;
-out vec2 texCoord;
-out vec2 texSlotBase;
-out float aoFactor;
-out float lightLevel;
-out float viewDepth;
+layout(location = 0) out vec3 fragPos;
+layout(location = 1) out vec3 fragNormal;
+layout(location = 2) out vec2 texCoord;
+layout(location = 3) out vec2 texSlotBase;
+layout(location = 4) out float aoFactor;
+layout(location = 5) out float lightLevel;
+layout(location = 6) out float viewDepth;
 
 uniform mat4 view;
 uniform mat4 projection;

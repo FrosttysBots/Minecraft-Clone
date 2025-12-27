@@ -1,22 +1,22 @@
 #version 460 core
-in vec2 texCoord;
-in vec2 texSlotBase;  // Base UV of texture slot for greedy meshing tiling
-in vec3 fragNormal;
-in vec3 fragPos;
-in float aoFactor;
-in float lightLevel;
-in float fogDepth;
-in vec2 screenPos;
-in vec4 fragPosLightSpace;
+layout(location = 0) in vec2 texCoord;
+layout(location = 1) in vec2 texSlotBase;  // Base UV of texture slot for greedy meshing tiling
+layout(location = 2) in vec3 fragNormal;
+layout(location = 3) in vec3 fragPos;
+layout(location = 4) in float aoFactor;
+layout(location = 5) in float lightLevel;
+layout(location = 6) in float fogDepth;
+layout(location = 7) in vec2 screenPos;
+layout(location = 8) in vec4 fragPosLightSpace;
 
-out vec4 FragColor;
+layout(location = 0) out vec4 FragColor;
 
-uniform sampler2D texAtlas;
+layout(binding = 0) uniform sampler2D texAtlas;
 
 // Texture atlas constants for greedy meshing tiling
 const float ATLAS_SIZE = 16.0;
 const float SLOT_SIZE = 1.0 / ATLAS_SIZE;  // 0.0625
-uniform sampler2D shadowMap;
+layout(binding = 1) uniform sampler2D shadowMap;
 uniform vec3 lightDir;
 uniform vec3 lightColor;
 uniform vec3 ambientColor;

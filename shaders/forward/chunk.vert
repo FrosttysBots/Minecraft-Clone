@@ -4,15 +4,15 @@ layout (location = 0) in vec3 aPackedPos;     // int16 * 3, scaled by 256
 layout (location = 1) in vec2 aPackedTexCoord; // uint16 * 2, 8.8 fixed point
 layout (location = 2) in uvec4 aPackedData;   // normalIndex, ao, light, texSlot
 
-out vec2 texCoord;
-out vec2 texSlotBase;  // Pass to fragment shader for tiling
-out vec3 fragNormal;
-out vec3 fragPos;
-out float aoFactor;
-out float lightLevel;
-out float fogDepth;
-out vec2 screenPos;
-out vec4 fragPosLightSpace;
+layout(location = 0) out vec2 texCoord;
+layout(location = 1) out vec2 texSlotBase;  // Pass to fragment shader for tiling
+layout(location = 2) out vec3 fragNormal;
+layout(location = 3) out vec3 fragPos;
+layout(location = 4) out float aoFactor;
+layout(location = 5) out float lightLevel;
+layout(location = 6) out float fogDepth;
+layout(location = 7) out vec2 screenPos;
+layout(location = 8) out vec4 fragPosLightSpace;
 
 uniform mat4 view;
 uniform mat4 projection;

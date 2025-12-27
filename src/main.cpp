@@ -28,6 +28,7 @@
 #include "render/Screenshot.h"
 #include "render/ShaderCache.h"
 #include "render/DeferredRendererRHI.h"
+#include "render/BackendSelector.h"
 
 #include <iostream>
 #include <iomanip>

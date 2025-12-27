@@ -1,8 +1,8 @@
 #version 460 core
-out vec4 FragColor;
-in vec2 TexCoords;
+layout(location = 0) out vec4 FragColor;
+layout(location = 0) in vec2 TexCoords;
 
-uniform sampler2D inputTexture;
+layout(binding = 0) uniform sampler2D inputTexture;
 uniform vec2 inputSize;      // Render resolution (e.g., 640x360)
 uniform vec2 outputSize;     // Display resolution (e.g., 1280x720)
 

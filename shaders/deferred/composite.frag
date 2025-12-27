@@ -1,20 +1,20 @@
 #version 460 core
-out vec4 FragColor;
+layout(location = 0) out vec4 FragColor;
 
-in vec2 TexCoords;
+layout(location = 0) in vec2 TexCoords;
 
 // G-Buffer textures
-uniform sampler2D gPosition;
-uniform sampler2D gNormal;
-uniform sampler2D gAlbedo;
-uniform sampler2D gDepth;
+layout(binding = 0) uniform sampler2D gPosition;
+layout(binding = 1) uniform sampler2D gNormal;
+layout(binding = 2) uniform sampler2D gAlbedo;
+layout(binding = 3) uniform sampler2D gDepth;
 
 // SSAO
-uniform sampler2D ssaoTexture;
+layout(binding = 4) uniform sampler2D ssaoTexture;
 uniform bool enableSSAO;
 
 // Cascade shadow maps
-uniform sampler2DArrayShadow cascadeShadowMaps;
+layout(binding = 5) uniform sampler2DArrayShadow cascadeShadowMaps;
 uniform mat4 cascadeMatrices[3];
 uniform float cascadeSplits[3];
 uniform float shadowStrength;
