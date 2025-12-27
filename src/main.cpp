@@ -4559,6 +4559,9 @@ int main() {
         reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
         reinterpret_cast<const char*>(glGetString(GL_VERSION))
     );
+    debugOverlay.setRendererBackend(
+        g_config.renderer == RendererType::VULKAN ? "Vulkan" : "OpenGL 4.6"
+    );
     panoramaRenderer.init(42424242);
     panoramaRenderer.setProjection(WINDOW_WIDTH, WINDOW_HEIGHT);
     PresetManager::init("assets");
