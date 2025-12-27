@@ -91,6 +91,22 @@ if(NOT vma_POPULATED)
     FetchContent_Populate(vma)
 endif()
 
+# glslang - GLSL to SPIR-V compiler
+FetchContent_Declare(
+    glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG 14.0.0
+)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
+set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)  # Disable SPIRV-Tools optimizer
+set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(glslang)
+
 # Source files for main game (exclude launcher)
 file(GLOB_RECURSE GAME_SOURCES
     "src/*.cpp"
@@ -116,6 +132,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${vulkan_headers_SOURCE_DIR}/include
     ${volk_SOURCE_DIR}
     ${vma_SOURCE_DIR}/include
+    # glslang includes
+    ${glslang_SOURCE_DIR}
 )
 
 # Vulkan platform defines
@@ -128,6 +146,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     glm::glm
     opengl32
     meshoptimizer
+    glslang
+    SPIRV
+    glslang-default-resource-limits
 )
 
 # OpenGL Launcher executable (Windows only)

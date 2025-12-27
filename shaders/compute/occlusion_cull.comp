@@ -1,0 +1,102 @@
+#version 460 core
+layout (local_size_x = 64) in;
+
+struct ChunkBounds {
+    vec4 minBound;  // xyz = min corner, w = padding
+    vec4 maxBound;  // xyz = max corner, w = padding
+};
+
+layout (std430, binding = 0) buffer ChunkBoundsBuffer {
+    ChunkBounds bounds[];
+};
+
+layout (std430, binding = 1) buffer VisibilityBuffer {
+    uint visible[];
+};
+
+uniform sampler2D hiZBuffer;
+uniform mat4 viewProj;
+uniform int numMipLevels;
+uniform vec2 screenSize;
+uniform int chunkCount;
+uniform vec4 frustumPlanes[6];  // Frustum planes for culling
+
+// GPU frustum test - returns true if box is visible
+bool frustumTestAABB(vec3 minB, vec3 maxB) {
+    for (int i = 0; i < 6; i++) {
+        vec4 plane = frustumPlanes[i];
+        // Find the positive vertex (furthest along plane normal)
+        vec3 pVertex = vec3(
+            plane.x >= 0.0 ? maxB.x : minB.x,
+            plane.y >= 0.0 ? maxB.y : minB.y,
+            plane.z >= 0.0 ? maxB.z : minB.z
+        );
+        // If positive vertex is behind plane, AABB is outside
+        if (dot(plane.xyz, pVertex) + plane.w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= chunkCount) return;
+
+    vec3 minB = bounds[idx].minBound.xyz;
+    vec3 maxB = bounds[idx].maxBound.xyz;
+
+    // GPU frustum culling first (fast rejection)
+    if (!frustumTestAABB(minB, maxB)) {
+        visible[idx] = 0u;
+        return;
+    }
+
+    // Project all 8 corners to screen space
+    vec4 corners[8];
+    corners[0] = viewProj * vec4(minB.x, minB.y, minB.z, 1.0);
+    corners[1] = viewProj * vec4(maxB.x, minB.y, minB.z, 1.0);
+    corners[2] = viewProj * vec4(minB.x, maxB.y, minB.z, 1.0);
+    corners[3] = viewProj * vec4(maxB.x, maxB.y, minB.z, 1.0);
+    corners[4] = viewProj * vec4(minB.x, minB.y, maxB.z, 1.0);
+    corners[5] = viewProj * vec4(maxB.x, minB.y, maxB.z, 1.0);
+    corners[6] = viewProj * vec4(minB.x, maxB.y, maxB.z, 1.0);
+    corners[7] = viewProj * vec4(maxB.x, maxB.y, maxB.z, 1.0);
+
+    // Find screen-space bounding box and closest depth
+    vec2 minScreen = vec2(1.0);
+    vec2 maxScreen = vec2(-1.0);
+    float minDepth = 1.0;
+    bool anyInFront = false;
+
+    for (int i = 0; i < 8; i++) {
+        if (corners[i].w <= 0.0) {
+            // Behind camera - assume visible
+            visible[idx] = 1u;
+            return;
+        }
+
+        vec3 ndc = corners[i].xyz / corners[i].w;
+        minScreen = min(minScreen, ndc.xy);
+        maxScreen = max(maxScreen, ndc.xy);
+        minDepth = min(minDepth, ndc.z * 0.5 + 0.5);
+        anyInFront = true;
+    }
+
+    // Clamp to screen bounds
+    minScreen = clamp(minScreen * 0.5 + 0.5, vec2(0.0), vec2(1.0));
+    maxScreen = clamp(maxScreen * 0.5 + 0.5, vec2(0.0), vec2(1.0));
+
+    // Calculate appropriate mip level based on screen size
+    vec2 size = (maxScreen - minScreen) * screenSize;
+    float maxDim = max(size.x, size.y);
+    int mipLevel = int(ceil(log2(maxDim)));
+    mipLevel = clamp(mipLevel, 0, numMipLevels - 1);
+
+    // Sample Hi-Z at center of bounding box
+    vec2 center = (minScreen + maxScreen) * 0.5;
+    float hiZDepth = textureLod(hiZBuffer, center, float(mipLevel)).r;
+
+    // Occluded if chunk's closest point is behind Hi-Z depth
+    visible[idx] = (minDepth <= hiZDepth) ? 1u : 0u;
+}
