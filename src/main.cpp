@@ -3575,21 +3575,24 @@ int main() {
     }
 
     // Compile main chunk shader (with caching)
-    GLuint shaderProgram = ShaderCache::createCachedProgram("chunk", vertexShaderSource, fragmentShaderSource);
+    GLuint shaderProgram = ShaderCache::createCachedProgramFromFiles(
+        "chunk", "shaders/forward/chunk.vert", "shaders/forward/chunk.frag");
     if (shaderProgram == 0) {
         std::cerr << "Failed to create chunk shader program" << std::endl;
         return -1;
     }
 
-    // Compile water shader (with caching)
-    GLuint waterShaderProgram = ShaderCache::createCachedProgram("water", waterVertexShaderSource, waterFragmentShaderSource);
+    // Compile water shader from files (with caching)
+    GLuint waterShaderProgram = ShaderCache::createCachedProgramFromFiles(
+        "water", "shaders/forward/water.vert", "shaders/forward/water.frag");
     if (waterShaderProgram == 0) {
         std::cerr << "Failed to create water shader program" << std::endl;
         return -1;
     }
 
-    // Compile sky shader (with caching)
-    GLuint skyShaderProgram = ShaderCache::createCachedProgram("sky", skyVertexShaderSource, skyFragmentShaderSource);
+    // Compile sky shader from files (with caching)
+    GLuint skyShaderProgram = ShaderCache::createCachedProgramFromFiles(
+        "sky", "shaders/sky/sky.vert", "shaders/sky/sky.frag");
     if (skyShaderProgram == 0) {
         std::cerr << "Failed to create sky shader program" << std::endl;
         return -1;
@@ -3602,8 +3605,9 @@ int main() {
         return -1;
     }
 
-    // Compile shadow shader (with caching)
-    GLuint shadowShaderProgram = ShaderCache::createCachedProgram("shadow", shadowVertexShaderSource, shadowFragmentShaderSource);
+    // Compile shadow shader from files (with caching)
+    GLuint shadowShaderProgram = ShaderCache::createCachedProgramFromFiles(
+        "shadow", "shaders/forward/shadow.vert", "shaders/forward/shadow.frag");
     if (shadowShaderProgram == 0) {
         std::cerr << "Failed to create shadow shader program" << std::endl;
         return -1;
