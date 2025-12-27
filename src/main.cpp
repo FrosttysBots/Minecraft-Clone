@@ -9,10 +9,24 @@
 #include "core/Raycast.h"
 #include "core/Config.h"
 #include "world/World.h"
+#include "world/WorldPresets.h"
 #include "render/Crosshair.h"
 #include "render/BlockHighlight.h"
 #include "render/TextureAtlas.h"
 #include "render/VertexPool.h"
+#include "ui/MenuUI.h"
+#include "ui/MainMenu.h"
+#include "ui/WorldSelectScreen.h"
+#include "ui/WorldCreateScreen.h"
+#include "ui/PanoramaRenderer.h"
+#include "ui/PauseMenu.h"
+#include "ui/SettingsMenu.h"
+#include "ui/LoadingScreen3D.h"
+#include "ui/DebugOverlay.h"
+#include "benchmark/BenchmarkSystem.h"
+#include "world/WorldSaveLoad.h"
+#include "render/Screenshot.h"
+#include "render/ShaderCache.h"
 
 #include <iostream>
 #include <iomanip>
@@ -88,13 +102,15 @@ bool wireframeKeyPressed = false;
 // Deferred rendering toggles
 bool g_useDeferredRendering = true;  // Master toggle
 bool g_enableSSAO = true;            // SSAO toggle
+
+// Benchmark system
+Benchmark::BenchmarkSystem g_benchmark;
+bool g_benchmarkMode = false;  // When true, camera is controlled by benchmark
 int g_deferredDebugMode = 0;         // 0=normal, 1=albedo, 2=normals, 3=position, 4=depth
 
 // Daylight cycle toggle
 bool doDaylightCycle = true;
-int cloudStyle = 0;  // 0 = simple, 1 = volumetric
 bool cloudTogglePressed = false;
-bool daylightTogglePressed = false;
 
 // Weather system
 enum class WeatherType { CLEAR, RAIN, SNOW, THUNDERSTORM };
@@ -110,11 +126,29 @@ float thunderTimer = 0.0f;            // For thunder delay after lightning
 bool leftMousePressed = false;
 bool rightMousePressed = false;
 
-// Game state for loading screen
-enum class GameState { LOADING, PLAYING };
-GameState gameState = GameState::LOADING;
+// Game state for menu and loading screen
+enum class GameState { MAIN_MENU, WORLD_SELECT, WORLD_CREATE, LOADING, PLAYING, PAUSED };
+GameState gameState = GameState::MAIN_MENU;
 int totalChunksToLoad = 0;
 int chunksLoaded = 0;
+
+// Menu systems
+MenuUIRenderer menuUI;
+MainMenu mainMenu;
+WorldSelectScreen worldSelectScreen;
+WorldCreateScreen worldCreateScreen;
+PanoramaRenderer panoramaRenderer;
+PauseMenu pauseMenu;
+SettingsMenu settingsMenu;
+LoadingScreen3D loadingScreen3D;  // 3D loading screen with floating blocks
+DebugOverlay debugOverlay;  // F3 debug screen
+WorldSettings worldSettings;  // Settings from world create screen
+WorldSaveLoad worldSaveLoad;  // World save/load manager
+bool menuInitialized = false;
+bool cursorEnabled = true;  // Track cursor state for menus
+bool showSettings = false;  // Settings overlay (from main menu or pause menu)
+bool escWasPressedPlaying = false;  // ESC key debounce for pause toggle
+bool loadingExistingWorld = false;  // True if loading existing world, false if creating new
 
 // ============================================
 // DEFERRED RENDERING INFRASTRUCTURE
@@ -165,7 +199,7 @@ PFNGLDRAWMESHTASKSNVPROC_LOCAL pfn_glDrawMeshTasksNV = nullptr;
 
 // Cascade shadow maps (3 cascades)
 const int NUM_CASCADES = 3;
-const unsigned int CASCADE_RESOLUTION = 2048;
+unsigned int g_shadowResolution = 2048;  // Set from config in main()
 GLuint cascadeShadowFBO = 0;
 GLuint cascadeShadowMaps = 0;  // GL_TEXTURE_2D_ARRAY
 float cascadeSplitDepths[NUM_CASCADES] = {0.0f};
@@ -198,8 +232,8 @@ int g_cascadeUpdateIntervals[3] = {1, 2, 4};     // Update interval per cascade 
 int g_cascadeShadowDistances[3] = {6, 10, 14};   // Shadow render distance per cascade (in chunks)
 bool g_cascadeNeedsUpdate[3] = {true, true, true}; // Track which cascades need updating this frame
 
-// SSAO
-const int SSAO_KERNEL_SIZE = 32;
+// SSAO - OPTIMIZATION: Reduced from 32 to 16 samples for 2x performance
+const int SSAO_KERNEL_SIZE = 16;
 const int SSAO_NOISE_SIZE = 4;
 GLuint ssaoFBO = 0;
 GLuint ssaoBlurFBO = 0;
@@ -340,11 +374,36 @@ void closeRenderTimingLog() {
 void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
     (void)window;
     glViewport(0, 0, width, height);
+
+    // Update window dimensions
+    WINDOW_WIDTH = width;
+    WINDOW_HEIGHT = height;
+
+    // Resize menu UI
+    if (menuInitialized) {
+        menuUI.resize(width, height);
+        mainMenu.resize(width, height);
+        worldSelectScreen.resize(width, height);
+        worldCreateScreen.resize(width, height);
+        pauseMenu.resize(width, height);
+        settingsMenu.resize(width, height);
+        loadingScreen3D.resize(width, height);
+        panoramaRenderer.setProjection(width, height);
+    }
 }
 
 // Callback for mouse movement
 void mouseCallback(GLFWwindow* window, double xposIn, double yposIn) {
     (void)window;
+
+    // Don't process camera movement when in menu states
+    if (gameState == GameState::MAIN_MENU ||
+        gameState == GameState::WORLD_SELECT ||
+        gameState == GameState::WORLD_CREATE ||
+        gameState == GameState::PAUSED) {
+        return;
+    }
+
     float xpos = static_cast<float>(xposIn);
     float ypos = static_cast<float>(yposIn);
 
@@ -425,6 +484,27 @@ void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     }
 }
 
+// Callback for keyboard input (for menu text inputs)
+void keyCallback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    (void)window;
+    (void)scancode;
+
+    // Forward to world create screen if in that state
+    if (gameState == GameState::WORLD_CREATE) {
+        worldCreateScreen.handleKeyInput(key, action, mods);
+    }
+}
+
+// Callback for character input (for menu text inputs)
+void charCallback(GLFWwindow* window, unsigned int codepoint) {
+    (void)window;
+
+    // Forward to world create screen if in that state
+    if (gameState == GameState::WORLD_CREATE) {
+        worldCreateScreen.handleCharInput(codepoint);
+    }
+}
+
 // Process keyboard input - returns input state for player
 struct InputState {
     bool forward = false;
@@ -439,9 +519,7 @@ struct InputState {
 InputState processInput(GLFWwindow* window) {
     InputState input;
 
-    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
-        glfwSetWindowShouldClose(window, true);
-    }
+    // ESC key handling moved to main loop for pause menu toggle
 
     // Movement keys
     input.forward = glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS;
@@ -473,22 +551,25 @@ InputState processInput(GLFWwindow* window) {
         wireframeKeyPressed = false;
     }
 
-    // Daylight cycle toggle (F3)
+    // Debug overlay toggle (F3)
+    static bool f3Pressed = false;
     if (glfwGetKey(window, GLFW_KEY_F3) == GLFW_PRESS) {
-        if (!daylightTogglePressed) {
-            doDaylightCycle = !doDaylightCycle;
-            std::cout << "Daylight cycle: " << (doDaylightCycle ? "ON" : "OFF") << std::endl;
-            daylightTogglePressed = true;
+        if (!f3Pressed) {
+            debugOverlay.toggle();
+            f3Pressed = true;
         }
     } else {
-        daylightTogglePressed = false;
+        f3Pressed = false;
     }
 
-    // Cloud style toggle (F4)
+    // Cloud style toggle (F4) - cycles Simple/Volumetric
     if (glfwGetKey(window, GLFW_KEY_F4) == GLFW_PRESS) {
         if (!cloudTogglePressed) {
-            cloudStyle = (cloudStyle + 1) % 2;
-            std::cout << "Cloud style: " << (cloudStyle == 0 ? "Simple" : "Volumetric") << std::endl;
+            g_config.cloudStyle = (g_config.cloudStyle == CloudStyle::SIMPLE)
+                ? CloudStyle::VOLUMETRIC : CloudStyle::SIMPLE;
+            std::cout << "Cloud style: "
+                      << (g_config.cloudStyle == CloudStyle::SIMPLE ? "Simple" : "Volumetric")
+                      << std::endl;
             cloudTogglePressed = true;
         }
     } else {
@@ -532,6 +613,33 @@ InputState processInput(GLFWwindow* window) {
         }
     } else {
         deferredTogglePressed = false;
+    }
+
+    // Benchmark mode toggle (B key)
+    static bool benchmarkKeyPressed = false;
+    if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
+        if (!benchmarkKeyPressed) {
+            if (!g_benchmark.isRunning) {
+                // Start benchmark - first run Deferred, then Forward
+                g_benchmark.init();
+                g_benchmarkMode = true;
+
+                // Run deferred benchmark first
+                g_useDeferredRendering = true;
+                g_benchmark.startBenchmark("Deferred");
+                std::cout << "\n=== BENCHMARK MODE STARTED ===" << std::endl;
+                std::cout << "Press B again to cancel" << std::endl;
+                std::cout << "Running Deferred rendering benchmark..." << std::endl;
+            } else {
+                // Cancel benchmark
+                g_benchmark.stopBenchmark();
+                g_benchmarkMode = false;
+                std::cout << "\n=== BENCHMARK CANCELLED ===" << std::endl;
+            }
+            benchmarkKeyPressed = true;
+        }
+    } else {
+        benchmarkKeyPressed = false;
     }
 
     // Sub-chunk culling toggle (F9)
@@ -638,6 +746,7 @@ InputState processInput(GLFWwindow* window) {
     if (glfwGetKey(window, GLFW_KEY_B) == GLFW_PRESS) {
         if (!batchedRenderingTogglePressed) {
             g_enableBatchedRendering = !g_enableBatchedRendering;
+            g_config.enableBatchedRendering = g_enableBatchedRendering;  // Sync to config
             std::cout << "Batched Rendering: " << (g_enableBatchedRendering ? "ON" : "OFF") << std::endl;
             batchedRenderingTogglePressed = true;
         }
@@ -1031,6 +1140,7 @@ uniform mat4 view;
 uniform mat4 projection;
 uniform float time;
 uniform vec3 chunkOffset;  // Transform local to world coordinates
+uniform float waterAnimationEnabled;  // 1.0 = enabled, 0.0 = disabled
 
 // ============================================================
 // Simplex 2D Noise for vertex displacement
@@ -1083,8 +1193,8 @@ float fbmVertex(vec2 p, float t) {
 void main() {
     vec3 pos = aPos + chunkOffset;  // Transform to world coordinates
 
-    // Only animate the top surface of water (normal pointing up)
-    if (aNormal.y > 0.5) {
+    // Only animate the top surface of water (normal pointing up) if animation enabled
+    if (aNormal.y > 0.5 && waterAnimationEnabled > 0.5) {
         vec2 samplePos = pos.xz;
 
         // Large gentle waves (slow, big motion)
@@ -1895,13 +2005,14 @@ void main() {
     vec3 moonColor = vec3(0.9, 0.9, 1.0) * 0.8;
     sky += moonDisc * moonColor * nightFactor;
 
-    // Render clouds based on style
-    vec4 cloudColor;
+    // Render clouds based on style (-1 = disabled, 0 = simple, 1 = volumetric)
+    vec4 cloudColor = vec4(0.0);
     if (cloudStyle == 0) {
         cloudColor = renderSimpleClouds(rayDir);
-    } else {
+    } else if (cloudStyle == 1) {
         cloudColor = renderVolumetricClouds(rayDir);
     }
+    // cloudStyle == -1: clouds disabled, cloudColor stays transparent
 
     // Composite
     vec3 finalColor = mix(sky, cloudColor.rgb, cloudColor.a);
@@ -2960,8 +3071,9 @@ uniform sampler2D gDepth;
 uniform sampler2D noiseTexture;
 
 // OPTIMIZATION: Use UBO for kernel samples (uploaded once, not per-frame)
+// Reduced from 32 to 16 samples for 2x performance
 layout(std140, binding = 0) uniform SSAOKernel {
-    vec4 samples[32];  // vec4 for std140 alignment (only xyz used)
+    vec4 samples[16];  // vec4 for std140 alignment (only xyz used)
 };
 
 uniform mat4 projection;
@@ -2994,7 +3106,8 @@ void main() {
     mat3 TBN = mat3(tangent, bitangent, normalView);
 
     float occlusion = 0.0;
-    for (int i = 0; i < 32; i++) {
+    // OPTIMIZATION: Reduced from 32 to 16 samples
+    for (int i = 0; i < 16; i++) {
         // Get sample position (samples stored as vec4 for std140 alignment)
         vec3 sampleDir = TBN * samples[i].xyz;
         vec3 samplePos = fragPosView + sampleDir * radius;
@@ -3016,7 +3129,7 @@ void main() {
         occlusion += (sampledDepth >= samplePos.z + bias ? 1.0 : 0.0) * rangeCheck;
     }
 
-    occlusion = 1.0 - (occlusion / 32.0);
+    occlusion = 1.0 - (occlusion / 16.0);
     FragColor = pow(occlusion, 2.0);  // Increase contrast
 }
 )";
@@ -3306,6 +3419,7 @@ int main() {
     g_enableSSAO = g_config.enableSSAO;
     g_enableHiZCulling = g_config.enableHiZCulling;
     g_showPerfStats = g_config.showPerformanceStats;
+    g_enableBatchedRendering = g_config.enableBatchedRendering;
 
     // Initialize GLFW
     if (!glfwInit()) {
@@ -3340,9 +3454,11 @@ int main() {
     glfwSetCursorPosCallback(window, mouseCallback);
     glfwSetScrollCallback(window, scrollCallback);
     glfwSetMouseButtonCallback(window, mouseButtonCallback);
+    glfwSetKeyCallback(window, keyCallback);
+    glfwSetCharCallback(window, charCallback);
 
-    // Capture mouse
-    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+    // Start with cursor visible for main menu
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
 
     // VSync from config
     glfwSwapInterval(g_config.vsync ? 1 : 0);
@@ -3382,6 +3498,10 @@ int main() {
     g_hardware.classifyGPU();
     g_hardware.calculateRecommendations();
     g_hardware.print();
+
+    // Initialize shader cache for faster startup
+    ShaderCache::init("shader_cache");
+    ShaderCache::printCacheStats();
 
     // Check for mesh shader extension (GL_NV_mesh_shader)
     GLint numExtensions = 0;
@@ -3437,115 +3557,40 @@ int main() {
         g_enableHiZCulling = g_config.enableHiZCulling;
     }
 
-    // Compile vertex shader
-    GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertexShader, 1, &vertexShaderSource, nullptr);
-    glCompileShader(vertexShader);
-    if (!checkShaderCompilation(vertexShader, "VERTEX")) return -1;
+    // Compile main chunk shader (with caching)
+    GLuint shaderProgram = ShaderCache::createCachedProgram("chunk", vertexShaderSource, fragmentShaderSource);
+    if (shaderProgram == 0) {
+        std::cerr << "Failed to create chunk shader program" << std::endl;
+        return -1;
+    }
 
-    // Compile fragment shader
-    GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragmentShader, 1, &fragmentShaderSource, nullptr);
-    glCompileShader(fragmentShader);
-    if (!checkShaderCompilation(fragmentShader, "FRAGMENT")) return -1;
+    // Compile water shader (with caching)
+    GLuint waterShaderProgram = ShaderCache::createCachedProgram("water", waterVertexShaderSource, waterFragmentShaderSource);
+    if (waterShaderProgram == 0) {
+        std::cerr << "Failed to create water shader program" << std::endl;
+        return -1;
+    }
 
-    // Link shaders into program
-    GLuint shaderProgram = glCreateProgram();
-    glAttachShader(shaderProgram, vertexShader);
-    glAttachShader(shaderProgram, fragmentShader);
-    glLinkProgram(shaderProgram);
-    if (!checkProgramLinking(shaderProgram)) return -1;
+    // Compile sky shader (with caching)
+    GLuint skyShaderProgram = ShaderCache::createCachedProgram("sky", skyVertexShaderSource, skyFragmentShaderSource);
+    if (skyShaderProgram == 0) {
+        std::cerr << "Failed to create sky shader program" << std::endl;
+        return -1;
+    }
 
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
+    // Compile precipitation shader (with caching)
+    GLuint precipShaderProgram = ShaderCache::createCachedProgram("precipitation", precipVertexShaderSource, precipFragmentShaderSource);
+    if (precipShaderProgram == 0) {
+        std::cerr << "Failed to create precipitation shader program" << std::endl;
+        return -1;
+    }
 
-    // Compile water vertex shader
-    GLuint waterVertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(waterVertexShader, 1, &waterVertexShaderSource, nullptr);
-    glCompileShader(waterVertexShader);
-    if (!checkShaderCompilation(waterVertexShader, "WATER VERTEX")) return -1;
-
-    // Compile water fragment shader
-    GLuint waterFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(waterFragmentShader, 1, &waterFragmentShaderSource, nullptr);
-    glCompileShader(waterFragmentShader);
-    if (!checkShaderCompilation(waterFragmentShader, "WATER FRAGMENT")) return -1;
-
-    // Link water shaders into program
-    GLuint waterShaderProgram = glCreateProgram();
-    glAttachShader(waterShaderProgram, waterVertexShader);
-    glAttachShader(waterShaderProgram, waterFragmentShader);
-    glLinkProgram(waterShaderProgram);
-    if (!checkProgramLinking(waterShaderProgram)) return -1;
-
-    glDeleteShader(waterVertexShader);
-    glDeleteShader(waterFragmentShader);
-
-    // Compile sky vertex shader
-    GLuint skyVertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(skyVertexShader, 1, &skyVertexShaderSource, nullptr);
-    glCompileShader(skyVertexShader);
-    if (!checkShaderCompilation(skyVertexShader, "SKY VERTEX")) return -1;
-
-    // Compile sky fragment shader
-    GLuint skyFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(skyFragmentShader, 1, &skyFragmentShaderSource, nullptr);
-    glCompileShader(skyFragmentShader);
-    if (!checkShaderCompilation(skyFragmentShader, "SKY FRAGMENT")) return -1;
-
-    // Link sky shaders into program
-    GLuint skyShaderProgram = glCreateProgram();
-    glAttachShader(skyShaderProgram, skyVertexShader);
-    glAttachShader(skyShaderProgram, skyFragmentShader);
-    glLinkProgram(skyShaderProgram);
-    if (!checkProgramLinking(skyShaderProgram)) return -1;
-
-    glDeleteShader(skyVertexShader);
-    glDeleteShader(skyFragmentShader);
-
-    // Compile precipitation vertex shader
-    GLuint precipVertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(precipVertexShader, 1, &precipVertexShaderSource, nullptr);
-    glCompileShader(precipVertexShader);
-    if (!checkShaderCompilation(precipVertexShader, "PRECIP VERTEX")) return -1;
-
-    // Compile precipitation fragment shader
-    GLuint precipFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(precipFragmentShader, 1, &precipFragmentShaderSource, nullptr);
-    glCompileShader(precipFragmentShader);
-    if (!checkShaderCompilation(precipFragmentShader, "PRECIP FRAGMENT")) return -1;
-
-    // Link precipitation shaders into program
-    GLuint precipShaderProgram = glCreateProgram();
-    glAttachShader(precipShaderProgram, precipVertexShader);
-    glAttachShader(precipShaderProgram, precipFragmentShader);
-    glLinkProgram(precipShaderProgram);
-    if (!checkProgramLinking(precipShaderProgram)) return -1;
-
-    glDeleteShader(precipVertexShader);
-    glDeleteShader(precipFragmentShader);
-
-    // Compile shadow vertex shader
-    GLuint shadowVertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(shadowVertexShader, 1, &shadowVertexShaderSource, nullptr);
-    glCompileShader(shadowVertexShader);
-    if (!checkShaderCompilation(shadowVertexShader, "SHADOW VERTEX")) return -1;
-
-    // Compile shadow fragment shader
-    GLuint shadowFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(shadowFragmentShader, 1, &shadowFragmentShaderSource, nullptr);
-    glCompileShader(shadowFragmentShader);
-    if (!checkShaderCompilation(shadowFragmentShader, "SHADOW FRAGMENT")) return -1;
-
-    // Link shadow shaders into program
-    GLuint shadowShaderProgram = glCreateProgram();
-    glAttachShader(shadowShaderProgram, shadowVertexShader);
-    glAttachShader(shadowShaderProgram, shadowFragmentShader);
-    glLinkProgram(shadowShaderProgram);
-    if (!checkProgramLinking(shadowShaderProgram)) return -1;
-
-    glDeleteShader(shadowVertexShader);
-    glDeleteShader(shadowFragmentShader);
+    // Compile shadow shader (with caching)
+    GLuint shadowShaderProgram = ShaderCache::createCachedProgram("shadow", shadowVertexShaderSource, shadowFragmentShaderSource);
+    if (shadowShaderProgram == 0) {
+        std::cerr << "Failed to create shadow shader program" << std::endl;
+        return -1;
+    }
 
     // Compile Z-prepass shaders (eliminates overdraw)
     GLuint zPrepassVertexShader = glCreateShader(GL_VERTEX_SHADER);
@@ -3889,6 +3934,7 @@ int main() {
     GLint waterTexBoundsLoc = glGetUniformLocation(waterShaderProgram, "waterTexBounds");
     GLint waterCameraPosLoc = glGetUniformLocation(waterShaderProgram, "cameraPos");
     GLint waterLodDistanceLoc = glGetUniformLocation(waterShaderProgram, "waterLodDistance");
+    GLint waterAnimationEnabledLoc = glGetUniformLocation(waterShaderProgram, "waterAnimationEnabled");
 
     // Get uniform locations for sky shader
     GLint skyInvViewLoc = glGetUniformLocation(skyShaderProgram, "invView");
@@ -4102,7 +4148,13 @@ int main() {
     glFrontFace(GL_CCW);
 
     // Create shadow map framebuffer and texture
-    const unsigned int SHADOW_WIDTH = 4096, SHADOW_HEIGHT = 4096;
+    // Use config shadow resolution - important for VRAM usage!
+    g_shadowResolution = static_cast<unsigned int>(g_config.shadowResolution);
+    if (g_config.shadowQuality == ShadowQuality::OFF) {
+        g_shadowResolution = 256;  // Minimal size when shadows are off
+    }
+    const unsigned int SHADOW_WIDTH = g_shadowResolution, SHADOW_HEIGHT = g_shadowResolution;
+
     GLuint shadowMapFBO;
     glGenFramebuffers(1, &shadowMapFBO);
 
@@ -4247,10 +4299,13 @@ int main() {
     // ============================================
     std::cout << "Creating cascade shadow maps..." << std::endl;
 
+    // Use same shadow resolution for cascades - already set from config above
+    unsigned int cascadeRes = g_shadowResolution;
+
     glGenTextures(1, &cascadeShadowMaps);
     glBindTexture(GL_TEXTURE_2D_ARRAY, cascadeShadowMaps);
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT32F,
-                 CASCADE_RESOLUTION, CASCADE_RESOLUTION, NUM_CASCADES,
+                 cascadeRes, cascadeRes, NUM_CASCADES,
                  0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -4271,7 +4326,7 @@ int main() {
         std::cerr << "Cascade shadow framebuffer is not complete!" << std::endl;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
-    std::cout << "Cascade shadow maps created (3x " << CASCADE_RESOLUTION << "x" << CASCADE_RESOLUTION << ")" << std::endl;
+    std::cout << "Cascade shadow maps created (3x " << cascadeRes << "x" << cascadeRes << ")" << std::endl;
 
     // ============================================
     // CREATE SSAO RESOURCES
@@ -4476,6 +4531,33 @@ int main() {
     BlockHighlight blockHighlight;
     blockHighlight.init();
 
+    // ============================================
+    // INITIALIZE MENU SYSTEM
+    // ============================================
+    menuUI.init(WINDOW_WIDTH, WINDOW_HEIGHT);
+    mainMenu.init(&menuUI);
+    worldSelectScreen.init(&menuUI);
+    worldCreateScreen.init(&menuUI);
+    pauseMenu.init(&menuUI);
+    settingsMenu.init(&menuUI);
+    loadingScreen3D.init(WINDOW_WIDTH, WINDOW_HEIGHT);
+    debugOverlay.init(&menuUI);
+    debugOverlay.setGPUInfo(
+        reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
+        reinterpret_cast<const char*>(glGetString(GL_VERSION))
+    );
+    panoramaRenderer.init(42424242);
+    panoramaRenderer.setProjection(WINDOW_WIDTH, WINDOW_HEIGHT);
+    PresetManager::init("assets");
+    menuInitialized = true;
+
+    // Start in main menu with cursor visible
+    gameState = GameState::MAIN_MENU;
+    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+    cursorEnabled = true;
+
+    std::cout << "Menu system initialized" << std::endl;
+
     // Initialize thread pool with config settings
     world.initThreadPool(g_config.chunkThreads, g_config.meshThreads);
 
@@ -4495,28 +4577,60 @@ int main() {
     player->attachCamera(&camera);
     player->isFlying = true;  // Start in fly mode for convenience
 
-    // Calculate total chunks to load for loading screen
+    // World loading will be triggered from the menu
+    // Don't auto-start loading - wait for user to create world from menu
     int loadRadius = world.renderDistance;
     totalChunksToLoad = 0;
-
-    // Queue all chunks within render distance for async generation
-    std::cout << "\nQueuing chunks for generation (render distance: " << loadRadius << ")..." << std::endl;
-    for (int dx = -loadRadius; dx <= loadRadius; dx++) {
-        for (int dz = -loadRadius; dz <= loadRadius; dz++) {
-            glm::ivec2 chunkPos(dx, dz);
-            world.chunkThreadPool->queueChunk(chunkPos);
-            totalChunksToLoad++;
-        }
-    }
-    std::cout << "Queued " << totalChunksToLoad << " chunks for generation" << std::endl;
-
-    // Set loading state
-    gameState = GameState::LOADING;
     chunksLoaded = 0;
     meshesBuilt = 0;
-    loadingMessage = "Generating terrain...";
-    world.burstMode = true;  // Enable burst mode for maximum loading speed
-    glfwSwapInterval(0);     // Disable VSync during loading for max speed
+
+    // Lambda to start world generation (called when user clicks "Create World")
+    auto startWorldGeneration = [&]() {
+        // Reset the world first (clear all existing chunks and meshes)
+        std::cout << "\nResetting world for new generation..." << std::endl;
+        world.reset();
+
+        // Apply world settings from menu
+        int newSeed = static_cast<int>(worldSettings.seedValue & 0x7FFFFFFF);
+        world.setSeed(newSeed);
+        world.chunkThreadPool->setSeed(newSeed);  // Update thread pool generators too
+        world.terrainGenerator.maxHeight = worldSettings.maxYHeight;
+        world.chunkThreadPool->setMaxHeight(worldSettings.maxYHeight);  // Update thread pool too
+        // TODO: Add continentScale, mountainScale, detailScale to TerrainGenerator
+        // world.terrainGenerator.continentScale = worldSettings.continentScale;
+        // world.terrainGenerator.mountainScale = worldSettings.mountainScale;
+        // world.terrainGenerator.detailScale = worldSettings.detailScale;
+        // TODO: Apply biome size and generation type settings
+
+        loadRadius = world.renderDistance;
+        totalChunksToLoad = 0;
+
+        // Queue all chunks within render distance for async generation
+        std::cout << "\nQueuing chunks for generation (render distance: " << loadRadius << ")..." << std::endl;
+        std::cout << "World seed: " << newSeed << std::endl;
+        std::cout << "Max height: " << worldSettings.maxYHeight << std::endl;
+        std::cout << "Generation type: " << static_cast<int>(worldSettings.generationType) << std::endl;
+        for (int dx = -loadRadius; dx <= loadRadius; dx++) {
+            for (int dz = -loadRadius; dz <= loadRadius; dz++) {
+                glm::ivec2 chunkPos(dx, dz);
+                world.chunkThreadPool->queueChunk(chunkPos);
+                totalChunksToLoad++;
+            }
+        }
+        std::cout << "Queued " << totalChunksToLoad << " chunks for generation" << std::endl;
+
+        // Set loading state
+        gameState = GameState::LOADING;
+        chunksLoaded = 0;
+        meshesBuilt = 0;
+        loadingMessage = "Generating terrain...";
+        world.burstMode = true;  // Enable burst mode for maximum loading speed
+        glfwSwapInterval(0);     // Disable VSync during loading for max speed
+
+        // Hide cursor for loading screen
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        cursorEnabled = false;
+    };
 
     std::cout << "\n=== Voxel Engine Started ===" << std::endl;
     std::cout << "Controls:" << std::endl;
@@ -4530,7 +4644,7 @@ int main() {
     std::cout << "  Scroll/1-9 - Select block" << std::endl;
     std::cout << "  F1 - Toggle wireframe" << std::endl;
     std::cout << "  F2 - Toggle fly mode" << std::endl;
-    std::cout << "  F3 - Toggle daylight cycle" << std::endl;
+    std::cout << "  F3 - Toggle debug overlay" << std::endl;
     std::cout << "  F4 - Toggle cloud style (Simple/Volumetric)" << std::endl;
     std::cout << "  F5 - Toggle weather (Clear/Rain/Snow/Thunderstorm)" << std::endl;
     std::cout << "  F6 - Toggle noclip (fly through blocks)" << std::endl;
@@ -4539,11 +4653,15 @@ int main() {
     // FPS counter
     double lastFPSTime = glfwGetTime();
     int frameCount = 0;
+    float currentFPS = 60.0f;  // For debug overlay
 
-    // Day/night cycle settings (from config)
-    float dayLength = g_config.dayLength;
+    // Day/night cycle settings
+    // 1440 seconds = 24 minutes real time = 24 hours game time
+    // So sun is up for ~12 minutes, moon for ~12 minutes
+    float dayLength = 1440.0f;  // Force 24 minute days (ignore config for now)
     float timeOfDay = 0.25f;   // Start at sunrise (0=midnight, 0.25=sunrise, 0.5=noon, 0.75=sunset)
     float fogDensity = g_config.fogDensity;
+    std::cout << "Day length: " << dayLength << " seconds (24 min = full day/night cycle)" << std::endl;
 
     // Main loop
     while (!glfwWindowShouldClose(window)) {
@@ -4554,6 +4672,229 @@ int main() {
 
         // Poll events first
         glfwPollEvents();
+
+        // ============================================================
+        // MAIN MENU STATE
+        // ============================================================
+        if (gameState == GameState::MAIN_MENU) {
+            // Get mouse position for menu
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            // Update panorama
+            panoramaRenderer.update(deltaTime);
+
+            // Handle ESC key
+            static bool mainMenuEscPressed = false;
+            bool escPressed = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+
+            if (showSettings) {
+                // Settings overlay on main menu
+                settingsMenu.update(mx, my, mouseDown);
+                SettingsAction settingsAction = settingsMenu.getAction();
+
+                if (settingsAction == SettingsAction::BACK) {
+                    showSettings = false;
+                }
+                else if (settingsAction == SettingsAction::APPLY) {
+                    glfwSwapInterval(g_config.vsync ? 1 : 0);
+                    g_enableBatchedRendering = g_config.enableBatchedRendering;  // Apply batched rendering setting
+                }
+
+                // ESC to close settings
+                if (escPressed && !mainMenuEscPressed) {
+                    showSettings = false;
+                }
+            } else {
+                // Update main menu
+                mainMenu.update(mx, my, mouseDown);
+
+                // Handle menu actions
+                MenuAction action = mainMenu.getAction();
+                if (action == MenuAction::PLAY_GAME) {
+                    worldSelectScreen.refreshWorldList();
+                    gameState = GameState::WORLD_SELECT;
+                }
+                else if (action == MenuAction::SETTINGS) {
+                    showSettings = true;
+                    settingsMenu.refreshFromConfig();
+                }
+                else if (action == MenuAction::EXIT) {
+                    glfwSetWindowShouldClose(window, GLFW_TRUE);
+                }
+
+                // ESC to exit (only when not in settings)
+                if (escPressed && !mainMenuEscPressed) {
+                    glfwSetWindowShouldClose(window, GLFW_TRUE);
+                }
+            }
+            mainMenuEscPressed = escPressed;
+
+            // Render menu - ensure we're on the default framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+            // Render 3D panorama background
+            panoramaRenderer.render();
+
+            // Setup for 2D rendering (overlay on top of panorama)
+            menuUI.beginFrame();
+
+            // Render main menu or settings
+            if (showSettings) {
+                settingsMenu.render();
+            } else {
+                mainMenu.render();
+            }
+            menuUI.endFrame();
+
+            glfwSwapBuffers(window);
+            continue;
+        }
+
+        // ============================================================
+        // WORLD SELECT STATE
+        // ============================================================
+        if (gameState == GameState::WORLD_SELECT) {
+            // Get mouse position for menu
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            // Update panorama
+            panoramaRenderer.update(deltaTime);
+
+            // Update world select screen
+            worldSelectScreen.update(mx, my, mouseDown, deltaTime);
+
+            // Handle actions
+            WorldSelectAction selectAction = worldSelectScreen.getAction();
+            if (selectAction == WorldSelectAction::BACK) {
+                gameState = GameState::MAIN_MENU;
+            }
+            else if (selectAction == WorldSelectAction::CREATE_NEW) {
+                gameState = GameState::WORLD_CREATE;
+            }
+            else if (selectAction == WorldSelectAction::PLAY_SELECTED) {
+                const SavedWorldInfo* selectedWorld = worldSelectScreen.getSelectedWorld();
+                if (selectedWorld) {
+                    // Load existing world
+                    loadingExistingWorld = true;
+                    worldSaveLoad.currentWorldPath = selectedWorld->folderPath;
+                    worldSaveLoad.currentWorldName = selectedWorld->name;
+                    worldSaveLoad.hasLoadedWorld = true;
+
+                    // Set up world settings from saved data
+                    worldSettings.worldName = selectedWorld->name;
+                    worldSettings.seedValue = static_cast<uint64_t>(selectedWorld->seed);
+                    worldSettings.generationType = static_cast<GenerationType>(selectedWorld->generationType);
+                    worldSettings.maxYHeight = selectedWorld->maxHeight;
+
+                    // Update last played time
+                    WorldSaveLoad::updateLastPlayed(selectedWorld->folderPath);
+
+                    startWorldGeneration();
+                }
+            }
+            else if (selectAction == WorldSelectAction::DELETE_SELECTED) {
+                worldSelectScreen.deleteSelectedWorld();
+            }
+
+            // Check for ESC to go back
+            static bool worldSelectEscPressed = false;
+            if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+                if (!worldSelectEscPressed) {
+                    gameState = GameState::MAIN_MENU;
+                    worldSelectEscPressed = true;
+                }
+            } else {
+                worldSelectEscPressed = false;
+            }
+
+            // Render - ensure we're on the default framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+            // Render 3D panorama background
+            panoramaRenderer.render();
+
+            // Setup for 2D rendering (overlay on top of panorama)
+            menuUI.beginFrame();
+
+            // Render world select UI
+            worldSelectScreen.render();
+            menuUI.endFrame();
+
+            glfwSwapBuffers(window);
+            continue;
+        }
+
+        // ============================================================
+        // WORLD CREATE STATE
+        // ============================================================
+        if (gameState == GameState::WORLD_CREATE) {
+            // Get mouse position for menu
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            // Update panorama
+            panoramaRenderer.update(deltaTime);
+
+            // Update world create screen
+            worldCreateScreen.update(mx, my, mouseDown, deltaTime);
+
+            // Handle actions
+            WorldCreateAction action = worldCreateScreen.getAction();
+            if (action == WorldCreateAction::BACK) {
+                gameState = GameState::WORLD_SELECT;
+            }
+            else if (action == WorldCreateAction::CREATE_WORLD) {
+                worldSettings = worldCreateScreen.getSettings();
+
+                // Create world folder and save metadata
+                loadingExistingWorld = false;
+                worldSaveLoad.currentWorldPath = WorldSaveLoad::createWorldFolder(worldSettings.worldName);
+                worldSaveLoad.currentWorldName = worldSettings.worldName;
+                worldSaveLoad.hasLoadedWorld = true;
+
+                int newSeed = static_cast<int>(worldSettings.seedValue & 0x7FFFFFFF);
+                WorldSaveLoad::saveWorldMeta(worldSaveLoad.currentWorldPath, worldSettings.worldName,
+                                            newSeed, static_cast<int>(worldSettings.generationType),
+                                            worldSettings.maxYHeight);
+
+                startWorldGeneration();
+            }
+
+            // Check for ESC to go back
+            static bool escWasPressed = false;
+            if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+                if (!escWasPressed) {
+                    gameState = GameState::WORLD_SELECT;
+                    escWasPressed = true;
+                }
+            } else {
+                escWasPressed = false;
+            }
+
+            // Render - ensure we're on the default framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+            // Render 3D panorama background
+            panoramaRenderer.render();
+
+            // Setup for 2D rendering (overlay on top of panorama)
+            menuUI.beginFrame();
+
+            // Render world create UI
+            worldCreateScreen.render();
+            menuUI.endFrame();
+
+            glfwSwapBuffers(window);
+            continue;
+        }
 
         // ============================================================
         // LOADING STATE - Preload chunks before gameplay
@@ -4608,63 +4949,61 @@ int main() {
                 }
 
                 if (allMeshesBuilt) {
-                    // Find spawn point
-                    for (int y = 200; y > 0; y--) {
-                        if (isBlockSolid(world.getBlock(8, y, 8))) {
-                            spawnPos.y = static_cast<float>(y + 1);
-                            break;
+                    // Try to load player position from save, or find spawn point
+                    glm::vec3 loadedPos;
+                    float loadedYaw, loadedPitch;
+                    bool loadedFlying;
+
+                    if (loadingExistingWorld &&
+                        WorldSaveLoad::loadPlayer(worldSaveLoad.currentWorldPath,
+                                                 loadedPos, loadedYaw, loadedPitch, loadedFlying)) {
+                        player->position = loadedPos;
+                        player->isFlying = loadedFlying;
+                        camera.setOrientation(loadedYaw, loadedPitch);
+                        std::cout << "Loaded player position from save" << std::endl;
+                    } else {
+                        // Find spawn point for new worlds
+                        for (int y = 200; y > 0; y--) {
+                            if (isBlockSolid(world.getBlock(8, y, 8))) {
+                                spawnPos.y = static_cast<float>(y + 1);
+                                break;
+                            }
                         }
+                        player->position = spawnPos;
                     }
-                    player->position = spawnPos;
-                    camera.position = spawnPos + glm::vec3(0, Player::EYE_HEIGHT, 0);
+                    camera.position = player->position + glm::vec3(0, Player::EYE_HEIGHT, 0);
 
                     std::cout << "Loading complete! " << chunksLoaded << " chunks, " << meshesBuilt << " meshes" << std::endl;
-                    std::cout << "Player spawned at: " << spawnPos.x << ", " << spawnPos.y << ", " << spawnPos.z << std::endl;
+                    std::cout << "Player at: " << player->position.x << ", " << player->position.y << ", " << player->position.z << std::endl;
 
                     world.burstMode = false;  // Disable burst mode for smoother gameplay
                     glfwSwapInterval(g_config.vsync ? 1 : 0);  // Restore VSync setting
+                    loadingExistingWorld = false;  // Reset for next load
                     gameState = GameState::PLAYING;
                 }
             }
 
-            // Render loading screen
-            glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-            glUseProgram(loadingShaderProgram);
-            glBindVertexArray(loadingVAO);
-
-            // Draw background bar (dark gray)
-            float barWidth = 0.6f;
-            float barHeight = 0.05f;
-            float barY = -0.1f;
-            glUniform2f(loadingOffsetLoc, 0.0f, barY);
-            glUniform2f(loadingScaleLoc, barWidth, barHeight);
-            glUniform3f(loadingColorLoc, 0.2f, 0.2f, 0.25f);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
-
-            // Draw progress bar (green)
+            // Calculate progress
             float progress = chunkProgress;
+            std::string statusText = "Generating terrain...";
             if (chunksLoaded >= totalChunksToLoad) {
                 // During mesh building, estimate progress
                 int totalMeshes = static_cast<int>(world.chunks.size());
                 progress = 0.5f + 0.5f * (static_cast<float>(meshesBuilt) / static_cast<float>(std::max(1, totalMeshes)));
+                statusText = "Building meshes...";
             } else {
                 progress = 0.5f * chunkProgress;  // Chunk loading is 50% of total
+                statusText = "Generating terrain... (" + std::to_string(chunksLoaded) + "/" + std::to_string(totalChunksToLoad) + " chunks)";
             }
-            float progressWidth = barWidth * progress;
-            glUniform2f(loadingOffsetLoc, -barWidth + progressWidth, barY);
-            glUniform2f(loadingScaleLoc, progressWidth, barHeight * 0.8f);
-            glUniform3f(loadingColorLoc, 0.2f, 0.7f, 0.3f);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
 
-            // Draw title bar (light)
-            glUniform2f(loadingOffsetLoc, 0.0f, 0.15f);
-            glUniform2f(loadingScaleLoc, 0.4f, 0.08f);
-            glUniform3f(loadingColorLoc, 0.3f, 0.4f, 0.5f);
-            glDrawArrays(GL_TRIANGLES, 0, 6);
+            // Update and render 3D loading screen
+            loadingScreen3D.update(deltaTime);
+            loadingScreen3D.setProgress(progress, statusText);
 
-            glBindVertexArray(0);
+            // Render 3D scene with floating blocks
+            menuUI.beginFrame();
+            loadingScreen3D.render(&menuUI);
+            menuUI.endFrame();
 
             // Update window title with progress
             int progressPercent = static_cast<int>(progress * 100);
@@ -4673,6 +5012,140 @@ int main() {
 
             glfwSwapBuffers(window);
             continue;  // Skip the rest of the game loop during loading
+        }
+
+        // ============================================================
+        // PAUSED STATE - In-game pause menu with settings
+        // ============================================================
+        if (gameState == GameState::PAUSED) {
+            // Get mouse position for menu
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            // Handle ESC to unpause (when not in settings)
+            bool escPressed = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+            if (escPressed && !escWasPressedPlaying && !showSettings) {
+                gameState = GameState::PLAYING;
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                cursorEnabled = false;
+                firstMouse = true;  // Reset mouse to avoid camera jump
+            }
+            escWasPressedPlaying = escPressed;
+
+            if (showSettings) {
+                // Update and handle settings menu
+                settingsMenu.update(mx, my, mouseDown);
+                SettingsAction settingsAction = settingsMenu.getAction();
+
+                if (settingsAction == SettingsAction::BACK) {
+                    showSettings = false;
+                }
+                else if (settingsAction == SettingsAction::APPLY) {
+                    // Settings are saved to config, apply VSync immediately
+                    glfwSwapInterval(g_config.vsync ? 1 : 0);
+                    g_enableBatchedRendering = g_config.enableBatchedRendering;  // Apply batched rendering setting
+                }
+
+                // Handle ESC in settings to go back to pause menu
+                if (escPressed && !escWasPressedPlaying) {
+                    showSettings = false;
+                }
+            } else {
+                // Update pause menu
+                pauseMenu.update(mx, my, mouseDown, deltaTime);
+
+                // Handle pause menu actions
+                PauseAction pauseAction = pauseMenu.getAction();
+                if (pauseAction == PauseAction::RESUME) {
+                    gameState = GameState::PLAYING;
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    cursorEnabled = false;
+                    firstMouse = true;
+                }
+                else if (pauseAction == PauseAction::SETTINGS) {
+                    showSettings = true;
+                    settingsMenu.refreshFromConfig();
+                }
+                else if (pauseAction == PauseAction::SAVE_GAME) {
+                    // Save all modified chunks
+                    if (worldSaveLoad.hasLoadedWorld) {
+                        int savedChunks = WorldSaveLoad::saveAllChunks(worldSaveLoad.currentWorldPath, world);
+
+                        // Save player position
+                        if (player) {
+                            WorldSaveLoad::savePlayer(worldSaveLoad.currentWorldPath,
+                                                     player->position,
+                                                     camera.yaw, camera.pitch,
+                                                     player->isFlying);
+                        }
+
+                        // Thumbnail is already captured when ESC was pressed (before pause overlay)
+
+                        WorldSaveLoad::updateLastPlayed(worldSaveLoad.currentWorldPath);
+                        pauseMenu.showSaveMessage("Saved " + std::to_string(savedChunks) + " chunks!", 3.0f);
+                    } else {
+                        pauseMenu.showSaveMessage("No world loaded!", 3.0f);
+                    }
+                }
+                else if (pauseAction == PauseAction::QUIT_TO_MENU) {
+                    // Save before quitting
+                    if (worldSaveLoad.hasLoadedWorld) {
+                        WorldSaveLoad::saveAllChunks(worldSaveLoad.currentWorldPath, world);
+                        if (player) {
+                            WorldSaveLoad::savePlayer(worldSaveLoad.currentWorldPath,
+                                                     player->position,
+                                                     camera.yaw, camera.pitch,
+                                                     player->isFlying);
+                        }
+                        WorldSaveLoad::updateLastPlayed(worldSaveLoad.currentWorldPath);
+                    }
+
+                    // Reset for returning to menu
+                    worldSaveLoad.hasLoadedWorld = false;
+                    worldSaveLoad.currentWorldPath = "";
+                    worldSaveLoad.currentWorldName = "";
+
+                    gameState = GameState::MAIN_MENU;
+                    showSettings = false;
+                }
+            }
+
+            // Render pause menu overlay
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+            // Don't clear - render over the game frame
+
+            menuUI.beginFrame();
+            if (showSettings) {
+                settingsMenu.render();
+            } else {
+                pauseMenu.render();
+            }
+            menuUI.endFrame();
+
+            glfwSwapBuffers(window);
+            continue;
+        }
+
+        // ============================================================
+        // PLAYING STATE - Handle ESC to pause
+        // ============================================================
+        {
+            bool escPressed = glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS;
+            if (escPressed && !escWasPressedPlaying) {
+                // Capture thumbnail NOW before showing pause menu
+                // The game world is currently rendered on screen
+                if (worldSaveLoad.hasLoadedWorld) {
+                    std::string thumbnailPath = worldSaveLoad.currentWorldPath + "/thumbnail.png";
+                    Screenshot::captureThumbnail(thumbnailPath, WINDOW_WIDTH, WINDOW_HEIGHT, 160, 90);
+                }
+
+                gameState = GameState::PAUSED;
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                cursorEnabled = true;
+            }
+            escWasPressedPlaying = escPressed;
         }
 
         // Reset window title when playing
@@ -4878,6 +5351,7 @@ int main() {
         // FPS counter with chunk stats and time
         frameCount++;
         if (currentFrame - lastFPSTime >= 1.0) {
+            currentFPS = static_cast<float>(frameCount);
             std::string mode = player->isFlying ? "Flying" :
                                player->isInWater ? "Swimming" : "Survival";
             int hour = static_cast<int>(timeOfDay * 24.0f) % 24;
@@ -4897,9 +5371,65 @@ int main() {
         // Process input and update player physics (timed)
         auto inputStart = std::chrono::high_resolution_clock::now();
         InputState input = processInput(window);
-        player->update(deltaTime, world,
-                       input.forward, input.backward, input.left, input.right,
-                       input.jump, input.descend, input.sprint);
+
+        // Benchmark mode - override camera control
+        if (g_benchmarkMode && g_benchmark.isRunning) {
+            glm::vec3 benchPos, benchLookAt;
+            bool continueRunning = g_benchmark.updateCamera(deltaTime, benchPos, benchLookAt);
+
+            if (continueRunning) {
+                // Override camera position
+                camera.position = benchPos;
+                glm::vec3 dir = glm::normalize(benchLookAt - benchPos);
+
+                // Calculate yaw and pitch from direction
+                float yaw = glm::degrees(atan2(dir.z, dir.x)) - 90.0f;
+                float pitch = glm::degrees(asin(dir.y));
+                camera.setOrientation(yaw, pitch);
+
+                player->position = benchPos;
+
+                // Apply scenario settings
+                auto* scenario = g_benchmark.getCurrentScenario();
+                if (scenario) {
+                    g_enableSSAO = scenario->enableSSAO;
+                    g_config.enableShadows = scenario->enableShadows;
+                    g_config.enableClouds = scenario->enableClouds;
+                }
+
+                // Record frame time
+                g_benchmark.recordFrame(deltaTime * 1000.0);
+            } else {
+                // Current benchmark pass complete
+                if (g_benchmark.renderMode == "Deferred") {
+                    // Save deferred results
+                    g_benchmark.saveResults("benchmark_deferred.txt");
+
+                    // Now run forward benchmark
+                    g_benchmark.init();
+                    g_useDeferredRendering = false;
+                    g_benchmark.startBenchmark("Forward");
+                    std::cout << "\nNow running Forward rendering benchmark..." << std::endl;
+                } else {
+                    // Forward complete - save and finish
+                    g_benchmark.saveResults("benchmark_forward.txt");
+                    g_benchmarkMode = false;
+                    g_useDeferredRendering = true;  // Restore to deferred
+
+                    std::cout << "\n========================================" << std::endl;
+                    std::cout << "BENCHMARK COMPLETE!" << std::endl;
+                    std::cout << "Results saved to:" << std::endl;
+                    std::cout << "  - benchmark_deferred.txt" << std::endl;
+                    std::cout << "  - benchmark_forward.txt" << std::endl;
+                    std::cout << "========================================\n" << std::endl;
+                }
+            }
+        } else {
+            // Normal player update
+            player->update(deltaTime, world,
+                           input.forward, input.backward, input.left, input.right,
+                           input.jump, input.descend, input.sprint);
+        }
 
         // Raycast to find target block
         currentTarget = Raycast::cast(
@@ -5010,7 +5540,9 @@ int main() {
             glUniform3fv(skySkyTopLoc, 1, glm::value_ptr(skyColor));
             glUniform3fv(skySkyBottomLoc, 1, glm::value_ptr(glm::mix(skyColor, glm::vec3(0.9f, 0.85f, 0.8f), 0.3f)));
             glUniform1f(skyTimeLoc, static_cast<float>(glfwGetTime()));
-            glUniform1i(skyCloudStyleLoc, cloudStyle);
+            // Cloud style: -1 = disabled, 0 = simple, 1 = volumetric
+            int cloudStyleValue = g_config.enableClouds ? static_cast<int>(g_config.cloudStyle) : -1;
+            glUniform1i(skyCloudStyleLoc, cloudStyleValue);
             glUniform1f(skyCloudRenderDistLoc, static_cast<float>(world.renderDistance));
 
             glBindVertexArray(skyVAO);
@@ -5045,7 +5577,7 @@ int main() {
             // Render cascade shadow maps (only cascades that need updating)
             glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries[currentTimerFrame][TIMER_SHADOW]);
 
-            glViewport(0, 0, CASCADE_RESOLUTION, CASCADE_RESOLUTION);
+            glViewport(0, 0, g_shadowResolution, g_shadowResolution);
             glBindFramebuffer(GL_FRAMEBUFFER, cascadeShadowFBO);
             glCullFace(GL_FRONT);
 
@@ -5661,6 +6193,7 @@ int main() {
         // Based on render distance: LOD kicks in at 40% of render distance in blocks
         float waterLodDist = static_cast<float>(world.renderDistance * CHUNK_SIZE_X) * 0.4f;
         glUniform1f(waterLodDistanceLoc, waterLodDist);
+        glUniform1f(waterAnimationEnabledLoc, g_config.enableWaterAnimation ? 1.0f : 0.0f);
 
         // Render water with depth writing disabled (prevents water from occluding objects behind it)
         world.renderWater(camera.position, waterChunkOffsetLoc);
@@ -5729,6 +6262,45 @@ int main() {
 
         // Render crosshair
         crosshair.render();
+
+        // Render debug overlay (F3)
+        if (debugOverlay.visible) {
+            debugOverlay.update(camera, player, world, currentFPS, deltaTime, timeOfDay);
+            debugOverlay.setRenderStats(
+                g_perfStats.chunksRendered,
+                g_perfStats.subChunksRendered,
+                world.meshes.size() * sizeof(ChunkMesh) * 16  // Rough estimate
+            );
+            menuUI.beginFrame();
+            debugOverlay.render();
+            menuUI.endFrame();
+        }
+
+        // Render benchmark overlay if running
+        if (g_benchmarkMode && g_benchmark.isRunning) {
+            menuUI.beginFrame();
+            // Background bar
+            glm::vec4 bgColor(0.0f, 0.0f, 0.0f, 0.7f);
+            menuUI.drawRect(10, 10, 400, 60, bgColor);
+
+            // Title
+            glm::vec4 titleColor(0.2f, 1.0f, 0.3f, 1.0f);
+            menuUI.drawText("BENCHMARK RUNNING", 20, 20, titleColor, 1.2f);
+
+            // Status
+            glm::vec4 textColor(1.0f, 1.0f, 1.0f, 1.0f);
+            std::string status = g_benchmark.getStatusText();
+            menuUI.drawText(status, 20, 45, textColor, 0.9f);
+
+            // Progress bar
+            float progress = g_benchmark.getProgress() / 100.0f;
+            glm::vec4 barBg(0.3f, 0.3f, 0.3f, 1.0f);
+            glm::vec4 barFg(0.2f, 0.8f, 0.2f, 1.0f);
+            menuUI.drawRect(220, 18, 180, 16, barBg);
+            menuUI.drawRect(222, 20, 176 * progress, 12, barFg);
+
+            menuUI.endFrame();
+        }
 
         glEndQuery(GL_TIME_ELAPSED);
 
@@ -5843,6 +6415,13 @@ int main() {
     // Shutdown vertex pool
     if (g_useVertexPool) {
         VertexPool::getInstance().shutdown();
+    }
+
+    // Cleanup menu system
+    if (menuInitialized) {
+        menuUI.cleanup();
+        panoramaRenderer.cleanup();
+        loadingScreen3D.cleanup();
     }
 
     glfwDestroyWindow(window);

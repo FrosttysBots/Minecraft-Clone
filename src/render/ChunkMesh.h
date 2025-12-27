@@ -237,6 +237,10 @@ struct SubChunkMesh {
     MeshletData meshletData;
     GLuint vertexSSBO = 0;  // SSBO for vertex data (mesh shaders read from SSBO, not VBO)
 
+    // Cached vertex data for deferred meshlet generation (used during burst mode)
+    std::vector<PackedChunkVertex> cachedVerticesForMeshlets;
+    bool needsMeshletGeneration = false;  // Flag for deferred meshlet generation
+
     int subChunkY = 0;     // Y index (0-15)
     bool isEmpty = true;   // Skip rendering if no geometry
     bool hasWater = false; // Quick check for water rendering pass

@@ -44,6 +44,9 @@ public:
     // Mesh needs rebuilding?
     bool isDirty = true;
 
+    // Has been modified by player (needs saving)?
+    bool isModified = false;
+
     // Has pending water updates?
     bool hasWaterUpdates = false;
 

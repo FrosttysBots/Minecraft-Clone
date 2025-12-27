@@ -11,6 +11,7 @@
 #include <thread>
 #include <iostream>
 #include <array>
+#include <chrono>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -250,11 +251,18 @@ public:
     // Unload distance (chunks beyond this are removed)
     int unloadDistance = 12;
 
-    // Max chunks to generate per frame (high default for better utilization)
-    int maxChunksPerFrame = 128;
+    // Max chunks to generate per frame (reasonable default)
+    int maxChunksPerFrame = 8;
 
-    // Max meshes to build per frame (high default for better utilization)
-    int maxMeshesPerFrame = 64;
+    // Max meshes to build per frame (reasonable default)
+    int maxMeshesPerFrame = 8;
+
+    // OPTIMIZATION: Frame time budget system
+    // Limits chunk/mesh processing based on available frame time
+    float frameTimeBudgetMs = 4.0f;  // Max ms to spend on chunk loading per frame
+    float lastChunkProcessTimeMs = 0.0f;  // Track actual time spent
+    float lastMeshProcessTimeMs = 0.0f;
+    bool useFrameTimeBudget = true;  // Enable adaptive throttling
 
     // World seed
     int seed = 12345;
@@ -430,8 +438,9 @@ public:
 
         chunk->setBlock(localX, y, localZ, type);
 
-        // Mark this chunk dirty
+        // Mark this chunk dirty and modified (needs saving)
         chunk->isDirty = true;
+        chunk->isModified = true;
 
         // Mark neighboring chunks as dirty if on edge
         if (localX == 0) markChunkDirty(glm::ivec2(chunkPos.x - 1, chunkPos.y));
@@ -463,6 +472,34 @@ public:
     void setSeed(int newSeed) {
         seed = newSeed;
         terrainGenerator.setSeed(newSeed);
+    }
+
+    // Reset world for new generation (clears all chunks and meshes)
+    void reset() {
+        // Stop any pending chunk generation
+        if (chunkThreadPool) {
+            chunkThreadPool->clearPendingChunks();
+        }
+
+        // Clear all meshes first (they reference chunks)
+        for (auto& [pos, mesh] : meshes) {
+            if (mesh) {
+                mesh->destroy();
+            }
+        }
+        meshes.clear();
+
+        // Clear all chunks
+        chunks.clear();
+
+        // Reset stats
+        lastRenderedChunks = 0;
+        lastCulledChunks = 0;
+        lastHiZCulledChunks = 0;
+        lastRenderedSubChunks = 0;
+        lastCulledSubChunks = 0;
+        lastRenderedWaterSubChunks = 0;
+        lastCulledWaterSubChunks = 0;
     }
 
     // Water simulation timer
@@ -690,20 +727,21 @@ public:
         while (it != meshes.end() && processed < maxPerFrame) {
             ChunkMesh* mesh = it->second.get();
 
-            // Find sub-chunks that need meshlet generation
+            // Find sub-chunks that need meshlet generation from cached data
             for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN && processed < maxPerFrame; ++subY) {
                 auto& subChunk = mesh->subChunks[subY];
 
-                // Skip if already has meshlets or is empty
-                if (subChunk.isEmpty || subChunk.meshletData.hasMeshlets()) continue;
+                // Check if this sub-chunk needs deferred meshlet generation
+                if (subChunk.needsMeshletGeneration && !subChunk.cachedVerticesForMeshlets.empty()) {
+                    // Generate meshlets from cached vertex data
+                    mesh->generateMeshlets(subY, subChunk.cachedVerticesForMeshlets);
 
-                // Get vertex data from existing VBO (need to read back or cache)
-                // For now, mark as needing rebuild by dirtying the chunk
-                auto chunkIt = chunks.find(it->first);
-                if (chunkIt != chunks.end()) {
-                    chunkIt->second->isDirty = true;
+                    // Clear cached data to free memory
+                    subChunk.cachedVerticesForMeshlets.clear();
+                    subChunk.cachedVerticesForMeshlets.shrink_to_fit();
+                    subChunk.needsMeshletGeneration = false;
+                    processed++;
                 }
-                processed++;
             }
 
             ++it;
@@ -803,12 +841,26 @@ public:
     void processCompletedChunks() {
         if (!chunkThreadPool) return;
 
-        // In burst mode, process all available chunks without throttling
-        // OPTIMIZATION: Reduced multiplier from 2 to 1 for smoother frame pacing
-        int maxToProcess = burstMode ? 10000 : maxChunksPerFrame;
+        auto startTime = std::chrono::high_resolution_clock::now();
+
+        // OPTIMIZATION: Dynamic throttling based on frame time budget
+        // During burst mode, limit to prevent frame spikes
+        // Otherwise, process up to maxChunksPerFrame or until budget exhausted
+        int maxToProcess = burstMode ? 32 : maxChunksPerFrame;  // Reduced burst from 10000 to 32
+        int processed = 0;
+
         auto completed = chunkThreadPool->getCompletedChunks(maxToProcess);
 
         for (auto& result : completed) {
+            // Check frame time budget (skip in burst mode for faster initial load)
+            if (!burstMode && useFrameTimeBudget && processed > 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                float elapsedMs = std::chrono::duration<float, std::milli>(now - startTime).count();
+                if (elapsedMs > frameTimeBudgetMs * 0.5f) {
+                    break;  // Leave remaining chunks for next frame
+                }
+            }
+
             // Only add if not already present (could have been unloaded while generating)
             if (getChunk(result.position) == nullptr) {
                 chunks[result.position] = std::move(result.chunk);
@@ -820,13 +872,18 @@ public:
                 markChunkDirty(glm::ivec2(result.position.x, result.position.y - 1));
                 markChunkDirty(glm::ivec2(result.position.x, result.position.y + 1));
             }
+            processed++;
         }
+
+        auto endTime = std::chrono::high_resolution_clock::now();
+        lastChunkProcessTimeMs = std::chrono::duration<float, std::milli>(endTime - startTime).count();
     }
 
     // Load chunks around player position
     void loadChunksAroundPlayer(const glm::ivec2& playerChunk) {
         int chunksQueued = 0;
-        int maxToQueue = burstMode ? 10000 : maxChunksPerFrame * 2;
+        // OPTIMIZATION: Limit queue size to prevent overwhelming the thread pool
+        int maxToQueue = burstMode ? 64 : maxChunksPerFrame * 2;  // Reduced burst from 10000
 
         // Predictive chunk streaming: prioritize chunks in movement direction
         if (usePredictiveLoading && !burstMode && glm::length(playerVelocity) > 0.5f) {
@@ -963,8 +1020,8 @@ public:
             [](const auto& a, const auto& b) { return a.first < b.first; });
 
         // Queue meshes for async generation
-        // OPTIMIZATION: Reduced multiplier from 4 to 2 for smoother frame pacing
-        int maxToQueue = burstMode ? 10000 : maxMeshesPerFrame * 2;
+        // OPTIMIZATION: Limit queue size to prevent frame spikes
+        int maxToQueue = burstMode ? 64 : maxMeshesPerFrame * 2;  // Reduced burst from 10000
         for (auto& [distSq, pos] : dirtyChunks) {
             if (meshesQueued >= maxToQueue) break;  // Queue more since it's async
 
@@ -1011,13 +1068,24 @@ public:
     void processCompletedMeshes() {
         if (!chunkThreadPool) return;
 
-        // In burst mode, upload all available meshes without throttling
-        // OPTIMIZATION: Reduced multiplier from 2 to 1 for smoother frame pacing
-        // This spreads mesh uploads over more frames, reducing CPU spikes
-        int maxToProcess = burstMode ? 10000 : maxMeshesPerFrame;
+        auto startTime = std::chrono::high_resolution_clock::now();
+
+        // OPTIMIZATION: Limit mesh uploads to prevent GPU stalls
+        // GPU uploads are slow and can cause frame spikes
+        int maxToProcess = burstMode ? 16 : maxMeshesPerFrame;  // Reduced burst from 10000
         auto completedMeshes = chunkThreadPool->getCompletedMeshes(maxToProcess);
+        int processed = 0;
 
         for (auto& meshResult : completedMeshes) {
+            // OPTIMIZATION: Check frame time budget to prevent stalls
+            if (!burstMode && useFrameTimeBudget && processed > 0) {
+                auto now = std::chrono::high_resolution_clock::now();
+                float elapsedMs = std::chrono::duration<float, std::milli>(now - startTime).count();
+                if (elapsedMs > frameTimeBudgetMs * 0.5f) {
+                    break;  // Leave remaining meshes for next frame
+                }
+            }
+
             glm::ivec2 pos = meshResult.position;
 
             // Skip if chunk was unloaded while mesh was generating
@@ -1056,16 +1124,23 @@ public:
 
                 // Generate meshlets for mesh shader rendering (if enabled)
                 // Must be done on main thread (OpenGL calls)
-                // Skip during burst mode for faster initial loading
                 // Use combined vertices from face buckets for meshlet generation
-                if (g_generateMeshlets && !burstMode && hasLOD0Data) {
+                if (g_generateMeshlets && hasLOD0Data) {
                     // Combine face buckets into a single vertex array for meshlet generation
                     std::vector<PackedChunkVertex> combinedVertices;
                     combinedVertices.reserve(subData.getLOD0VertexCount());
                     for (const auto& bucket : subData.faceBucketVertices) {
                         combinedVertices.insert(combinedVertices.end(), bucket.begin(), bucket.end());
                     }
-                    mesh->generateMeshlets(subY, combinedVertices);
+
+                    if (burstMode) {
+                        // During burst mode, cache vertices for later meshlet generation
+                        subChunk.cachedVerticesForMeshlets = std::move(combinedVertices);
+                        subChunk.needsMeshletGeneration = true;
+                    } else {
+                        // Normal mode: generate meshlets immediately
+                        mesh->generateMeshlets(subY, combinedVertices);
+                    }
                 }
 
                 // Upload pre-generated water vertices (generated on worker thread)
@@ -1074,7 +1149,11 @@ public:
                     mesh->uploadWaterToSubChunk(subY, subData.waterVertices);
                 }
             }
+            processed++;
         }
+
+        auto endTime = std::chrono::high_resolution_clock::now();
+        lastMeshProcessTimeMs = std::chrono::duration<float, std::milli>(endTime - startTime).count();
     }
 
     // Legacy function for compatibility

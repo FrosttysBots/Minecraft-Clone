@@ -112,6 +112,13 @@ public:
         movementSpeed = sprinting ? 10.0f : 5.0f;
     }
 
+    // Set camera orientation (for loading saved games)
+    void setOrientation(float newYaw, float newPitch) {
+        yaw = newYaw;
+        pitch = newPitch;
+        updateCameraVectors();
+    }
+
 private:
     // Recalculate camera vectors from euler angles
     void updateCameraVectors() {

@@ -218,6 +218,64 @@ public:
         return pendingQueue.size();
     }
 
+    // Update world seed for all generators (call before starting new world)
+    void setSeed(int newSeed) {
+        worldSeed = newSeed;
+        for (auto& gen : generators) {
+            gen->setSeed(newSeed);
+        }
+    }
+
+    // Update max height for all generators
+    void setMaxHeight(int maxHeight) {
+        for (auto& gen : generators) {
+            gen->maxHeight = maxHeight;
+        }
+    }
+
+    // Clear all pending chunks and meshes (for world reset)
+    void clearPendingChunks() {
+        // Clear pending chunk queue
+        {
+            std::lock_guard<std::mutex> lock(pendingMutex);
+            std::queue<glm::ivec2> empty;
+            std::swap(pendingQueue, empty);
+        }
+
+        // Clear in-progress set for chunks
+        {
+            std::lock_guard<std::mutex> lock(inProgressMutex);
+            inProgress.clear();
+        }
+
+        // Clear completed chunks
+        {
+            std::lock_guard<std::mutex> lock(completedMutex);
+            std::queue<ChunkResult> empty;
+            std::swap(completedQueue, empty);
+        }
+
+        // Clear pending mesh queue
+        {
+            std::lock_guard<std::mutex> lock(meshPendingMutex);
+            std::queue<MeshRequest> empty;
+            std::swap(meshPendingQueue, empty);
+        }
+
+        // Clear in-progress set for meshes
+        {
+            std::lock_guard<std::mutex> lock(meshInProgressMutex);
+            meshInProgress.clear();
+        }
+
+        // Clear completed meshes
+        {
+            std::lock_guard<std::mutex> lock(meshCompletedMutex);
+            std::queue<MeshResult> empty;
+            std::swap(meshCompletedQueue, empty);
+        }
+    }
+
     // Get number of completed chunks waiting
     size_t getCompletedCount() {
         std::lock_guard<std::mutex> lock(completedMutex);

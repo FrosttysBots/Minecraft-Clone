@@ -77,23 +77,35 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     opengl32
 )
 
-# Launcher executable (Windows only)
+# OpenGL Launcher executable (Windows only)
 if(WIN32)
     add_executable(VoxelLauncher WIN32
-        src/launcher/Launcher.cpp
+        src/launcher/GLLauncher.cpp
+        ${GLAD_DIR}/src/gl.c
     )
 
     target_include_directories(VoxelLauncher PRIVATE
         ${CMAKE_SOURCE_DIR}/src
+        ${GLAD_DIR}/include
+        ${stb_SOURCE_DIR}
     )
 
     target_link_libraries(VoxelLauncher PRIVATE
-        comctl32
+        glfw
+        glm::glm
+        opengl32
     )
 
     # Put launcher in same directory as game
     set_target_properties(VoxelLauncher PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+
+    # Copy assets for launcher too
+    add_custom_command(TARGET VoxelLauncher POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+        ${CMAKE_SOURCE_DIR}/assets
+        $<TARGET_FILE_DIR:VoxelLauncher>/assets
     )
 endif()
 

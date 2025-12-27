@@ -1,0 +1,181 @@
+================================================================================
+VOXEL ENGINE BENCHMARK RESULTS
+================================================================================
+Date: Sat Dec 27 08:56:42 2025
+Rendering Mode: Deferred
+Total Tests: 7
+================================================================================
+
+SUMMARY
+--------------------------------------------------------------------------------
+Test Name                   Avg FPS      1% Low    0.1% Low     CPU %    RAM MB   VRAM MB
+--------------------------------------------------------------------------------
+Chunk_Generation               64.8        11.6         8.7      74.3      1746       902
+Water_Rendering                58.8         7.5         6.5      35.8      2063       914
+Shadow_Lighting                58.4        10.8         9.9      16.4      2290      1113
+SSAO_AmbientOcclusion          64.0        12.9        11.2       8.6      2435      1202
+Cloud_Rendering                59.9         9.0         7.3       9.1      2496      1238
+Full_Scene_Stress              45.4        11.3        10.6      20.6      2513      1252
+Full_Scene_Stress              45.4        11.3        10.6      20.6      2513      1252
+--------------------------------------------------------------------------------
+
+================================================================================
+TEST: Chunk_Generation
+================================================================================
+Description: Flying through terrain to stress chunk generation and meshing
+
+FRAME TIMING
+  Duration:        25.66 seconds
+  Total Frames:    1662
+  Average FPS:     64.8
+  1% Low FPS:      11.6
+  0.1% Low FPS:    8.7
+  Avg Frame Time:  15.43 ms
+  Min Frame Time:  2.32 ms
+  Max Frame Time:  114.98 ms
+
+RESOURCE USAGE
+  Avg CPU:         74.3%
+  Avg RAM:         1746 MB
+  Peak RAM:        2162 MB
+  Avg VRAM:        902 MB
+  Peak VRAM:       1176 MB
+
+================================================================================
+TEST: Water_Rendering
+================================================================================
+Description: Testing water shader performance with reflections and animations
+
+FRAME TIMING
+  Duration:        14.27 seconds
+  Total Frames:    839
+  Average FPS:     58.8
+  1% Low FPS:      7.5
+  0.1% Low FPS:    6.5
+  Avg Frame Time:  17.02 ms
+  Min Frame Time:  4.48 ms
+  Max Frame Time:  153.92 ms
+
+RESOURCE USAGE
+  Avg CPU:         35.8%
+  Avg RAM:         2063 MB
+  Peak RAM:        3094 MB
+  Avg VRAM:        914 MB
+  Peak VRAM:       1008 MB
+
+================================================================================
+TEST: Shadow_Lighting
+================================================================================
+Description: Testing shadow mapping and lighting calculations
+
+FRAME TIMING
+  Duration:        17.38 seconds
+  Total Frames:    1016
+  Average FPS:     58.4
+  1% Low FPS:      10.8
+  0.1% Low FPS:    9.9
+  Avg Frame Time:  17.12 ms
+  Min Frame Time:  3.80 ms
+  Max Frame Time:  100.82 ms
+
+RESOURCE USAGE
+  Avg CPU:         16.4%
+  Avg RAM:         2290 MB
+  Peak RAM:        2379 MB
+  Avg VRAM:        1113 MB
+  Peak VRAM:       1172 MB
+
+================================================================================
+TEST: SSAO_AmbientOcclusion
+================================================================================
+Description: Testing Screen Space Ambient Occlusion performance
+
+FRAME TIMING
+  Duration:        15.80 seconds
+  Total Frames:    1011
+  Average FPS:     64.0
+  1% Low FPS:      12.9
+  0.1% Low FPS:    11.2
+  Avg Frame Time:  15.62 ms
+  Min Frame Time:  3.92 ms
+  Max Frame Time:  89.13 ms
+
+RESOURCE USAGE
+  Avg CPU:         8.6%
+  Avg RAM:         2435 MB
+  Peak RAM:        2472 MB
+  Avg VRAM:        1202 MB
+  Peak VRAM:       1224 MB
+
+================================================================================
+TEST: Cloud_Rendering
+================================================================================
+Description: Testing cloud shader performance
+
+FRAME TIMING
+  Duration:        16.85 seconds
+  Total Frames:    1007
+  Average FPS:     59.9
+  1% Low FPS:      9.0
+  0.1% Low FPS:    7.3
+  Avg Frame Time:  16.69 ms
+  Min Frame Time:  3.98 ms
+  Max Frame Time:  136.18 ms
+
+RESOURCE USAGE
+  Avg CPU:         9.1%
+  Avg RAM:         2496 MB
+  Peak RAM:        2503 MB
+  Avg VRAM:        1238 MB
+  Peak VRAM:       1246 MB
+
+================================================================================
+TEST: Full_Scene_Stress
+================================================================================
+Description: Maximum load with all features enabled
+
+FRAME TIMING
+  Duration:        18.11 seconds
+  Total Frames:    822
+  Average FPS:     45.4
+  1% Low FPS:      11.3
+  0.1% Low FPS:    10.6
+  Avg Frame Time:  22.05 ms
+  Min Frame Time:  6.59 ms
+  Max Frame Time:  94.39 ms
+
+RESOURCE USAGE
+  Avg CPU:         20.6%
+  Avg RAM:         2513 MB
+  Peak RAM:        2517 MB
+  Avg VRAM:        1252 MB
+  Peak VRAM:       1254 MB
+
+================================================================================
+TEST: Full_Scene_Stress
+================================================================================
+Description: Maximum load with all features enabled
+
+FRAME TIMING
+  Duration:        18.11 seconds
+  Total Frames:    822
+  Average FPS:     45.4
+  1% Low FPS:      11.3
+  0.1% Low FPS:    10.6
+  Avg Frame Time:  22.05 ms
+  Min Frame Time:  6.59 ms
+  Max Frame Time:  94.39 ms
+
+RESOURCE USAGE
+  Avg CPU:         20.6%
+  Avg RAM:         2513 MB
+  Peak RAM:        2517 MB
+  Avg VRAM:        1252 MB
+  Peak VRAM:       1254 MB
+
+================================================================================
+OVERALL STATISTICS
+================================================================================
+Average FPS (all tests):     56.7
+Average 1% Low (all tests):  10.6
+================================================================================

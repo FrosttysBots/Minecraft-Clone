@@ -41,6 +41,65 @@ enum class UpscaleMode {
     ULTRA_PERF = 4    // 3.0x - 33% render scale (FSR Ultra Performance)
 };
 
+// Anti-Aliasing modes
+enum class AntiAliasMode {
+    NONE = 0,         // No anti-aliasing
+    FXAA = 1,         // Fast approximate AA (post-process)
+    MSAA_2X = 2,      // 2x Multisample AA
+    MSAA_4X = 3,      // 4x Multisample AA
+    MSAA_8X = 4,      // 8x Multisample AA
+    TAA = 5           // Temporal AA
+};
+
+// Texture quality levels
+enum class TextureQuality {
+    LOW = 0,          // 1/4 resolution
+    MEDIUM = 1,       // 1/2 resolution
+    HIGH = 2,         // Full resolution
+    ULTRA = 3         // Full resolution + high-quality filtering
+};
+
+// Graphics preset levels
+enum class GraphicsPreset {
+    LOW = 0,
+    MEDIUM = 1,
+    HIGH = 2,
+    ULTRA = 3,
+    CUSTOM = 4        // User-customized settings
+};
+
+// Ambient Occlusion quality
+enum class AOQuality {
+    OFF = 0,
+    LOW = 1,          // 8 samples
+    MEDIUM = 2,       // 16 samples
+    HIGH = 3,         // 32 samples
+    ULTRA = 4         // 64 samples
+};
+
+// Shadow quality levels
+enum class ShadowQuality {
+    OFF = 0,
+    LOW = 1,          // 512 resolution, 1 cascade
+    MEDIUM = 2,       // 1024 resolution, 2 cascades
+    HIGH = 3,         // 2048 resolution, 3 cascades
+    ULTRA = 4         // 4096 resolution, 4 cascades
+};
+
+// Cloud quality levels (affects render steps)
+enum class CloudQuality {
+    VERY_LOW = 0,     // 4 steps
+    LOW = 1,          // 8 steps
+    MEDIUM = 2,       // 12 steps
+    HIGH = 3          // 16 steps
+};
+
+// Cloud rendering style
+enum class CloudStyle {
+    SIMPLE = 0,       // Simple 3D puffy clouds
+    VOLUMETRIC = 1    // Full volumetric ray-marched clouds [Experimental]
+};
+
 struct HardwareInfo {
     // GPU Info
     std::string gpuName = "Unknown";
@@ -342,9 +401,9 @@ struct GameConfig {
     bool fullscreen = false;
     bool vsync = true;
     int fov = 70;
-    int renderDistance = 24;
-    int maxChunksPerFrame = 128;   // Increased for better hardware utilization
-    int maxMeshesPerFrame = 64;    // Increased for better hardware utilization
+    int renderDistance = 16;
+    int maxChunksPerFrame = 8;     // Reasonable default for new players
+    int maxMeshesPerFrame = 8;     // Reasonable default for new players
     float fogDensity = 0.00015f;
 
     // Performance
@@ -354,20 +413,57 @@ struct GameConfig {
     int meshThreads = 0;                // 0 = auto-detect based on CPU
     bool autoTuneOnStartup = true;      // Auto-configure settings on first run
 
+    // Graphics Preset
+    GraphicsPreset graphicsPreset = GraphicsPreset::HIGH;
+
+    // Anti-Aliasing
+    AntiAliasMode antiAliasing = AntiAliasMode::FXAA;
+
+    // Texture Quality
+    TextureQuality textureQuality = TextureQuality::HIGH;
+    int anisotropicFiltering = 8;       // 1, 2, 4, 8, or 16
+
     // Quality Settings
     bool enableSSAO = true;             // Screen-space ambient occlusion
-    int ssaoSamples = 32;               // SSAO kernel size (16, 32, 64)
+    int ssaoSamples = 16;               // SSAO kernel size (8, 16, 32) - reduced default from 32
     float ssaoRadius = 1.5f;            // SSAO sample radius
     float ssaoBias = 0.03f;             // SSAO depth bias
+    float ssaoScale = 0.5f;             // SSAO resolution scale (0.5 = half-res, 1.0 = full)
+    AOQuality aoQuality = AOQuality::MEDIUM;
 
     bool enableShadows = true;          // Shadow mapping
     int shadowResolution = 2048;        // Shadow map resolution per cascade
     int shadowCascades = 3;             // Number of shadow cascades (1-4)
+    ShadowQuality shadowQuality = ShadowQuality::HIGH;
 
     bool enableHiZCulling = true;       // Hi-Z occlusion culling
     bool enableDeferredRendering = true; // Use deferred rendering pipeline
 
     bool showPerformanceStats = true;   // Show FPS and timing overlay
+
+    // Post-Processing Effects
+    bool enableBloom = true;            // Bloom/glow effect
+    float bloomIntensity = 0.5f;        // Bloom strength (0.0 - 2.0)
+    float bloomThreshold = 1.0f;        // Brightness threshold for bloom
+
+    bool enableMotionBlur = false;      // Motion blur effect
+    float motionBlurStrength = 0.5f;    // Motion blur intensity (0.0 - 1.0)
+
+    // Cloud settings
+    bool enableClouds = true;           // Enable cloud rendering
+    CloudStyle cloudStyle = CloudStyle::SIMPLE;  // Simple or Volumetric clouds
+    CloudQuality cloudQuality = CloudQuality::MEDIUM;  // Cloud render quality
+
+    bool enableWaterAnimation = true;   // Water surface animation (disable for performance)
+    bool enableBatchedRendering = true; // Sodium-style batched indirect rendering
+
+    bool enableVignette = true;         // Screen edge darkening
+    float vignetteIntensity = 0.3f;     // Vignette strength
+
+    bool enableColorGrading = true;     // Color correction
+    float gamma = 2.2f;                 // Display gamma
+    float exposure = 1.0f;              // Exposure adjustment
+    float saturation = 1.0f;            // Color saturation
 
     // FSR / Upscaling
     UpscaleMode upscaleMode = UpscaleMode::NATIVE;  // FSR upscaling preset
@@ -377,77 +473,218 @@ struct GameConfig {
     // Gameplay
     float mouseSensitivity = 0.1f;
     bool invertY = false;
-    float dayLength = 120.0f;  // Day cycle length in seconds
+    float dayLength = 1440.0f;  // Day cycle: 24 real minutes = 24 game hours (1 min = 1 hour)
 
     // Audio (for future)
     float masterVolume = 1.0f;
     float musicVolume = 0.5f;
     float sfxVolume = 1.0f;
 
+    // Apply a graphics preset
+    void applyPreset(GraphicsPreset preset) {
+        graphicsPreset = preset;
+
+        switch (preset) {
+            case GraphicsPreset::LOW:
+                renderDistance = 10;
+                antiAliasing = AntiAliasMode::NONE;
+                textureQuality = TextureQuality::LOW;
+                anisotropicFiltering = 1;
+                enableSSAO = false;
+                aoQuality = AOQuality::OFF;
+                enableShadows = false;  // Disable shadows on Low
+                shadowQuality = ShadowQuality::OFF;
+                shadowResolution = 512;
+                shadowCascades = 1;
+                ssaoSamples = 8;
+                ssaoScale = 0.25f;  // Quarter resolution (if enabled)
+                enableBloom = false;
+                enableMotionBlur = false;
+                enableVignette = false;
+                enableColorGrading = false;  // Disable for performance
+                enableFSR = true;
+                upscaleMode = UpscaleMode::PERFORMANCE;
+                maxChunksPerFrame = 4;   // Low values for weak hardware
+                maxMeshesPerFrame = 4;
+                chunkCacheSize = 500;    // Reduce memory usage
+                break;
+
+            case GraphicsPreset::MEDIUM:
+                renderDistance = 16;
+                antiAliasing = AntiAliasMode::FXAA;
+                textureQuality = TextureQuality::MEDIUM;
+                anisotropicFiltering = 4;
+                enableSSAO = true;
+                aoQuality = AOQuality::LOW;
+                enableShadows = true;
+                shadowQuality = ShadowQuality::MEDIUM;
+                shadowResolution = 1024;
+                shadowCascades = 2;
+                ssaoSamples = 16;
+                ssaoScale = 0.5f;  // Half resolution for performance
+                enableBloom = true;
+                bloomIntensity = 0.3f;
+                enableMotionBlur = false;
+                enableVignette = true;
+                vignetteIntensity = 0.2f;
+                enableColorGrading = true;
+                enableFSR = true;
+                upscaleMode = UpscaleMode::BALANCED;
+                maxChunksPerFrame = 8;   // Reasonable value
+                maxMeshesPerFrame = 8;
+                chunkCacheSize = 1000;
+                break;
+
+            case GraphicsPreset::HIGH:
+                renderDistance = 24;
+                antiAliasing = AntiAliasMode::FXAA;
+                textureQuality = TextureQuality::HIGH;
+                anisotropicFiltering = 8;
+                enableSSAO = true;
+                aoQuality = AOQuality::MEDIUM;
+                enableShadows = true;
+                shadowQuality = ShadowQuality::HIGH;
+                shadowResolution = 2048;
+                shadowCascades = 3;
+                ssaoSamples = 16;  // Reduced from 32
+                ssaoScale = 0.75f;  // 3/4 resolution for balance
+                enableBloom = true;
+                bloomIntensity = 0.5f;
+                enableMotionBlur = false;
+                enableVignette = true;
+                vignetteIntensity = 0.3f;
+                enableColorGrading = true;
+                enableFSR = false;
+                upscaleMode = UpscaleMode::NATIVE;
+                maxChunksPerFrame = 16;   // Higher for good hardware
+                maxMeshesPerFrame = 16;
+                chunkCacheSize = 2000;
+                break;
+
+            case GraphicsPreset::ULTRA:
+                renderDistance = 32;
+                antiAliasing = AntiAliasMode::TAA;
+                textureQuality = TextureQuality::ULTRA;
+                anisotropicFiltering = 16;
+                enableSSAO = true;
+                aoQuality = AOQuality::ULTRA;
+                enableShadows = true;
+                shadowQuality = ShadowQuality::ULTRA;
+                shadowResolution = 4096;
+                shadowCascades = 4;
+                ssaoSamples = 32;  // Reduced from 64
+                ssaoScale = 1.0f;  // Full resolution for ULTRA
+                enableBloom = true;
+                bloomIntensity = 0.5f;
+                enableMotionBlur = true;
+                motionBlurStrength = 0.3f;
+                enableVignette = true;
+                vignetteIntensity = 0.3f;
+                enableColorGrading = true;
+                enableFSR = false;
+                upscaleMode = UpscaleMode::NATIVE;
+                maxChunksPerFrame = 32;   // Maximum for top-tier hardware
+                maxMeshesPerFrame = 32;
+                chunkCacheSize = 4000;
+                break;
+
+            case GraphicsPreset::CUSTOM:
+                // Don't change anything for custom
+                break;
+        }
+
+        // Update fog based on render distance
+        fogDensity = 0.008f / static_cast<float>(renderDistance);
+
+        std::cout << "Applied graphics preset: " << getPresetName(preset) << std::endl;
+    }
+
+    // Get preset name as string
+    static std::string getPresetName(GraphicsPreset preset) {
+        switch (preset) {
+            case GraphicsPreset::LOW: return "Low";
+            case GraphicsPreset::MEDIUM: return "Medium";
+            case GraphicsPreset::HIGH: return "High";
+            case GraphicsPreset::ULTRA: return "Ultra";
+            case GraphicsPreset::CUSTOM: return "Custom";
+            default: return "Unknown";
+        }
+    }
+
+    // Get anti-alias mode name
+    static std::string getAAModeName(AntiAliasMode mode) {
+        switch (mode) {
+            case AntiAliasMode::NONE: return "Off";
+            case AntiAliasMode::FXAA: return "FXAA";
+            case AntiAliasMode::MSAA_2X: return "MSAA 2x";
+            case AntiAliasMode::MSAA_4X: return "MSAA 4x";
+            case AntiAliasMode::MSAA_8X: return "MSAA 8x";
+            case AntiAliasMode::TAA: return "TAA";
+            default: return "Unknown";
+        }
+    }
+
+    // Get texture quality name
+    static std::string getTextureQualityName(TextureQuality quality) {
+        switch (quality) {
+            case TextureQuality::LOW: return "Low";
+            case TextureQuality::MEDIUM: return "Medium";
+            case TextureQuality::HIGH: return "High";
+            case TextureQuality::ULTRA: return "Ultra";
+            default: return "Unknown";
+        }
+    }
+
+    // Get quality level name (for AO/Shadow)
+    static std::string getQualityLevelName(int level) {
+        switch (level) {
+            case 0: return "Off";
+            case 1: return "Low";
+            case 2: return "Medium";
+            case 3: return "High";
+            case 4: return "Ultra";
+            default: return "Unknown";
+        }
+    }
+
     // Apply hardware-based auto-tuning
     void autoTune() {
         std::cout << "Auto-tuning settings based on detected hardware..." << std::endl;
 
-        // Apply GPU-tier recommendations
-        renderDistance = g_hardware.recommendedRenderDistance;
-        shadowResolution = g_hardware.recommendedShadowRes;
-        ssaoSamples = g_hardware.recommendedSSAOSamples;
+        // Determine appropriate preset based on GPU tier
+        GraphicsPreset recommendedPreset;
+        switch (g_hardware.gpuTier) {
+            case GPUTier::ULTRA:
+                recommendedPreset = GraphicsPreset::ULTRA;
+                break;
+            case GPUTier::HIGH:
+                recommendedPreset = GraphicsPreset::HIGH;
+                break;
+            case GPUTier::MID:
+                recommendedPreset = GraphicsPreset::MEDIUM;
+                break;
+            case GPUTier::LOW:
+            default:
+                recommendedPreset = GraphicsPreset::LOW;
+                break;
+        }
+
+        // Apply the recommended preset
+        applyPreset(recommendedPreset);
 
         // Apply CPU-based thread counts
         if (chunkThreads == 0) chunkThreads = g_hardware.recommendedChunkThreads;
         if (meshThreads == 0) meshThreads = g_hardware.recommendedMeshThreads;
 
-        // Scale other settings based on tier
-        switch (g_hardware.gpuTier) {
-            case GPUTier::ULTRA:
-                maxChunksPerFrame = 256;   // Maximize throughput
-                maxMeshesPerFrame = 128;
-                chunkCacheSize = 8000;
-                enableSSAO = true;
-                enableShadows = true;
-                shadowCascades = 4;
-                break;
-
-            case GPUTier::HIGH:
-                maxChunksPerFrame = 192;
-                maxMeshesPerFrame = 96;
-                chunkCacheSize = 4000;
-                enableSSAO = true;
-                enableShadows = true;
-                shadowCascades = 3;
-                break;
-
-            case GPUTier::MID:
-                maxChunksPerFrame = 128;
-                maxMeshesPerFrame = 64;
-                chunkCacheSize = 2000;
-                enableSSAO = true;
-                enableShadows = true;
-                shadowCascades = 2;
-                break;
-
-            case GPUTier::LOW:
-            default:
-                maxChunksPerFrame = 64;
-                maxMeshesPerFrame = 32;
-                chunkCacheSize = 1000;
-                enableSSAO = false;
-                enableShadows = true;
-                shadowCascades = 1;
-                shadowResolution = 512;
-                break;
+        // Override FSR based on hardware recommendation if needed
+        if (g_hardware.recommendedUpscaleMode != UpscaleMode::NATIVE) {
+            upscaleMode = g_hardware.recommendedUpscaleMode;
+            enableFSR = true;
         }
-
-        // Adjust fog based on render distance
-        fogDensity = 0.008f / static_cast<float>(renderDistance);
-
-        // Apply FSR recommendations based on GPU tier
-        upscaleMode = g_hardware.recommendedUpscaleMode;
-        enableFSR = (upscaleMode != UpscaleMode::NATIVE);
-        fsrSharpness = 0.5f;  // Default sharpness
 
         std::cout << "Auto-tune complete. Settings optimized for "
                   << g_hardware.getTierName() << " tier hardware." << std::endl;
+        std::cout << "Applied preset: " << getPresetName(graphicsPreset) << std::endl;
         if (enableFSR) {
             std::cout << "FSR upscaling enabled: " << g_hardware.getUpscaleModeName() << std::endl;
         }
@@ -476,6 +713,10 @@ struct GameConfig {
         file << "maxChunksPerFrame=" << maxChunksPerFrame << "\n";
         file << "maxMeshesPerFrame=" << maxMeshesPerFrame << "\n";
         file << "fogDensity=" << fogDensity << "\n";
+        file << "graphicsPreset=" << static_cast<int>(graphicsPreset) << "\n";
+        file << "antiAliasing=" << static_cast<int>(antiAliasing) << "\n";
+        file << "textureQuality=" << static_cast<int>(textureQuality) << "\n";
+        file << "anisotropicFiltering=" << anisotropicFiltering << "\n";
 
         file << "\n[Performance]\n";
         file << "useHighPerformanceGPU=" << (useHighPerformanceGPU ? "true" : "false") << "\n";
@@ -489,12 +730,33 @@ struct GameConfig {
         file << "ssaoSamples=" << ssaoSamples << "\n";
         file << "ssaoRadius=" << ssaoRadius << "\n";
         file << "ssaoBias=" << ssaoBias << "\n";
+        file << "ssaoScale=" << ssaoScale << "\n";
+        file << "aoQuality=" << static_cast<int>(aoQuality) << "\n";
         file << "enableShadows=" << (enableShadows ? "true" : "false") << "\n";
         file << "shadowResolution=" << shadowResolution << "\n";
         file << "shadowCascades=" << shadowCascades << "\n";
+        file << "shadowQuality=" << static_cast<int>(shadowQuality) << "\n";
         file << "enableHiZCulling=" << (enableHiZCulling ? "true" : "false") << "\n";
         file << "enableDeferredRendering=" << (enableDeferredRendering ? "true" : "false") << "\n";
         file << "showPerformanceStats=" << (showPerformanceStats ? "true" : "false") << "\n";
+
+        file << "\n[PostProcessing]\n";
+        file << "enableBloom=" << (enableBloom ? "true" : "false") << "\n";
+        file << "bloomIntensity=" << bloomIntensity << "\n";
+        file << "bloomThreshold=" << bloomThreshold << "\n";
+        file << "enableMotionBlur=" << (enableMotionBlur ? "true" : "false") << "\n";
+        file << "motionBlurStrength=" << motionBlurStrength << "\n";
+        file << "enableClouds=" << (enableClouds ? "true" : "false") << "\n";
+        file << "cloudStyle=" << static_cast<int>(cloudStyle) << "\n";
+        file << "cloudQuality=" << static_cast<int>(cloudQuality) << "\n";
+        file << "enableWaterAnimation=" << (enableWaterAnimation ? "true" : "false") << "\n";
+        file << "enableBatchedRendering=" << (enableBatchedRendering ? "true" : "false") << "\n";
+        file << "enableVignette=" << (enableVignette ? "true" : "false") << "\n";
+        file << "vignetteIntensity=" << vignetteIntensity << "\n";
+        file << "enableColorGrading=" << (enableColorGrading ? "true" : "false") << "\n";
+        file << "gamma=" << gamma << "\n";
+        file << "exposure=" << exposure << "\n";
+        file << "saturation=" << saturation << "\n";
 
         file << "\n[Upscaling]\n";
         file << "enableFSR=" << (enableFSR ? "true" : "false") << "\n";
@@ -553,6 +815,11 @@ struct GameConfig {
             else if (key == "maxChunksPerFrame") maxChunksPerFrame = std::stoi(value);
             else if (key == "maxMeshesPerFrame") maxMeshesPerFrame = std::stoi(value);
             else if (key == "fogDensity") fogDensity = std::stof(value);
+            else if (key == "graphicsPreset") graphicsPreset = static_cast<GraphicsPreset>(std::stoi(value));
+            else if (key == "antiAliasing") antiAliasing = static_cast<AntiAliasMode>(std::stoi(value));
+            else if (key == "textureQuality") textureQuality = static_cast<TextureQuality>(std::stoi(value));
+            else if (key == "anisotropicFiltering") anisotropicFiltering = std::stoi(value);
+            // Performance
             else if (key == "useHighPerformanceGPU") useHighPerformanceGPU = (value == "true");
             else if (key == "chunkCacheSize") chunkCacheSize = std::stoi(value);
             else if (key == "chunkThreads") chunkThreads = std::stoi(value);
@@ -563,19 +830,41 @@ struct GameConfig {
             else if (key == "ssaoSamples") ssaoSamples = std::stoi(value);
             else if (key == "ssaoRadius") ssaoRadius = std::stof(value);
             else if (key == "ssaoBias") ssaoBias = std::stof(value);
+            else if (key == "ssaoScale") ssaoScale = std::stof(value);
+            else if (key == "aoQuality") aoQuality = static_cast<AOQuality>(std::stoi(value));
             else if (key == "enableShadows") enableShadows = (value == "true");
             else if (key == "shadowResolution") shadowResolution = std::stoi(value);
             else if (key == "shadowCascades") shadowCascades = std::stoi(value);
+            else if (key == "shadowQuality") shadowQuality = static_cast<ShadowQuality>(std::stoi(value));
             else if (key == "enableHiZCulling") enableHiZCulling = (value == "true");
             else if (key == "enableDeferredRendering") enableDeferredRendering = (value == "true");
             else if (key == "showPerformanceStats") showPerformanceStats = (value == "true");
+            // Post-processing settings
+            else if (key == "enableBloom") enableBloom = (value == "true");
+            else if (key == "bloomIntensity") bloomIntensity = std::stof(value);
+            else if (key == "bloomThreshold") bloomThreshold = std::stof(value);
+            else if (key == "enableMotionBlur") enableMotionBlur = (value == "true");
+            else if (key == "motionBlurStrength") motionBlurStrength = std::stof(value);
+            else if (key == "enableClouds") enableClouds = (value == "true");
+            else if (key == "cloudStyle") cloudStyle = static_cast<CloudStyle>(std::stoi(value));
+            else if (key == "cloudQuality") cloudQuality = static_cast<CloudQuality>(std::stoi(value));
+            else if (key == "enableWaterAnimation") enableWaterAnimation = (value == "true");
+            else if (key == "enableBatchedRendering") enableBatchedRendering = (value == "true");
+            else if (key == "enableVignette") enableVignette = (value == "true");
+            else if (key == "vignetteIntensity") vignetteIntensity = std::stof(value);
+            else if (key == "enableColorGrading") enableColorGrading = (value == "true");
+            else if (key == "gamma") gamma = std::stof(value);
+            else if (key == "exposure") exposure = std::stof(value);
+            else if (key == "saturation") saturation = std::stof(value);
             // Upscaling settings
             else if (key == "enableFSR") enableFSR = (value == "true");
             else if (key == "upscaleMode") upscaleMode = static_cast<UpscaleMode>(std::stoi(value));
             else if (key == "fsrSharpness") fsrSharpness = std::stof(value);
+            // Gameplay
             else if (key == "mouseSensitivity") mouseSensitivity = std::stof(value);
             else if (key == "invertY") invertY = (value == "true");
             else if (key == "dayLength") dayLength = std::stof(value);
+            // Audio
             else if (key == "masterVolume") masterVolume = std::stof(value);
             else if (key == "musicVolume") musicVolume = std::stof(value);
             else if (key == "sfxVolume") sfxVolume = std::stof(value);
