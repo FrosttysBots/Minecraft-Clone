@@ -104,16 +104,29 @@ VKGraphicsPipeline::~VKGraphicsPipeline() {
     if (m_pipeline != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_device->getDevice(), m_pipeline, nullptr);
     }
+    if (m_pipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(m_device->getDevice(), m_pipelineLayout, nullptr);
+    }
 }
 
 void VKGraphicsPipeline::createPipeline() {
+    std::cout << "[VKGraphicsPipeline] createPipeline() starting" << std::endl;
+
     auto* shaderProgram = static_cast<VKShaderProgram*>(m_desc.shaderProgram);
+    if (!shaderProgram) {
+        std::cerr << "[VKGraphicsPipeline] Error: shaderProgram is null!" << std::endl;
+        return;
+    }
+    std::cout << "[VKGraphicsPipeline] Getting shader stages..." << std::endl;
     auto shaderStages = shaderProgram->getShaderStages();
+    std::cout << "[VKGraphicsPipeline] Got " << shaderStages.size() << " shader stages" << std::endl;
 
     // Vertex input state
+    std::cout << "[VKGraphicsPipeline] Setting up vertex input state..." << std::endl;
     std::vector<VkVertexInputBindingDescription> bindingDescriptions;
     std::vector<VkVertexInputAttributeDescription> attributeDescriptions;
 
+    std::cout << "[VKGraphicsPipeline] Vertex bindings: " << m_desc.vertexInput.bindings.size() << std::endl;
     for (const auto& binding : m_desc.vertexInput.bindings) {
         VkVertexInputBindingDescription vkBinding{};
         vkBinding.binding = binding.binding;
@@ -123,6 +136,7 @@ void VKGraphicsPipeline::createPipeline() {
         bindingDescriptions.push_back(vkBinding);
     }
 
+    std::cout << "[VKGraphicsPipeline] Vertex attributes: " << m_desc.vertexInput.attributes.size() << std::endl;
     for (const auto& attr : m_desc.vertexInput.attributes) {
         VkVertexInputAttributeDescription vkAttr{};
         vkAttr.location = attr.location;
@@ -131,7 +145,9 @@ void VKGraphicsPipeline::createPipeline() {
         vkAttr.offset = attr.offset;
         attributeDescriptions.push_back(vkAttr);
     }
+    std::cout << "[VKGraphicsPipeline] Vertex input setup complete" << std::endl;
 
+    std::cout << "[VKGraphicsPipeline] Creating vertex input info..." << std::endl;
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInputInfo.vertexBindingDescriptionCount = static_cast<uint32_t>(bindingDescriptions.size());
@@ -140,18 +156,22 @@ void VKGraphicsPipeline::createPipeline() {
     vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
     // Input assembly state
+    std::cout << "[VKGraphicsPipeline] Creating input assembly state..." << std::endl;
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     inputAssembly.topology = VKDevice::toVkPrimitiveTopology(m_desc.primitiveTopology);
     inputAssembly.primitiveRestartEnable = m_desc.primitiveRestartEnable ? VK_TRUE : VK_FALSE;
+    std::cout << "[VKGraphicsPipeline] Input assembly done" << std::endl;
 
     // Viewport state (dynamic)
+    std::cout << "[VKGraphicsPipeline] Creating viewport state..." << std::endl;
     VkPipelineViewportStateCreateInfo viewportState{};
     viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewportState.viewportCount = 1;
     viewportState.scissorCount = 1;
 
     // Rasterization state
+    std::cout << "[VKGraphicsPipeline] Creating rasterizer state..." << std::endl;
     VkPipelineRasterizationStateCreateInfo rasterizer{};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterizer.depthClampEnable = m_desc.rasterizer.depthClampEnable ? VK_TRUE : VK_FALSE;
@@ -164,18 +184,24 @@ void VKGraphicsPipeline::createPipeline() {
     rasterizer.depthBiasSlopeFactor = m_desc.rasterizer.depthBiasSlope;
     rasterizer.depthBiasClamp = 0.0f;  // Not in RasterizerState, default to 0
     rasterizer.lineWidth = m_desc.rasterizer.lineWidth;
+    std::cout << "[VKGraphicsPipeline] Rasterizer done, lineWidth=" << rasterizer.lineWidth << std::endl;
 
     // Multisample state
+    std::cout << "[VKGraphicsPipeline] Creating multisampling state, sampleCount=" << m_desc.sampleCount << std::endl;
     VkPipelineMultisampleStateCreateInfo multisampling{};
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisampling.sampleShadingEnable = m_desc.sampleShading ? VK_TRUE : VK_FALSE;
-    multisampling.rasterizationSamples = static_cast<VkSampleCountFlagBits>(m_desc.sampleCount);
+    // Ensure sample count is at least 1
+    uint32_t sampleCount = m_desc.sampleCount > 0 ? m_desc.sampleCount : 1;
+    multisampling.rasterizationSamples = static_cast<VkSampleCountFlagBits>(sampleCount);
     multisampling.minSampleShading = m_desc.minSampleShading;
     multisampling.pSampleMask = nullptr;
     multisampling.alphaToCoverageEnable = VK_FALSE;
     multisampling.alphaToOneEnable = VK_FALSE;
+    std::cout << "[VKGraphicsPipeline] Multisampling done" << std::endl;
 
     // Depth stencil state
+    std::cout << "[VKGraphicsPipeline] Creating depth stencil state..." << std::endl;
     VkPipelineDepthStencilStateCreateInfo depthStencil{};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = m_desc.depthStencil.depthTestEnable ? VK_TRUE : VK_FALSE;
@@ -184,10 +210,13 @@ void VKGraphicsPipeline::createPipeline() {
     depthStencil.depthBoundsTestEnable = VK_FALSE;
     depthStencil.stencilTestEnable = m_desc.depthStencil.stencilTestEnable ? VK_TRUE : VK_FALSE;
     // TODO: Configure stencil ops if needed
+    std::cout << "[VKGraphicsPipeline] Depth stencil done" << std::endl;
 
     // Color blend state
+    std::cout << "[VKGraphicsPipeline] Creating color blend state, attachments=" << m_desc.colorBlendStates.size() << std::endl;
     std::vector<VkPipelineColorBlendAttachmentState> colorBlendAttachments;
     for (const auto& attachment : m_desc.colorBlendStates) {
+        std::cout << "[VKGraphicsPipeline] Processing blend attachment..." << std::endl;
         VkPipelineColorBlendAttachmentState blendAttachment{};
         blendAttachment.colorWriteMask = attachment.colorWriteMask;
         blendAttachment.blendEnable = attachment.enable ? VK_TRUE : VK_FALSE;
@@ -234,8 +263,53 @@ void VKGraphicsPipeline::createPipeline() {
     dynamicState.pDynamicStates = dynamicStates.data();
 
     // Get pipeline layout
+    std::cout << "[VKGraphicsPipeline] Getting pipeline layout and render pass..." << std::endl;
     auto* pipelineLayout = static_cast<VKPipelineLayout*>(m_desc.layout);
     auto* renderPass = static_cast<VKRenderPass*>(m_desc.renderPass);
+
+    if (!pipelineLayout) {
+        std::cerr << "[VKGraphicsPipeline] Error: pipeline layout is null! Creating default layout..." << std::endl;
+
+        // Create a descriptor set layout with a uniform buffer binding at binding 0
+        VkDescriptorSetLayoutBinding uboBinding{};
+        uboBinding.binding = 0;
+        uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        uboBinding.descriptorCount = 1;
+        uboBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        uboBinding.pImmutableSamplers = nullptr;
+
+        VkDescriptorSetLayoutCreateInfo layoutCreateInfo{};
+        layoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutCreateInfo.bindingCount = 1;
+        layoutCreateInfo.pBindings = &uboBinding;
+
+        VkDescriptorSetLayout descriptorSetLayout;
+        VkResult dsResult = vkCreateDescriptorSetLayout(m_device->getDevice(), &layoutCreateInfo, nullptr, &descriptorSetLayout);
+        if (dsResult != VK_SUCCESS) {
+            std::cerr << "[VKGraphicsPipeline] Failed to create descriptor set layout: " << dsResult << std::endl;
+        }
+
+        // Create pipeline layout with the descriptor set layout
+        VkPipelineLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &descriptorSetLayout;
+        layoutInfo.pushConstantRangeCount = 0;
+
+        VkResult result = vkCreatePipelineLayout(m_device->getDevice(), &layoutInfo, nullptr, &m_pipelineLayout);
+        if (result != VK_SUCCESS) {
+            std::cerr << "[VKGraphicsPipeline] Failed to create pipeline layout: " << result << std::endl;
+        } else {
+            std::cout << "[VKGraphicsPipeline] Created default pipeline layout with UBO binding" << std::endl;
+        }
+    }
+
+    if (!renderPass) {
+        std::cerr << "[VKGraphicsPipeline] Error: render pass is null!" << std::endl;
+        return;
+    }
+
+    std::cout << "[VKGraphicsPipeline] Creating pipeline info struct..." << std::endl;
 
     // Create the pipeline
     VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -251,22 +325,33 @@ void VKGraphicsPipeline::createPipeline() {
     pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.pDynamicState = &dynamicState;
-    pipelineInfo.layout = pipelineLayout->getVkLayout();
+    pipelineInfo.layout = pipelineLayout ? pipelineLayout->getVkLayout() : m_pipelineLayout;
     pipelineInfo.renderPass = renderPass->getVkRenderPass();
     pipelineInfo.subpass = m_desc.subpass;
     pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipelineInfo.basePipelineIndex = -1;
 
+    std::cout << "[VKGraphicsPipeline] Calling vkCreateGraphicsPipelines..." << std::endl;
+    std::cout << "[VKGraphicsPipeline]   renderPass=" << (void*)pipelineInfo.renderPass << std::endl;
+    std::cout << "[VKGraphicsPipeline]   layout=" << (void*)pipelineInfo.layout << std::endl;
+    std::cout << "[VKGraphicsPipeline]   stageCount=" << pipelineInfo.stageCount << std::endl;
+    for (uint32_t i = 0; i < pipelineInfo.stageCount; i++) {
+        std::cout << "[VKGraphicsPipeline]   stage[" << i << "].module=" << (void*)pipelineInfo.pStages[i].module << std::endl;
+        std::cout << "[VKGraphicsPipeline]   stage[" << i << "].pName=" << pipelineInfo.pStages[i].pName << std::endl;
+    }
+    std::cout.flush();
+
     VkResult result = vkCreateGraphicsPipelines(m_device->getDevice(), VK_NULL_HANDLE, 1,
                                                  &pipelineInfo, nullptr, &m_pipeline);
 
     if (result != VK_SUCCESS) {
-        std::cerr << "[VKGraphicsPipeline] Failed to create graphics pipeline" << std::endl;
+        std::cerr << "[VKGraphicsPipeline] Failed to create graphics pipeline: VkResult=" << result << std::endl;
         return;
     }
+    std::cout << "[VKGraphicsPipeline] Pipeline created successfully: " << (void*)m_pipeline << std::endl;
 
     // Set debug name
-    if (!m_desc.debugName.empty()) {
+    if (!m_desc.debugName.empty() && vkSetDebugUtilsObjectNameEXT) {
         VkDebugUtilsObjectNameInfoEXT nameInfo{};
         nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
         nameInfo.objectType = VK_OBJECT_TYPE_PIPELINE;
@@ -308,10 +393,44 @@ VKComputePipeline::VKComputePipeline(VKDevice* device, const ComputePipelineDesc
 
     auto* pipelineLayout = static_cast<VKPipelineLayout*>(m_desc.layout);
 
+    // Handle null pipeline layout - create a default one
+    VkPipelineLayout vkLayout = VK_NULL_HANDLE;
+    if (pipelineLayout) {
+        vkLayout = pipelineLayout->getVkLayout();
+    } else {
+        std::cerr << "[VKComputePipeline] Pipeline layout is null, creating default" << std::endl;
+
+        VkDescriptorSetLayoutBinding uboBinding{};
+        uboBinding.binding = 0;
+        uboBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        uboBinding.descriptorCount = 1;
+        uboBinding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo layoutCreateInfo{};
+        layoutCreateInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        layoutCreateInfo.bindingCount = 1;
+        layoutCreateInfo.pBindings = &uboBinding;
+
+        VkDescriptorSetLayout descriptorSetLayout;
+        vkCreateDescriptorSetLayout(m_device->getDevice(), &layoutCreateInfo, nullptr, &descriptorSetLayout);
+
+        VkPipelineLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &descriptorSetLayout;
+
+        VkResult layoutResult = vkCreatePipelineLayout(m_device->getDevice(), &layoutInfo, nullptr, &vkLayout);
+        if (layoutResult != VK_SUCCESS) {
+            std::cerr << "[VKComputePipeline] Failed to create pipeline layout: " << layoutResult << std::endl;
+            return;
+        }
+        std::cout << "[VKComputePipeline] Created default pipeline layout" << std::endl;
+    }
+
     VkComputePipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage = computeStage;
-    pipelineInfo.layout = pipelineLayout->getVkLayout();
+    pipelineInfo.layout = vkLayout;
     pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipelineInfo.basePipelineIndex = -1;
 
@@ -319,12 +438,13 @@ VKComputePipeline::VKComputePipeline(VKDevice* device, const ComputePipelineDesc
                                                 &pipelineInfo, nullptr, &m_pipeline);
 
     if (result != VK_SUCCESS) {
-        std::cerr << "[VKComputePipeline] Failed to create compute pipeline" << std::endl;
+        std::cerr << "[VKComputePipeline] Failed to create compute pipeline: VkResult=" << result << std::endl;
         return;
     }
+    std::cout << "[VKComputePipeline] Compute pipeline created successfully: " << (void*)m_pipeline << std::endl;
 
     // Set debug name
-    if (!m_desc.debugName.empty()) {
+    if (!m_desc.debugName.empty() && vkSetDebugUtilsObjectNameEXT) {
         VkDebugUtilsObjectNameInfoEXT nameInfo{};
         nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
         nameInfo.objectType = VK_OBJECT_TYPE_PIPELINE;

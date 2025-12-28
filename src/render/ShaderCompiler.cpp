@@ -13,6 +13,107 @@
 
 namespace Render {
 
+// ============================================================================
+// SHADER PREPROCESSOR - Converts OpenGL-style uniforms to Vulkan uniform blocks
+// ============================================================================
+
+namespace {
+
+// Preprocess GLSL to convert loose uniforms to uniform blocks for Vulkan
+// This allows existing OpenGL shaders to work with minimal modification
+std::string preprocessGLSLForVulkan(const std::string& source) {
+    std::istringstream stream(source);
+    std::ostringstream result;
+    std::vector<std::pair<std::string, std::string>> uniforms;  // type, full declaration
+    std::string line;
+    bool foundVersion = false;
+
+    // Regex to match uniform declarations (but not samplers or images)
+    // Matches: uniform mat4 name; uniform vec3 name[3]; etc.
+    // Captures: 1=type, 2=name, 3=optional array size with brackets
+    std::regex uniformRegex(R"(^\s*uniform\s+(bool|int|uint|float|double|[biud]?vec[234]|mat[234](?:x[234])?)\s+(\w+)(\s*\[\s*\d+\s*\])?\s*;)");
+
+    // First pass: collect all loose uniforms
+    while (std::getline(stream, line)) {
+        std::smatch match;
+        if (std::regex_search(line, match, uniformRegex)) {
+            // This is a loose uniform (non-sampler) - collect it
+            // match[1] = type, match[2] = name, match[3] = array brackets (optional)
+            std::string typeAndArray = match[1].str();
+            if (match[3].matched) {
+                typeAndArray += match[3].str();  // Add array brackets to type
+            }
+            uniforms.push_back({match[2].str(), typeAndArray});
+        }
+    }
+
+    // If no loose uniforms, return source unchanged
+    if (uniforms.empty()) {
+        return source;
+    }
+
+    // Second pass: rewrite the shader
+    stream.clear();
+    stream.str(source);
+
+    bool insertedBlock = false;
+
+    while (std::getline(stream, line)) {
+        std::smatch match;
+
+        // Check for #version directive
+        if (line.find("#version") != std::string::npos) {
+            result << line << "\n";
+            foundVersion = true;
+            continue;
+        }
+
+        // Insert uniform block after #version and any #extension directives
+        if (foundVersion && !insertedBlock &&
+            line.find("#extension") == std::string::npos &&
+            line.find("#define") == std::string::npos) {
+
+            // Insert the uniform block
+            result << "\n// Auto-generated uniform block for Vulkan compatibility\n";
+            result << "layout(set = 0, binding = 0) uniform AutoUniforms {\n";
+
+            for (const auto& [name, typeAndArray] : uniforms) {
+                // Check if array (contains '[')
+                size_t bracketPos = typeAndArray.find('[');
+                if (bracketPos != std::string::npos) {
+                    std::string type = typeAndArray.substr(0, bracketPos);
+                    std::string arrayPart = typeAndArray.substr(bracketPos);
+                    result << "    " << type << " " << name << arrayPart << ";\n";
+                } else {
+                    result << "    " << typeAndArray << " " << name << ";\n";
+                }
+            }
+
+            result << "} _u;\n\n";
+
+            // Add #defines to redirect uniform access
+            for (const auto& [name, typeAndArray] : uniforms) {
+                result << "#define " << name << " _u." << name << "\n";
+            }
+            result << "\n";
+
+            insertedBlock = true;
+        }
+
+        // Skip original loose uniform declarations
+        if (std::regex_search(line, match, uniformRegex)) {
+            result << "// (moved to uniform block) " << line << "\n";
+            continue;
+        }
+
+        result << line << "\n";
+    }
+
+    return result.str();
+}
+
+} // anonymous namespace
+
 bool ShaderCompiler::s_initialized = false;
 
 ShaderCompiler::ShaderCompiler() {
@@ -68,11 +169,19 @@ std::optional<CompiledShader> ShaderCompiler::compile(
         return std::nullopt;
     }
 
+    // Preprocess for Vulkan if needed
+    std::string processedSource = source;
+    if (options.vulkanSemantics) {
+        std::cout << "[ShaderCompiler] Preprocessing for Vulkan: " << debugName << std::endl;
+        processedSource = preprocessGLSLForVulkan(source);
+        std::cout << "[ShaderCompiler] Preprocessing complete" << std::endl;
+    }
+
     EShLanguage glslangStage = toGlslangStage(stage);
     glslang::TShader shader(glslangStage);
 
     // Set up source
-    const char* sourceCStr = source.c_str();
+    const char* sourceCStr = processedSource.c_str();
     const char* sourceNames = debugName.empty() ? "shader" : debugName.c_str();
     shader.setStringsWithLengthsAndNames(&sourceCStr, nullptr, &sourceNames, 1);
 
@@ -153,6 +262,8 @@ std::optional<CompiledShader> ShaderCompiler::compile(
         m_lastError = "SPIR-V generation produced no output";
         return std::nullopt;
     }
+
+    std::cout << "[ShaderCompiler] Compiled " << debugName << " (" << spirv.size() * 4 << " bytes SPIR-V)" << std::endl;
 
     // Build result
     CompiledShader result;

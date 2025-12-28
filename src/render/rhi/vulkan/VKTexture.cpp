@@ -89,7 +89,7 @@ void VKTexture::createImage() {
     }
 
     // Set debug name
-    if (!m_desc.debugName.empty()) {
+    if (!m_desc.debugName.empty() && vkSetDebugUtilsObjectNameEXT) {
         VkDebugUtilsObjectNameInfoEXT nameInfo{};
         nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
         nameInfo.objectType = VK_OBJECT_TYPE_IMAGE;

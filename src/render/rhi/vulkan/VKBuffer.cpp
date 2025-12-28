@@ -67,7 +67,7 @@ VKBuffer::VKBuffer(VKDevice* device, const BufferDesc& desc)
     }
 
     // Set debug name
-    if (!desc.debugName.empty()) {
+    if (!desc.debugName.empty() && vkSetDebugUtilsObjectNameEXT) {
         VkDebugUtilsObjectNameInfoEXT nameInfo{};
         nameInfo.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT;
         nameInfo.objectType = VK_OBJECT_TYPE_BUFFER;

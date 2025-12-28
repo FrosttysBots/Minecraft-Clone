@@ -63,6 +63,17 @@ void WorldRendererRHI::render(RHI::RHICommandBuffer* cmd, ::World& world, const 
 void WorldRendererRHI::renderSolid(RHI::RHICommandBuffer* cmd, ::World& world, const WorldRenderParams& params) {
     (void)cmd;  // Used for RHI state in hybrid mode
 
+    // Skip rendering for Vulkan backend - hybrid path uses OpenGL calls which don't work with Vulkan
+    // TODO: Implement proper Vulkan rendering path that uses RHI commands
+    if (m_device && m_device->getBackend() == RHI::Backend::Vulkan) {
+        // For Vulkan, we would need to:
+        // 1. Get cached vertex data from chunk meshes
+        // 2. Upload to RHI buffers via VertexPool
+        // 3. Issue draw calls through RHI command buffer
+        // For now, skip to prevent crash
+        return;
+    }
+
     // Set forced LOD if specified
     int previousForcedLOD = world.forcedLOD;
     if (params.forcedLOD >= 0) {
@@ -121,6 +132,11 @@ void WorldRendererRHI::renderSolid(RHI::RHICommandBuffer* cmd, ::World& world, c
 void WorldRendererRHI::renderWater(RHI::RHICommandBuffer* cmd, ::World& world, const WorldRenderParams& params) {
     (void)cmd;  // Used for RHI state in hybrid mode
 
+    // Skip for Vulkan backend
+    if (m_device && m_device->getBackend() == RHI::Backend::Vulkan) {
+        return;
+    }
+
     if (m_useHybridPath) {
         // Get chunk offset uniform location
         GLint currentProgram = 0;
@@ -139,6 +155,11 @@ void WorldRendererRHI::renderWater(RHI::RHICommandBuffer* cmd, ::World& world, c
 void WorldRendererRHI::renderShadow(RHI::RHICommandBuffer* cmd, ::World& world, const WorldRenderParams& params,
                                      int maxShadowDistance) {
     (void)cmd;
+
+    // Skip for Vulkan backend
+    if (m_device && m_device->getBackend() == RHI::Backend::Vulkan) {
+        return;
+    }
 
     if (m_useHybridPath) {
         GLint currentProgram = 0;

@@ -360,10 +360,18 @@ void DeferredRendererRHI::resize(uint32_t width, uint32_t height) {
 
 void DeferredRendererRHI::beginFrame() {
     // Wait for this frame's fence
+    if (m_currentFrame >= m_frameFences.size() || !m_frameFences[m_currentFrame]) {
+        std::cerr << "[DeferredRendererRHI] ERROR: Invalid fence at frame " << m_currentFrame << std::endl;
+        return;
+    }
     m_frameFences[m_currentFrame]->wait(UINT64_MAX);
     m_frameFences[m_currentFrame]->reset();
 
     // Acquire next swapchain image
+    if (!m_swapchain) {
+        std::cerr << "[DeferredRendererRHI] ERROR: Swapchain is null!" << std::endl;
+        return;
+    }
     if (!m_swapchain->acquireNextImage()) {
         // Swapchain out of date, resize
         int width, height;
@@ -373,6 +381,10 @@ void DeferredRendererRHI::beginFrame() {
     }
 
     // Begin command buffer recording
+    if (m_currentFrame >= m_commandBuffers.size() || !m_commandBuffers[m_currentFrame]) {
+        std::cerr << "[DeferredRendererRHI] ERROR: Invalid command buffer at frame " << m_currentFrame << std::endl;
+        return;
+    }
     m_commandBuffers[m_currentFrame]->reset();
     m_commandBuffers[m_currentFrame]->begin();
 
@@ -405,6 +417,7 @@ void DeferredRendererRHI::render(::World& world, const CameraData& camera) {
     if (firstFrame) LOG_DEBUG("RHI", "Context setup complete");
 
     // Execute render passes
+
     // 1. Shadow Pass
     if (m_config.enableShadows) {
         if (firstFrame) LOG_DEBUG("RHI", "Starting Shadow Pass");
@@ -776,9 +789,13 @@ bool DeferredRendererRHI::createPipelines() {
 
         progDesc.debugName = name;
 
+        std::cout << "[DeferredRendererRHI] Creating shader program: " << name << std::endl;
         auto program = m_device->createShaderProgram(progDesc);
         if (program) {
             m_shaderPrograms[name] = std::move(program);
+            std::cout << "[DeferredRendererRHI] Shader program created: " << name << std::endl;
+        } else {
+            std::cerr << "[DeferredRendererRHI] Failed to create shader program: " << name << std::endl;
         }
         return m_shaderPrograms[name].get();
     };
@@ -826,9 +843,13 @@ bool DeferredRendererRHI::createPipelines() {
 
         progDesc.debugName = name;
 
+        std::cout << "[DeferredRendererRHI] Creating compute shader program: " << name << std::endl;
         auto program = m_device->createShaderProgram(progDesc);
         if (program) {
             m_shaderPrograms[name] = std::move(program);
+            std::cout << "[DeferredRendererRHI] Compute shader program created: " << name << std::endl;
+        } else {
+            std::cerr << "[DeferredRendererRHI] Failed to create compute shader program: " << name << std::endl;
         }
         return m_shaderPrograms[name].get();
     };
@@ -889,7 +910,10 @@ bool DeferredRendererRHI::createPipelines() {
         {2, 0, RHI::Format::RGBA8_UINT, sizeof(float) * 5}            // packed data
     };
 
+    std::cout << "[DeferredRendererRHI] Creating pipelines..." << std::endl;
+
     // Create G-Buffer pipeline
+    std::cout << "[DeferredRendererRHI] Creating G-Buffer pipeline..." << std::endl;
     if (gbufferProg && m_gBufferPass->getRenderPass()) {
         RHI::GraphicsPipelineDesc gbufferPipeDesc{};
         gbufferPipeDesc.shaderProgram = gbufferProg;
@@ -907,10 +931,16 @@ bool DeferredRendererRHI::createPipelines() {
         gbufferPipeDesc.renderPass = m_gBufferPass->getRenderPass();
         gbufferPipeDesc.debugName = "GBufferPipeline";
 
+        std::cout << "[DeferredRendererRHI] Calling createGraphicsPipeline for G-Buffer..." << std::endl;
         m_gBufferPipeline = m_device->createGraphicsPipeline(gbufferPipeDesc);
         if (m_gBufferPipeline) {
+            std::cout << "[DeferredRendererRHI] G-Buffer pipeline created successfully" << std::endl;
             m_gBufferPass->setPipeline(m_gBufferPipeline.get());
+        } else {
+            std::cerr << "[DeferredRendererRHI] Failed to create G-Buffer pipeline" << std::endl;
         }
+    } else {
+        std::cerr << "[DeferredRendererRHI] Skipping G-Buffer pipeline (null prog or renderpass)" << std::endl;
     }
 
     // Create shadow pipeline

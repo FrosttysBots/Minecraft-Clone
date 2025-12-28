@@ -53,8 +53,40 @@ void VKCommandBuffer::reset() {
 void VKCommandBuffer::beginRenderPass(RHIRenderPass* renderPass,
                                        RHIFramebuffer* framebuffer,
                                        const std::vector<ClearValue>& clearValues) {
+    std::cout << "[VKCommandBuffer::beginRenderPass] Starting..." << std::endl;
+    std::cout.flush();
+
+    if (!renderPass) {
+        std::cerr << "[VKCommandBuffer::beginRenderPass] ERROR: renderPass is null!" << std::endl;
+        return;
+    }
+    if (!framebuffer) {
+        std::cerr << "[VKCommandBuffer::beginRenderPass] ERROR: framebuffer is null!" << std::endl;
+        return;
+    }
+
     auto* vkRenderPass = static_cast<VKRenderPass*>(renderPass);
     auto* vkFramebuffer = static_cast<VKFramebuffer*>(framebuffer);
+
+    std::cout << "[VKCommandBuffer::beginRenderPass] vkRenderPass=" << (void*)vkRenderPass
+              << ", vkFramebuffer=" << (void*)vkFramebuffer << std::endl;
+    std::cout.flush();
+
+    VkRenderPass vkRP = vkRenderPass->getVkRenderPass();
+    VkFramebuffer vkFB = vkFramebuffer->getVkFramebuffer();
+
+    std::cout << "[VKCommandBuffer::beginRenderPass] VkRenderPass=" << (void*)vkRP
+              << ", VkFramebuffer=" << (void*)vkFB << std::endl;
+    std::cout.flush();
+
+    if (!vkRP) {
+        std::cerr << "[VKCommandBuffer::beginRenderPass] ERROR: VkRenderPass is VK_NULL_HANDLE!" << std::endl;
+        return;
+    }
+    if (!vkFB) {
+        std::cerr << "[VKCommandBuffer::beginRenderPass] ERROR: VkFramebuffer is VK_NULL_HANDLE!" << std::endl;
+        return;
+    }
 
     std::vector<VkClearValue> vkClearValues;
     for (const auto& clear : clearValues) {
@@ -64,16 +96,26 @@ void VKCommandBuffer::beginRenderPass(RHIRenderPass* renderPass,
         vkClearValues.push_back(vkClear);
     }
 
+    std::cout << "[VKCommandBuffer::beginRenderPass] clearValues=" << vkClearValues.size()
+              << ", extent=(" << vkFramebuffer->getWidth() << "x" << vkFramebuffer->getHeight() << ")" << std::endl;
+    std::cout.flush();
+
     VkRenderPassBeginInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    renderPassInfo.renderPass = vkRenderPass->getVkRenderPass();
-    renderPassInfo.framebuffer = vkFramebuffer->getVkFramebuffer();
+    renderPassInfo.renderPass = vkRP;
+    renderPassInfo.framebuffer = vkFB;
     renderPassInfo.renderArea.offset = {0, 0};
     renderPassInfo.renderArea.extent = {vkFramebuffer->getWidth(), vkFramebuffer->getHeight()};
     renderPassInfo.clearValueCount = static_cast<uint32_t>(vkClearValues.size());
     renderPassInfo.pClearValues = vkClearValues.data();
 
+    std::cout << "[VKCommandBuffer::beginRenderPass] Calling vkCmdBeginRenderPass..." << std::endl;
+    std::cout.flush();
+
     vkCmdBeginRenderPass(m_commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    std::cout << "[VKCommandBuffer::beginRenderPass] Done" << std::endl;
+    std::cout.flush();
 }
 
 void VKCommandBuffer::endRenderPass() {
@@ -85,9 +127,28 @@ void VKCommandBuffer::nextSubpass() {
 }
 
 void VKCommandBuffer::bindGraphicsPipeline(RHIGraphicsPipeline* pipeline) {
+    std::cout << "[VKCommandBuffer::bindGraphicsPipeline] pipeline=" << (void*)pipeline << std::endl;
+    std::cout.flush();
+
+    if (!pipeline) {
+        std::cerr << "[VKCommandBuffer::bindGraphicsPipeline] ERROR: pipeline is null!" << std::endl;
+        return;
+    }
+
     m_currentGraphicsPipeline = static_cast<VKGraphicsPipeline*>(pipeline);
-    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      m_currentGraphicsPipeline->getVkPipeline());
+    VkPipeline vkPipeline = m_currentGraphicsPipeline->getVkPipeline();
+
+    std::cout << "[VKCommandBuffer::bindGraphicsPipeline] VkPipeline=" << (void*)vkPipeline << std::endl;
+    std::cout.flush();
+
+    if (!vkPipeline) {
+        std::cerr << "[VKCommandBuffer::bindGraphicsPipeline] ERROR: VkPipeline is VK_NULL_HANDLE!" << std::endl;
+        return;
+    }
+
+    vkCmdBindPipeline(m_commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vkPipeline);
+    std::cout << "[VKCommandBuffer::bindGraphicsPipeline] Done" << std::endl;
+    std::cout.flush();
 }
 
 void VKCommandBuffer::bindComputePipeline(RHIComputePipeline* pipeline) {

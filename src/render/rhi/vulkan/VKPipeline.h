@@ -68,6 +68,7 @@ private:
     VKDevice* m_device = nullptr;
     GraphicsPipelineDesc m_desc;
     VkPipeline m_pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;  // For default layout if none provided
 };
 
 // ============================================================================

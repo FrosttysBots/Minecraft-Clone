@@ -258,6 +258,9 @@ public:
     bool gpuCullingInitialized = false;  // Track initialization state
     std::vector<GPUCulling::SubChunkData> gpuSubChunkData;  // Cached sub-chunk data for GPU upload
 
+    // Backend flag - when false, skip all OpenGL operations (for Vulkan backend)
+    bool useOpenGLMeshes = true;
+
     // Terrain generator (for main thread fallback)
     TerrainGenerator terrainGenerator;
 
@@ -298,6 +301,10 @@ public:
 
     // Enable/disable multithreading
     bool useMultithreading = true;
+
+    // Render faces at chunk borders (where neighbor chunk is unloaded)
+    // true = show textured faces at edges, false = hide faces (prevents seams through water)
+    bool renderChunkBorderFaces = true;
 
     // Burst mode - removes per-frame throttling for faster loading
     bool burstMode = false;
@@ -586,6 +593,24 @@ public:
         return chunk->getBlock(localX, y, localZ);
     }
 
+    // Get block for border face rendering - returns AIR for non-existent chunks
+    // This renders textured faces at chunk borders (useful for title screen / limited render distance)
+    BlockType getBlockBorder(int x, int y, int z) const {
+        glm::ivec2 chunkPos(
+            static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X)),
+            static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z))
+        );
+
+        const Chunk* chunk = getChunk(chunkPos);
+        if (!chunk) return BlockType::AIR;  // Treat as air - render the face
+
+        // Convert to local coordinates
+        int localX = x - chunkPos.x * CHUNK_SIZE_X;
+        int localZ = z - chunkPos.y * CHUNK_SIZE_Z;
+
+        return chunk->getBlock(localX, y, localZ);
+    }
+
     // Set block at world position
     void setBlock(int x, int y, int z, BlockType type) {
         glm::ivec2 chunkPos(
@@ -815,7 +840,11 @@ public:
 
     // Update world around player - loads new chunks, unloads distant ones
     void update(const glm::vec3& playerPos, float deltaTime = 0.0f) {
+        std::cout << "[World::update] Starting..." << std::endl;
+        std::cout.flush();
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
+        std::cout << "[World::update] playerChunk calculated: (" << playerChunk.x << ", " << playerChunk.y << ")" << std::endl;
+        std::cout.flush();
 
         // Update player velocity for predictive chunk streaming
         if (usePredictiveLoading && deltaTime > 0.0f) {
@@ -853,13 +882,25 @@ public:
         }
 
         // Process chunks completed by worker threads
+        std::cout << "[World::update] Calling processCompletedChunks..." << std::endl;
+        std::cout.flush();
         processCompletedChunks();
+        std::cout << "[World::update] processCompletedChunks done" << std::endl;
+        std::cout.flush();
 
         // Queue new chunks for generation around player
+        std::cout << "[World::update] Calling loadChunksAroundPlayer..." << std::endl;
+        std::cout.flush();
         loadChunksAroundPlayer(playerChunk);
+        std::cout << "[World::update] loadChunksAroundPlayer done" << std::endl;
+        std::cout.flush();
 
         // Unload distant chunks
+        std::cout << "[World::update] Calling unloadDistantChunks..." << std::endl;
+        std::cout.flush();
         unloadDistantChunks(playerChunk);
+        std::cout << "[World::update] unloadDistantChunks done" << std::endl;
+        std::cout.flush();
 
         // Update water simulation (skip during burst mode for faster loading)
         if (!burstMode) {
@@ -871,7 +912,11 @@ public:
         }
 
         // Update meshes
+        std::cout << "[World::update] Calling updateMeshes..." << std::endl;
+        std::cout.flush();
         updateMeshes(playerChunk);
+        std::cout << "[World::update] updateMeshes done" << std::endl;
+        std::cout.flush();
 
         // Lazy meshlet regeneration after burst mode (a few per frame)
         if (meshletRegenerationNeeded && g_generateMeshlets) {
@@ -884,6 +929,8 @@ public:
         }
 
         lastPlayerChunk = playerChunk;
+        std::cout << "[World::update] Complete" << std::endl;
+        std::cout.flush();
     }
 
     // Lazily regenerate meshlets for meshes that were created during burst mode
@@ -1187,20 +1234,29 @@ public:
 
     // Update chunk meshes around player - queues async mesh generation
     void updateMeshes(const glm::ivec2& playerChunk) {
+        std::cout << "[updateMeshes] Starting..." << std::endl;
+        std::cout.flush();
         int meshesQueued = 0;
 
         // First, process any completed meshes from worker threads
+        std::cout << "[updateMeshes] Calling processCompletedMeshes..." << std::endl;
+        std::cout.flush();
         processCompletedMeshes();
+        std::cout << "[updateMeshes] processCompletedMeshes done" << std::endl;
+        std::cout.flush();
 
         // Collect dirty chunks within render distance, sorted by distance
         std::vector<std::pair<int, glm::ivec2>> dirtyChunks;
+
+        std::cout << "[updateMeshes] Iterating chunks, count=" << chunks.size() << std::endl;
+        std::cout.flush();
 
         for (auto& [pos, chunk] : chunks) {
             int dx = abs(pos.x - playerChunk.x);
             int dz = abs(pos.y - playerChunk.y);
 
             if (dx <= renderDistance && dz <= renderDistance) {
-                if (chunk->isDirty && !chunkThreadPool->isMeshGenerating(pos)) {
+                if (chunk->isDirty && chunkThreadPool && !chunkThreadPool->isMeshGenerating(pos)) {
                     int distSq = dx * dx + dz * dz;
                     dirtyChunks.push_back({distSq, pos});
                 }
@@ -1244,7 +1300,10 @@ public:
                 return this->getBlockForWater(x, y, z);
             };
             request.getSafeBlock = [this](int x, int y, int z) -> BlockType {
-                return this->getBlockSafe(x, y, z);
+                // Use getBlockBorder when rendering chunk edges (title screen)
+                // getBlockBorder returns AIR for unloaded chunks, causing faces to render
+                // getBlockSafe returns STONE for unloaded chunks, hiding border faces
+                return this->renderChunkBorderFaces ? this->getBlockBorder(x, y, z) : this->getBlockSafe(x, y, z);
             };
             request.getLightLevel = [this](int x, int y, int z) -> uint8_t {
                 return this->getLightLevel(x, y, z);
@@ -1259,6 +1318,43 @@ public:
     // Process completed meshes from worker threads (upload to GPU)
     void processCompletedMeshes() {
         if (!chunkThreadPool) return;
+
+        // Skip OpenGL mesh uploads when using Vulkan backend
+        // The renderer will handle mesh data through its own vertex pool
+        if (!useOpenGLMeshes) {
+            // Just consume completed meshes without uploading to OpenGL
+            auto completedMeshes = chunkThreadPool->getCompletedMeshes(burstMode ? 64 : maxMeshesPerFrame);
+            for (auto& meshResult : completedMeshes) {
+                glm::ivec2 pos = meshResult.position;
+                Chunk* chunk = getChunk(pos);
+                if (chunk == nullptr) continue;
+
+                // Create or get mesh (store mesh data without OpenGL upload)
+                auto it = meshes.find(pos);
+                if (it == meshes.end()) {
+                    meshes[pos] = std::make_unique<ChunkMesh>();
+                }
+                ChunkMesh* mesh = meshes[pos].get();
+                mesh->worldOffset = meshResult.worldOffset;
+
+                // Store sub-chunk vertex data for renderer to use
+                for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
+                    auto& subData = meshResult.subChunks[subY];
+                    auto& subChunk = mesh->subChunks[subY];
+                    subChunk.subChunkY = subData.subChunkY;
+                    subChunk.isEmpty = subData.isEmpty;
+                    subChunk.hasWater = subData.hasWater;
+                    // Combine face bucket vertices into single cached array for RHI renderer
+                    subChunk.cachedVertices.clear();
+                    for (const auto& bucket : subData.faceBucketVertices) {
+                        subChunk.cachedVertices.insert(subChunk.cachedVertices.end(),
+                            bucket.begin(), bucket.end());
+                    }
+                    subChunk.cachedWaterVertices = std::move(subData.waterVertices);
+                }
+            }
+            return;
+        }
 
         auto startTime = std::chrono::high_resolution_clock::now();
 

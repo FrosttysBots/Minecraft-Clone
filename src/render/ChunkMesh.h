@@ -258,6 +258,10 @@ struct SubChunkMesh {
     std::vector<PackedChunkVertex> cachedVerticesForMeshlets;
     bool needsMeshletGeneration = false;  // Flag for deferred meshlet generation
 
+    // Cached vertex data for RHI renderer (Vulkan backend)
+    std::vector<PackedChunkVertex> cachedVertices;
+    std::vector<ChunkVertex> cachedWaterVertices;
+
     int subChunkY = 0;     // Y index (0-15)
     bool isEmpty = true;   // Skip rendering if no geometry
     bool hasWater = false; // Quick check for water rendering pass

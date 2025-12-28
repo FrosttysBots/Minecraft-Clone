@@ -205,6 +205,72 @@ else()
 endif()
 
 # ============================================================================
+# VULKAN ENGINE EXECUTABLE (Vulkan backend)
+# ============================================================================
+
+# Get all game sources except main.cpp
+file(GLOB_RECURSE VULKAN_GAME_SOURCES
+    "src/*.cpp"
+)
+list(FILTER VULKAN_GAME_SOURCES EXCLUDE REGEX ".*launcher/.*")
+list(FILTER VULKAN_GAME_SOURCES EXCLUDE REGEX ".*main\\.cpp$")
+
+add_executable(VoxelEngineVK
+    ${VULKAN_GAME_SOURCES}
+    src/main_vulkan.cpp
+    ${GLAD_DIR}/src/gl.c
+)
+
+target_include_directories(VoxelEngineVK PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/src
+    ${GLAD_DIR}/include
+    ${stb_SOURCE_DIR}
+    ${fastnoiselite_SOURCE_DIR}/Cpp
+    ${vulkan_headers_SOURCE_DIR}/include
+    ${volk_SOURCE_DIR}
+    ${vma_SOURCE_DIR}/include
+    ${glslang_SOURCE_DIR}
+)
+
+if(WIN32)
+    target_compile_definitions(VoxelEngineVK PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
+
+target_link_libraries(VoxelEngineVK PRIVATE
+    glfw
+    glm::glm
+    opengl32
+    meshoptimizer
+    glslang
+    SPIRV
+    glslang-default-resource-limits
+)
+
+set_target_properties(VoxelEngineVK PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Copy assets and shaders for Vulkan build
+add_custom_command(TARGET VoxelEngineVK POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/assets
+    $<TARGET_FILE_DIR:VoxelEngineVK>/assets
+)
+
+add_custom_command(TARGET VoxelEngineVK POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/shaders
+    $<TARGET_FILE_DIR:VoxelEngineVK>/shaders
+)
+
+if(MSVC)
+    target_compile_options(VoxelEngineVK PRIVATE /W4)
+else()
+    target_compile_options(VoxelEngineVK PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ============================================================================
 # VULKAN TEST EXECUTABLE
 # ============================================================================
 add_executable(VulkanTest
@@ -226,5 +292,46 @@ if(WIN32)
 endif()
 
 set_target_properties(VulkanTest PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# ============================================================================
+# VULKAN RHI TEST EXECUTABLE (Tests the RHI abstraction layer)
+# ============================================================================
+add_executable(VulkanRHITest
+    tests/VulkanRHITest.cpp
+    # Vulkan RHI implementation files
+    src/render/rhi/vulkan/VKDevice.cpp
+    src/render/rhi/vulkan/VKBuffer.cpp
+    src/render/rhi/vulkan/VKTexture.cpp
+    src/render/rhi/vulkan/VKShader.cpp
+    src/render/rhi/vulkan/VKPipeline.cpp
+    src/render/rhi/vulkan/VKFramebuffer.cpp
+    src/render/rhi/vulkan/VKDescriptorSet.cpp
+    src/render/rhi/vulkan/VKCommandBuffer.cpp
+)
+
+target_include_directories(VulkanRHITest PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${vulkan_headers_SOURCE_DIR}/include
+    ${volk_SOURCE_DIR}
+    ${vma_SOURCE_DIR}/include
+    ${glslang_SOURCE_DIR}
+    ${glslang_SOURCE_DIR}/glslang/Include
+)
+
+target_link_libraries(VulkanRHITest PRIVATE
+    glfw
+    glm::glm
+    glslang
+    SPIRV
+    glslang-default-resource-limits
+)
+
+if(WIN32)
+    target_compile_definitions(VulkanRHITest PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+endif()
+
+set_target_properties(VulkanRHITest PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
