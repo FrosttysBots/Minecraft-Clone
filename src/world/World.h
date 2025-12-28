@@ -6,6 +6,7 @@
 #include "../render/ChunkMesh.h"
 #include "../render/GPUCulling.h"
 #include "../render/VertexPool.h"
+#include "../render/RayBoxSprites.h"
 #include "../core/CrashHandler.h"
 #include "WorldSaveLoad.h"
 #include <unordered_map>
@@ -225,6 +226,10 @@ public:
     // Chunks stored by position
     std::unordered_map<glm::ivec2, std::unique_ptr<Chunk>> chunks;
 
+    // Mutex for thread-safe chunk access (used by mesh worker threads)
+    // Using recursive_mutex to allow nested locking from methods that call getChunk
+    mutable std::recursive_mutex chunksMutex;
+
     // Chunk meshes stored by position
     std::unordered_map<glm::ivec2, std::unique_ptr<ChunkMesh>> meshes;
 
@@ -259,8 +264,16 @@ public:
     bool gpuCullingInitialized = false;  // Track initialization state
     std::vector<GPUCulling::SubChunkData> gpuSubChunkData;  // Cached sub-chunk data for GPU upload
 
+    // Ray-box sprite renderer for distant voxels (LOD 3+)
+    RayBoxSprites::RayBoxSpriteRenderer rayBoxRenderer;
+    bool rayBoxSpritesEnabled = true;  // Enable ray-box sprites for distant chunks
+    int rayBoxMinLOD = 3;  // Minimum LOD level to use ray-box sprites
+
     // Backend flag - when false, skip all OpenGL operations (for Vulkan backend)
     bool useOpenGLMeshes = true;
+
+    // Warm-up frames to skip frustum culling (fixes initial render issue)
+    int warmupFrames = 5;
 
     // Terrain generator (for main thread fallback)
     TerrainGenerator terrainGenerator;
@@ -398,6 +411,7 @@ public:
 
     // Get or create chunk at position
     Chunk* getChunk(glm::ivec2 pos) {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
         auto it = chunks.find(pos);
         if (it != chunks.end()) {
             return it->second.get();
@@ -407,6 +421,7 @@ public:
 
     // Get chunk at position (const)
     const Chunk* getChunk(glm::ivec2 pos) const {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
         auto it = chunks.find(pos);
         if (it != chunks.end()) {
             return it->second.get();
@@ -416,6 +431,7 @@ public:
 
     // Create a new chunk at position
     Chunk* createChunk(glm::ivec2 pos) {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
         auto chunk = std::make_unique<Chunk>(pos);
         Chunk* ptr = chunk.get();
         chunks[pos] = std::move(chunk);
@@ -501,7 +517,10 @@ public:
                 if (WorldSaveLoad::loadChunk(worldSavePath, *chunk, chunkPos)) {
                     chunk->isDirty = true;
                     chunk->recalculateHeightmaps();
-                    chunks[chunkPos] = std::move(chunk);
+                    {
+                        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                        chunks[chunkPos] = std::move(chunk);
+                    }
                     pregenerationProgress++;
                     continue;
                 }
@@ -526,7 +545,10 @@ public:
             if (WorldSaveLoad::loadChunk(worldSavePath, *chunk, chunkPos)) {
                 chunk->isDirty = true;
                 chunk->recalculateHeightmaps();
-                chunks[chunkPos] = std::move(chunk);
+                {
+                    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                    chunks[chunkPos] = std::move(chunk);
+                }
                 return true;
             }
         }
@@ -728,6 +750,9 @@ public:
         lastCulledSubChunks = 0;
         lastRenderedWaterSubChunks = 0;
         lastCulledWaterSubChunks = 0;
+
+        // Reset warmup frames for new world
+        warmupFrames = 10;
     }
 
     // Water simulation timer
@@ -894,7 +919,11 @@ public:
             }
 
             // Enable burst mode until we have most chunks loaded
-            int loadedChunks = static_cast<int>(chunks.size());
+            int loadedChunks;
+            {
+                std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                loadedChunks = static_cast<int>(chunks.size());
+            }
             int loadedMeshes = static_cast<int>(meshes.size());
 
             if (loadedChunks >= targetChunkCount && loadedMeshes >= targetChunkCount * 0.8f) {
@@ -945,6 +974,9 @@ public:
 
         // Process pending chunk saves (batched to avoid I/O stalls)
         processPendingSaves();
+
+        // Decrement warmup counter (skip frustum culling for first few frames)
+        if (warmupFrames > 0) warmupFrames--;
 
         lastPlayerChunk = playerChunk;
     }
@@ -1098,25 +1130,29 @@ public:
             }
 
             // Only add if not already present (could have been unloaded while generating)
-            if (getChunk(result.position) == nullptr) {
-                chunks[result.position] = std::move(result.chunk);
-                chunks[result.position]->isDirty = true;
-
-                // Mark neighboring chunks as dirty
-                markChunkDirty(glm::ivec2(result.position.x - 1, result.position.y));
-                markChunkDirty(glm::ivec2(result.position.x + 1, result.position.y));
-                markChunkDirty(glm::ivec2(result.position.x, result.position.y - 1));
-                markChunkDirty(glm::ivec2(result.position.x, result.position.y + 1));
-
-                // Queue chunk for async save (don't save immediately - causes 40ms+ stalls)
-                if (useChunkCaching && !worldSavePath.empty()) {
-                    pendingSaveQueue.push(result.position);
+            {
+                std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                auto it = chunks.find(result.position);
+                if (it == chunks.end()) {
+                    chunks[result.position] = std::move(result.chunk);
+                    chunks[result.position]->isDirty = true;
                 }
+            }
 
-                // Update pregeneration progress
-                if (pregenerationActive) {
-                    pregenerationProgress++;
-                }
+            // Mark neighboring chunks as dirty (uses getChunk which handles locking)
+            markChunkDirty(glm::ivec2(result.position.x - 1, result.position.y));
+            markChunkDirty(glm::ivec2(result.position.x + 1, result.position.y));
+            markChunkDirty(glm::ivec2(result.position.x, result.position.y - 1));
+            markChunkDirty(glm::ivec2(result.position.x, result.position.y + 1));
+
+            // Queue chunk for async save (don't save immediately - causes 40ms+ stalls)
+            if (useChunkCaching && !worldSavePath.empty()) {
+                pendingSaveQueue.push(result.position);
+            }
+
+            // Update pregeneration progress
+            if (pregenerationActive) {
+                pregenerationProgress++;
             }
             processed++;
         }
@@ -1235,19 +1271,26 @@ public:
     void unloadDistantChunks(const glm::ivec2& playerChunk) {
         std::vector<glm::ivec2> toRemove;
 
-        // Find chunks to unload
-        for (auto& [pos, chunk] : chunks) {
-            int dx = abs(pos.x - playerChunk.x);
-            int dz = abs(pos.y - playerChunk.y);
+        // Find chunks to unload (with lock)
+        {
+            std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+            for (auto& [pos, chunk] : chunks) {
+                int dx = abs(pos.x - playerChunk.x);
+                int dz = abs(pos.y - playerChunk.y);
 
-            if (dx > unloadDistance || dz > unloadDistance) {
-                toRemove.push_back(pos);
+                if (dx > unloadDistance || dz > unloadDistance) {
+                    toRemove.push_back(pos);
+                }
+            }
+
+            // Remove distant chunks (inside lock)
+            for (const auto& pos : toRemove) {
+                chunks.erase(pos);
             }
         }
 
-        // Remove distant chunks and their meshes
+        // Remove meshes (no lock needed - meshes accessed only from main thread)
         for (const auto& pos : toRemove) {
-            chunks.erase(pos);
             meshes.erase(pos);
         }
     }
@@ -1463,6 +1506,11 @@ public:
                     mesh->uploadWaterToSubChunk(subY, subData.waterVertices);
                 }
             }
+
+            // Update 3D lightmap texture for smooth lighting across greedy-meshed quads
+            // This must be done after all sub-chunk uploads so the lightmap is ready for rendering
+            mesh->updateLightmap(*chunk);
+
             processed++;
         }
 
@@ -1604,6 +1652,8 @@ public:
             if (chunkOffsetLoc >= 0) {
                 glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(chunk.mesh->worldOffset));
             }
+            // Bind 3D lightmap texture for smooth lighting
+            chunk.mesh->bindLightmap(2);
             // Calculate LOD level based on distance (or use forced LOD for shadow pass)
             int lodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(chunk.distSq);
             chunk.mesh->render(lodLevel);
@@ -1648,14 +1698,14 @@ public:
                     // Create sub-chunk position (chunkX, subChunkY, chunkZ)
                     glm::ivec3 subPos(pos.x, subY, pos.y);
 
-                    // Frustum culling per sub-chunk
-                    if (!frustum.isSubChunkVisible(subPos)) {
+                    // Frustum culling per sub-chunk (skip during warmup to fix initial render)
+                    if (warmupFrames <= 0 && !frustum.isSubChunkVisible(subPos)) {
                         lastCulledSubChunks++;
                         continue;
                     }
 
-                    // Hi-Z occlusion culling per sub-chunk (if enabled)
-                    if (useHiZCulling && !hiZSubChunkVisibility.empty()) {
+                    // Hi-Z occlusion culling per sub-chunk (if enabled, skip during warmup)
+                    if (warmupFrames <= 0 && useHiZCulling && !hiZSubChunkVisibility.empty()) {
                         auto it = hiZSubChunkVisibility.find(subPos);
                         if (it != hiZSubChunkVisibility.end() && !it->second) {
                             lastHiZCulledChunks++;
@@ -1680,11 +1730,13 @@ public:
         // Render sorted sub-chunks with LOD based on distance
         ChunkMesh* lastMesh = nullptr;
         for (const auto& sub : visibleSubChunks) {
-            // Only update uniform if mesh changed (batching optimization)
+            // Only update uniform and bind lightmap if mesh changed (batching optimization)
             if (sub.mesh != lastMesh) {
                 if (chunkOffsetLoc >= 0) {
                     glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(sub.mesh->worldOffset));
                 }
+                // Bind 3D lightmap texture for smooth lighting
+                sub.mesh->bindLightmap(2);
                 lastMesh = sub.mesh;
             }
 
@@ -1868,6 +1920,8 @@ public:
             if (chunkOffsetLoc >= 0) {
                 glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(col.mesh->worldOffset));
             }
+            // Bind 3D lightmap texture for smooth lighting
+            col.mesh->bindLightmap(2);
 
             // Render all sub-chunks in this column
             for (const auto& [subY, lodLevel] : col.subChunks) {
@@ -2004,9 +2058,13 @@ public:
                     continue;
                 }
 
-                // Update chunk offset if mesh changed
-                if (ref.mesh != lastMesh && chunkOffsetLoc >= 0) {
-                    glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(ref.mesh->worldOffset));
+                // Update chunk offset and lightmap if mesh changed
+                if (ref.mesh != lastMesh) {
+                    if (chunkOffsetLoc >= 0) {
+                        glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(ref.mesh->worldOffset));
+                    }
+                    // Bind 3D lightmap texture for smooth lighting
+                    ref.mesh->bindLightmap(2);
                     lastMesh = ref.mesh;
                 }
 
@@ -2016,9 +2074,15 @@ public:
         } else {
             glUnmapBuffer(GL_DRAW_INDIRECT_BUFFER);
             // Fallback: render all (GPU cull failed)
+            ChunkMesh* lastMesh = nullptr;
             for (const auto& ref : subChunkRefs) {
-                if (ref.mesh != nullptr && chunkOffsetLoc >= 0) {
-                    glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(ref.mesh->worldOffset));
+                if (ref.mesh != nullptr && ref.mesh != lastMesh) {
+                    if (chunkOffsetLoc >= 0) {
+                        glUniform3fv(chunkOffsetLoc, 1, glm::value_ptr(ref.mesh->worldOffset));
+                    }
+                    // Bind 3D lightmap texture for smooth lighting
+                    ref.mesh->bindLightmap(2);
+                    lastMesh = ref.mesh;
                 }
                 ref.mesh->renderSubChunk(ref.subChunkY, ref.lodLevel);
                 lastRenderedSubChunks++;
@@ -2028,6 +2092,87 @@ public:
         glBindBuffer(GL_DRAW_INDIRECT_BUFFER, 0);
         lastRenderedChunks = static_cast<int>(meshes.size());
     }
+
+    // ================================================================
+    // RAY-BOX SPRITE RENDERING (for distant voxels)
+    // ================================================================
+    // Collects and renders distant blocks as point sprites with ray-traced cube intersection
+    // Only used for chunks at LOD 3+ (80-100% of render distance)
+    void renderDistantBlockSprites(const glm::vec3& playerPos, const glm::mat4& view,
+                                    const glm::mat4& projection, const glm::vec3& lightDir,
+                                    const glm::vec3& lightColor, const glm::vec3& ambientColor,
+                                    const glm::vec3& skyColor, float fogDensity, float time,
+                                    const glm::vec2& viewportSize, GLuint textureAtlas) {
+        if (!rayBoxSpritesEnabled || !useOpenGLMeshes) return;
+
+        // Initialize renderer if needed
+        if (!rayBoxRenderer.initialized) {
+            if (!rayBoxRenderer.initialize()) {
+                rayBoxSpritesEnabled = false;  // Disable if init fails
+                return;
+            }
+        }
+
+        // Clear sprites from previous frame
+        rayBoxRenderer.beginFrame();
+
+        glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
+        float maxDistSq = static_cast<float>(renderDistance * renderDistance);
+
+        // Collect visible blocks from distant chunks (LOD 3+)
+        for (auto& [pos, chunk] : chunks) {
+            int dx = pos.x - playerChunk.x;
+            int dz = pos.y - playerChunk.y;
+            float distSq = static_cast<float>(dx * dx + dz * dz);
+
+            // Only process chunks at LOD 3+ distance (80-100% of render distance)
+            float ratio = distSq / maxDistSq;
+            if (ratio < 0.64f) continue;  // Skip chunks closer than LOD 3 threshold
+
+            // Skip if chunk not in frustum
+            if (!frustum.isChunkVisible(pos)) continue;
+
+            // Add visible surface blocks from this chunk
+            glm::vec3 worldOffset(pos.x * CHUNK_SIZE_X, 0, pos.y * CHUNK_SIZE_Z);
+
+            // Iterate through the chunk and add exposed surface blocks
+            for (int y = 0; y < CHUNK_SIZE_Y; y++) {
+                for (int z = 0; z < CHUNK_SIZE_Z; z++) {
+                    for (int x = 0; x < CHUNK_SIZE_X; x++) {
+                        BlockType block = chunk->getBlock(x, y, z);
+                        if (block == BlockType::AIR) continue;  // Skip air
+
+                        // Quick check: only add blocks with at least one exposed face
+                        bool exposed = false;
+                        if (x == 0 || chunk->getBlock(x-1, y, z) == BlockType::AIR) exposed = true;
+                        else if (x == CHUNK_SIZE_X-1 || chunk->getBlock(x+1, y, z) == BlockType::AIR) exposed = true;
+                        else if (y == 0 || chunk->getBlock(x, y-1, z) == BlockType::AIR) exposed = true;
+                        else if (y == CHUNK_SIZE_Y-1 || chunk->getBlock(x, y+1, z) == BlockType::AIR) exposed = true;
+                        else if (z == 0 || chunk->getBlock(x, y, z-1) == BlockType::AIR) exposed = true;
+                        else if (z == CHUNK_SIZE_Z-1 || chunk->getBlock(x, y, z+1) == BlockType::AIR) exposed = true;
+
+                        if (exposed) {
+                            rayBoxRenderer.addSprite(
+                                worldOffset + glm::vec3(x, y, z),
+                                static_cast<uint32_t>(block)
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Render collected sprites
+        float renderDistBlocks = static_cast<float>(renderDistance * CHUNK_SIZE_X);
+        rayBoxRenderer.render(view, projection, playerPos, lightDir, lightColor,
+                              ambientColor, skyColor, fogDensity, renderDistBlocks,
+                              time, viewportSize, textureAtlas);
+    }
+
+    int getDistantSpriteCount() const {
+        return rayBoxRenderer.lastSpriteCount;
+    }
+
 
     // Render all water geometry - call this AFTER render() with depth write disabled
     // Sorted back-to-front for proper alpha blending
@@ -2196,6 +2341,7 @@ public:
 
     // Get number of loaded chunks
     size_t getChunkCount() const {
+        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
         return chunks.size();
     }
 
