@@ -473,7 +473,6 @@ public:
 
     // Advanced settings
     Dropdown rendererDropdown;  // OpenGL / Vulkan selection
-    Checkbox deferredCheckbox;
     Checkbox hiZCheckbox;
     Slider chunkSpeedSlider;
     Slider meshSpeedSlider;
@@ -706,10 +705,7 @@ public:
             [](int idx) { g_config.renderer = static_cast<RendererType>(idx); }};
 
         float row2Y = startY + spacing;
-        deferredCheckbox = {col1, row2Y, 26, "Deferred Rendering", g_config.enableDeferredRendering,
-            [](bool val) { g_config.enableDeferredRendering = val; }};
-
-        hiZCheckbox = {col2, row2Y, 26, "Hi-Z Occlusion Culling", g_config.enableHiZCulling,
+        hiZCheckbox = {col1, row2Y, 26, "Hi-Z Occlusion Culling", g_config.enableHiZCulling,
             [](bool val) { g_config.enableHiZCulling = val; }};
 
         float row3Y = row2Y + spacing;
@@ -774,7 +770,6 @@ public:
         motionBlurCheckbox.checked = g_config.enableMotionBlur;
         upscaleDropdown.selectedIndex = static_cast<int>(g_config.upscaleMode);
         rendererDropdown.selectedIndex = static_cast<int>(g_config.renderer);
-        deferredCheckbox.checked = g_config.enableDeferredRendering;
         hiZCheckbox.checked = g_config.enableHiZCulling;
         chunkSpeedSlider.value = static_cast<float>(g_config.maxChunksPerFrame);
         meshSpeedSlider.value = static_cast<float>(g_config.maxMeshesPerFrame);
@@ -977,7 +972,6 @@ public:
 
             case SettingsTab::ADVANCED:
                 handleDropdown(rendererDropdown, mx, my);
-                handleCheckbox(deferredCheckbox, mx, my);
                 handleCheckbox(hiZCheckbox, mx, my);
                 handleSlider(chunkSpeedSlider, mx, my);
                 handleSlider(meshSpeedSlider, mx, my);
@@ -1167,7 +1161,6 @@ public:
 
     void renderAdvancedTab() {
         rendererDropdown.render(ui);
-        deferredCheckbox.render(ui);
         hiZCheckbox.render(ui);
         chunkSpeedSlider.render(ui);
         meshSpeedSlider.render(ui);

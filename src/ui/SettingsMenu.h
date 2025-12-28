@@ -8,6 +8,10 @@
 #include "../core/Config.h"
 #include <functional>
 #include <algorithm>
+#include <fstream>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 enum class SettingsAction {
     NONE,
@@ -20,7 +24,8 @@ enum class SettingsTab {
     EFFECTS,
     PERFORMANCE,
     CONTROLS,
-    AUDIO
+    AUDIO,
+    TITLE_SCREEN
 };
 
 class SettingsMenu {
@@ -37,6 +42,7 @@ public:
     MenuButton performanceTabBtn;
     MenuButton controlsTabBtn;
     MenuButton audioTabBtn;
+    MenuButton titleScreenTabBtn;
 
     // === GRAPHICS TAB ===
     MenuDropdown graphicsPresetDropdown;
@@ -61,7 +67,6 @@ public:
     MenuCheckbox volumetricCloudsCheckbox;
 
     // === PERFORMANCE TAB ===
-    MenuCheckbox deferredCheckbox;
     MenuCheckbox hiZCheckbox;
     MenuCheckbox batchedRenderingCheckbox;
     MenuSlider chunkSpeedSlider;
@@ -78,6 +83,14 @@ public:
     MenuSlider musicVolumeSlider;
     MenuSlider sfxVolumeSlider;
 
+    // === TITLE SCREEN TAB ===
+    MenuDropdown titleSourceDropdown;
+    MenuTextInput titleSeedInput;
+    MenuSlider titleRenderDistSlider;
+    MenuDropdown titleWorldDropdown;
+    std::vector<std::string> savedWorldNames;
+    std::vector<std::string> savedWorldPaths;
+
     // Action buttons
     MenuButton backButton;
     MenuButton applyButton;
@@ -92,6 +105,9 @@ public:
     bool showAppliedFeedback = false;
     float appliedFeedbackTimer = 0.0f;
     static constexpr float APPLIED_FEEDBACK_DURATION = 2.5f;  // seconds (longer for visibility)
+
+    // Delta time for text input rendering
+    float currentDeltaTime = 0.016f;
 
     void init(MenuUIRenderer* uiRenderer) {
         ui = uiRenderer;
@@ -112,43 +128,49 @@ public:
         float panelX = centerX - panelWidth / 2.0f;
         float panelY = ui->windowHeight / 2.0f - panelHeight / 2.0f;
 
-        float tabWidth = 120.0f;
+        float tabWidth = 110.0f;  // Narrower to fit 6 tabs
         float tabHeight = 36.0f;
         float tabY = panelY + 50.0f;
-        float tabSpacing = 8.0f;
+        float tabSpacing = 6.0f;
 
-        // Tab buttons (5 tabs)
-        float tabStartX = panelX + 25;
+        // Tab buttons (6 tabs)
+        float tabStartX = panelX + 20;
 
         graphicsTabBtn = {
             tabStartX, tabY, tabWidth, tabHeight, "GRAPHICS",
             [this]() { currentTab = SettingsTab::GRAPHICS; }
         };
-        graphicsTabBtn.textScale = 0.9f;
+        graphicsTabBtn.textScale = 0.85f;
 
         effectsTabBtn = {
             tabStartX + (tabWidth + tabSpacing), tabY, tabWidth, tabHeight, "EFFECTS",
             [this]() { currentTab = SettingsTab::EFFECTS; }
         };
-        effectsTabBtn.textScale = 0.9f;
+        effectsTabBtn.textScale = 0.85f;
 
         performanceTabBtn = {
-            tabStartX + 2 * (tabWidth + tabSpacing), tabY, tabWidth, tabHeight, "PERFORMANCE",
+            tabStartX + 2 * (tabWidth + tabSpacing), tabY, tabWidth, tabHeight, "PERFORM",
             [this]() { currentTab = SettingsTab::PERFORMANCE; }
         };
-        performanceTabBtn.textScale = 0.9f;
+        performanceTabBtn.textScale = 0.85f;
 
         controlsTabBtn = {
             tabStartX + 3 * (tabWidth + tabSpacing), tabY, tabWidth, tabHeight, "CONTROLS",
             [this]() { currentTab = SettingsTab::CONTROLS; }
         };
-        controlsTabBtn.textScale = 0.9f;
+        controlsTabBtn.textScale = 0.85f;
 
         audioTabBtn = {
             tabStartX + 4 * (tabWidth + tabSpacing), tabY, tabWidth, tabHeight, "AUDIO",
             [this]() { currentTab = SettingsTab::AUDIO; }
         };
-        audioTabBtn.textScale = 0.9f;
+        audioTabBtn.textScale = 0.85f;
+
+        titleScreenTabBtn = {
+            tabStartX + 5 * (tabWidth + tabSpacing), tabY, tabWidth, tabHeight, "TITLE",
+            [this]() { currentTab = SettingsTab::TITLE_SCREEN; }
+        };
+        titleScreenTabBtn.textScale = 0.85f;
 
         float contentY = tabY + tabHeight + 35;  // More space after tabs
         float col1X = panelX + 30;
@@ -288,29 +310,24 @@ public:
         };
 
         // === PERFORMANCE TAB ===
-        deferredCheckbox = {
-            col1X, contentY, 24, "Deferred Rendering", g_config.enableDeferredRendering,
-            [](bool val) { g_config.enableDeferredRendering = val; }
-        };
-
         hiZCheckbox = {
-            col2X, contentY, 24, "Hi-Z Occlusion Culling", g_config.enableHiZCulling,
+            col1X, contentY, 24, "Hi-Z Occlusion Culling", g_config.enableHiZCulling,
             [](bool val) { g_config.enableHiZCulling = val; }
         };
 
         batchedRenderingCheckbox = {
-            col1X, contentY + rowSpacing, 24, "Batched Rendering", g_config.enableBatchedRendering,
+            col2X, contentY, 24, "Batched Rendering", g_config.enableBatchedRendering,
             [](bool val) { g_config.enableBatchedRendering = val; }
         };
 
         chunkSpeedSlider = {
-            col1X, contentY + rowSpacing * 2 + 5, sliderWidth, 26, "Chunks per Frame",
+            col1X, contentY + rowSpacing + 5, sliderWidth, 26, "Chunks per Frame",
             1.0f, 32.0f, static_cast<float>(g_config.maxChunksPerFrame),
             [](float val) { g_config.maxChunksPerFrame = static_cast<int>(val); }
         };
 
         meshSpeedSlider = {
-            col2X, contentY + rowSpacing * 2 + 5, sliderWidth, 26, "Meshes per Frame",
+            col2X, contentY + rowSpacing + 5, sliderWidth, 26, "Meshes per Frame",
             1.0f, 32.0f, static_cast<float>(g_config.maxMeshesPerFrame),
             [](float val) { g_config.maxMeshesPerFrame = static_cast<int>(val); }
         };
@@ -352,6 +369,47 @@ public:
             nullptr
         };
 
+        // === TITLE SCREEN TAB ===
+        // Load saved worlds list
+        loadSavedWorldsList();
+
+        titleSourceDropdown = {
+            col1X, contentY, dropdownWidth + 40, 32, "Background Source",
+            {"Random Each Launch", "Custom Seed", "Saved World"},
+            static_cast<int>(g_config.titleScreen.sourceMode),
+            [this](int idx) {
+                g_config.titleScreen.sourceMode = static_cast<TitleScreenSource>(idx);
+            }
+        };
+        allDropdowns.push_back(&titleSourceDropdown);
+
+        titleSeedInput = {
+            col1X, contentY + rowSpacing, sliderWidth + 80, 40,
+            "Custom Seed",
+            g_config.titleScreen.customSeed,
+            "Enter seed...",
+            [](const std::string& text) { g_config.titleScreen.customSeed = text; }
+        };
+        titleSeedInput.maxLength = 20;
+
+        titleWorldDropdown = {
+            col1X, contentY + rowSpacing * 2, dropdownWidth + 80, 32, "Saved World",
+            savedWorldNames.empty() ? std::vector<std::string>{"(No saved worlds)"} : savedWorldNames,
+            0,
+            [this](int idx) {
+                if (idx >= 0 && idx < static_cast<int>(savedWorldPaths.size())) {
+                    g_config.titleScreen.savedWorldPath = savedWorldPaths[idx];
+                }
+            }
+        };
+        allDropdowns.push_back(&titleWorldDropdown);
+
+        titleRenderDistSlider = {
+            col1X, contentY + rowSpacing * 3 + 5, sliderWidth, 26, "Title Render Distance",
+            32.0f, 64.0f, static_cast<float>(g_config.titleScreen.renderDistance),
+            [](float val) { g_config.titleScreen.renderDistance = static_cast<int>(val); }
+        };
+
         // Action buttons
         float btnY = panelY + panelHeight - 55;
         backButton = {
@@ -377,6 +435,40 @@ public:
         if (ui) {
             ui->resize(width, height);
             setupUI();
+        }
+    }
+
+    void loadSavedWorldsList() {
+        savedWorldNames.clear();
+        savedWorldPaths.clear();
+
+        // Scan saves directory for worlds
+        std::string savesPath = "saves";
+        #ifdef _WIN32
+        WIN32_FIND_DATAA findData;
+        HANDLE hFind = FindFirstFileA((savesPath + "/*").c_str(), &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    std::string name = findData.cFileName;
+                    if (name != "." && name != "..") {
+                        std::string worldPath = savesPath + "/" + name;
+                        std::string metaPath = worldPath + "/world.meta";
+                        std::ifstream metaFile(metaPath);
+                        if (metaFile.is_open()) {
+                            savedWorldNames.push_back(name);
+                            savedWorldPaths.push_back(worldPath);
+                            metaFile.close();
+                        }
+                    }
+                }
+            } while (FindNextFileA(hFind, &findData));
+            FindClose(hFind);
+        }
+        #endif
+
+        if (savedWorldNames.empty()) {
+            savedWorldNames.push_back("(No saved worlds)");
         }
     }
 
@@ -411,7 +503,6 @@ public:
         volumetricCloudsCheckbox.checked = (g_config.cloudStyle == CloudStyle::VOLUMETRIC);
 
         // Performance
-        deferredCheckbox.checked = g_config.enableDeferredRendering;
         hiZCheckbox.checked = g_config.enableHiZCulling;
         batchedRenderingCheckbox.checked = g_config.enableBatchedRendering;
         chunkSpeedSlider.value = static_cast<float>(g_config.maxChunksPerFrame);
@@ -420,10 +511,17 @@ public:
         // Controls
         sensitivitySlider.value = g_config.mouseSensitivity * 100.0f;
         invertYCheckbox.checked = g_config.invertY;
+
+        // Title Screen
+        titleSourceDropdown.selectedIndex = static_cast<int>(g_config.titleScreen.sourceMode);
+        titleSeedInput.text = g_config.titleScreen.customSeed;
+        titleRenderDistSlider.value = static_cast<float>(g_config.titleScreen.renderDistance);
+        loadSavedWorldsList();
     }
 
     void update(double mouseX, double mouseY, bool mousePressed, float deltaTime = 0.016f) {
         currentAction = SettingsAction::NONE;
+        currentDeltaTime = deltaTime;  // Store for render()
 
         // Update APPLIED feedback animation
         if (showAppliedFeedback) {
@@ -442,6 +540,7 @@ public:
         input.handleButton(performanceTabBtn);
         input.handleButton(controlsTabBtn);
         input.handleButton(audioTabBtn);
+        input.handleButton(titleScreenTabBtn);
 
         // Action buttons
         input.handleButton(backButton);
@@ -474,7 +573,6 @@ public:
                 break;
 
             case SettingsTab::PERFORMANCE:
-                input.handleCheckbox(deferredCheckbox);
                 input.handleCheckbox(hiZCheckbox);
                 input.handleCheckbox(batchedRenderingCheckbox);
                 input.handleSlider(chunkSpeedSlider);
@@ -491,6 +589,17 @@ public:
                 input.handleSlider(masterVolumeSlider);
                 input.handleSlider(musicVolumeSlider);
                 input.handleSlider(sfxVolumeSlider);
+                break;
+
+            case SettingsTab::TITLE_SCREEN:
+                input.handleDropdown(titleSourceDropdown, allDropdowns);
+                // Only show relevant controls based on source mode
+                if (g_config.titleScreen.sourceMode == TitleScreenSource::CUSTOM_SEED) {
+                    input.handleTextInput(titleSeedInput);
+                } else if (g_config.titleScreen.sourceMode == TitleScreenSource::SAVED_WORLD) {
+                    input.handleDropdown(titleWorldDropdown, allDropdowns);
+                }
+                input.handleSlider(titleRenderDistSlider);
                 break;
         }
     }
@@ -528,6 +637,7 @@ public:
         renderTab(performanceTabBtn, SettingsTab::PERFORMANCE);
         renderTab(controlsTabBtn, SettingsTab::CONTROLS);
         renderTab(audioTabBtn, SettingsTab::AUDIO);
+        renderTab(titleScreenTabBtn, SettingsTab::TITLE_SCREEN);
 
         // Tab content
         switch (currentTab) {
@@ -566,7 +676,6 @@ public:
                 break;
 
             case SettingsTab::PERFORMANCE:
-                deferredCheckbox.render(*ui);
                 hiZCheckbox.render(*ui);
                 batchedRenderingCheckbox.render(*ui);
                 chunkSpeedSlider.render(*ui);
@@ -585,6 +694,25 @@ public:
                 sfxVolumeSlider.render(*ui);
                 ui->drawText("(Audio not yet implemented)", panelX + 40,
                             panelY + 300, MenuColors::TEXT_DIM, 1.0f);
+                break;
+
+            case SettingsTab::TITLE_SCREEN:
+                titleSourceDropdown.render(*ui);
+                // Only show relevant controls based on source mode
+                if (g_config.titleScreen.sourceMode == TitleScreenSource::CUSTOM_SEED) {
+                    titleSeedInput.render(*ui, currentDeltaTime);
+                } else if (g_config.titleScreen.sourceMode == TitleScreenSource::SAVED_WORLD) {
+                    titleWorldDropdown.render(*ui);
+                }
+                titleRenderDistSlider.render(*ui);
+                // Info text
+                ui->drawText("Changes take effect on next launch or menu return",
+                            panelX + 40, panelY + 380, MenuColors::TEXT_DIM, 0.9f);
+                // Render dropdown options last
+                titleSourceDropdown.renderOptions(*ui);
+                if (g_config.titleScreen.sourceMode == TitleScreenSource::SAVED_WORLD) {
+                    titleWorldDropdown.renderOptions(*ui);
+                }
                 break;
         }
 

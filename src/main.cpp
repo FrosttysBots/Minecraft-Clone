@@ -114,11 +114,11 @@ bool g_advancedDebugInfo = false;   // F3+H - Show advanced debug info
 int g_renderDistanceOverride = 0;   // F3+F/Shift+F - Temporary render distance adjustment
 
 // Deferred rendering toggles
-// NOTE: Deferred rendering is currently disabled pending fixes to G-buffer rendering
-// Set to false to use forward rendering path (more stable, better performance for voxel scenes)
-bool g_useDeferredRendering = false;  // Master toggle - DISABLED
-bool g_enableSSAO = true;             // SSAO toggle (only works with deferred)
-bool g_useRHIRenderer = true;         // Use RHI-based renderer - ENABLED for testing
+// NOTE: Deferred rendering has been removed - using forward rendering only
+// Forward rendering provides better performance and stability for voxel scenes
+bool g_useDeferredRendering = false;  // DISABLED - forward rendering only
+bool g_enableSSAO = false;            // SSAO disabled (requires deferred)
+bool g_useRHIRenderer = false;        // RHI renderer disabled
 std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;  // Kept for future use
 
 // Benchmark system
@@ -832,6 +832,12 @@ InputState processInput(GLFWwindow* window) {
             g_deferredDebugMode = (g_deferredDebugMode + 1) % 9;
             const char* modeNames[] = {"Normal", "Albedo", "Normals", "Position", "Depth", "Vertex AO", "AO*SSAO", "Diffuse Only", "Light Level"};
             std::cout << "Debug mode: " << modeNames[g_deferredDebugMode] << std::endl;
+
+            // Update RHI renderer's debug mode
+            if (g_rhiRenderer) {
+                g_rhiRenderer->setDebugMode(g_deferredDebugMode);
+            }
+
             debugTogglePressed = true;
         }
     } else {
@@ -850,9 +856,9 @@ InputState processInput(GLFWwindow* window) {
         perfStatsTogglePressed = false;
     }
 
-    // FSR toggle (F12) - Note: Only affects runtime, FBOs are created at startup
+    // FSR toggle (F7) - Note: Only affects runtime, FBOs are created at startup
     static bool fsrTogglePressed = false;
-    if (glfwGetKey(window, GLFW_KEY_F12) == GLFW_PRESS) {
+    if (glfwGetKey(window, GLFW_KEY_F7) == GLFW_PRESS) {
         if (!fsrTogglePressed) {
             // FSR can only be toggled if scene FBO was created at startup
             if (sceneFBO != 0) {
@@ -6298,6 +6304,7 @@ int main() {
 
                 g_rhiRenderer->setLighting(lighting);
                 g_rhiRenderer->setFog(fog);
+                g_rhiRenderer->setTextureAtlas(textureAtlas.textureID);
 
                 // Render frame using RHI
                 static bool loggedFirstRender = false;
@@ -7041,6 +7048,18 @@ int main() {
 
             // Render solid geometry first (pass chunkOffsetLoc for packed vertices)
             world.render(camera.position, chunkOffsetLoc);
+
+            // Ray-box sprite rendering for distant voxels (experimental)
+            // Renders distant chunks (LOD 3+) as point sprites with ray-traced cube intersection
+            if (world.rayBoxSpritesEnabled) {
+                glm::vec2 viewportSize(static_cast<float>(WINDOW_WIDTH), static_cast<float>(WINDOW_HEIGHT));
+                world.renderDistantBlockSprites(
+                    camera.position, view, projection,
+                    lightDir, lightColor, ambientColor, skyColor,
+                    fogDensity, static_cast<float>(glfwGetTime()),
+                    viewportSize, textureAtlas.textureID
+                );
+            }
         } // End of deferred/forward rendering path selection
 
         // ============================================================
@@ -7254,6 +7273,19 @@ int main() {
             }
         }
 
+        // ============================================
+        // DEBUG MODE INDICATOR (always visible when debug mode active)
+        // ============================================
+        if (g_deferredDebugMode > 0 && g_useDeferredRendering) {
+            const char* modeNames[] = {"Normal", "Albedo", "Normals", "Position", "Depth", "Vertex AO", "AO*SSAO", "Diffuse Only", "Light Level"};
+            std::string debugText = "DEBUG MODE: " + std::string(modeNames[g_deferredDebugMode]) + " (F12 to cycle)";
+            menuUI.beginFrame();
+            float textWidth = debugText.length() * 8.0f;
+            float boxX = (WINDOW_WIDTH - textWidth - 20) / 2.0f;
+            menuUI.drawRect(boxX, 50, textWidth + 20, 30, glm::vec4(0.0f, 0.0f, 0.0f, 0.8f));
+            menuUI.drawText(debugText, boxX + 10, 58, glm::vec4(1.0f, 1.0f, 0.0f, 1.0f), 1.0f);
+            menuUI.endFrame();
+        }
         // Swap buffers (poll events is at the start of the loop)
         // Skip if RHI renderer is active - it handles its own swap in endFrame()
         if (!(g_useRHIRenderer && g_rhiRenderer && g_useDeferredRendering)) {

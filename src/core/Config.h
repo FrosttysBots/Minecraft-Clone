@@ -41,6 +41,25 @@ enum class UpscaleMode {
     ULTRA_PERF = 4    // 3.0x - 33% render scale (FSR Ultra Performance)
 };
 
+// Title screen background source
+enum class TitleScreenSource {
+    RANDOM = 0,       // Random seed each launch
+    CUSTOM_SEED = 1,  // User-specified seed
+    SAVED_WORLD = 2   // Load from saved world
+};
+
+// Title screen world settings
+struct TitleScreenSettings {
+    TitleScreenSource sourceMode = TitleScreenSource::RANDOM;
+    std::string customSeed = "";
+    std::string savedWorldPath = "";
+    int renderDistance = 8;
+    float continentScale = 25.0f;
+    float mountainScale = 50.0f;
+    float detailScale = 5.0f;
+    int generationType = 0;
+};
+
 // Anti-Aliasing modes
 enum class AntiAliasMode {
     NONE = 0,         // No anti-aliasing
@@ -68,13 +87,19 @@ enum class GraphicsPreset {
     CUSTOM = 4        // User-customized settings
 };
 
+// Ambient Occlusion type
+enum class AOType {
+    SSAO = 0,         // Standard Screen-Space Ambient Occlusion
+    HBAO = 1          // Horizon-Based Ambient Occlusion (better quality, slightly slower)
+};
+
 // Ambient Occlusion quality
 enum class AOQuality {
     OFF = 0,
-    LOW = 1,          // 8 samples
-    MEDIUM = 2,       // 16 samples
-    HIGH = 3,         // 32 samples
-    ULTRA = 4         // 64 samples
+    LOW = 1,          // 8 samples / 4 directions
+    MEDIUM = 2,       // 16 samples / 6 directions
+    HIGH = 3,         // 32 samples / 8 directions
+    ULTRA = 4         // 64 samples / 12 directions
 };
 
 // Shadow quality levels
@@ -395,6 +420,9 @@ struct GameConfig {
     // Renderer Selection
     RendererType renderer = RendererType::OPENGL;  // OpenGL or Vulkan
 
+    // Title Screen Settings
+    TitleScreenSettings titleScreen;
+
     // Graphics
     int windowWidth = 1280;
     int windowHeight = 720;
@@ -425,10 +453,14 @@ struct GameConfig {
 
     // Quality Settings
     bool enableSSAO = true;             // Screen-space ambient occlusion
+    AOType aoType = AOType::HBAO;       // AO algorithm (SSAO or HBAO)
     int ssaoSamples = 16;               // SSAO kernel size (8, 16, 32) - reduced default from 32
     float ssaoRadius = 1.5f;            // SSAO sample radius
     float ssaoBias = 0.03f;             // SSAO depth bias
     float ssaoScale = 0.5f;             // SSAO resolution scale (0.5 = half-res, 1.0 = full)
+    float hbaoIntensity = 1.5f;         // HBAO intensity multiplier
+    int hbaoDirections = 8;             // HBAO ray directions (4, 6, 8, 12)
+    int hbaoSteps = 4;                  // HBAO steps per direction (2, 4, 6, 8)
     AOQuality aoQuality = AOQuality::MEDIUM;
 
     bool enableShadows = true;          // Shadow mapping
@@ -437,7 +469,7 @@ struct GameConfig {
     ShadowQuality shadowQuality = ShadowQuality::HIGH;
 
     bool enableHiZCulling = true;       // Hi-Z occlusion culling
-    bool enableDeferredRendering = true; // Use deferred rendering pipeline
+    bool enableDeferredRendering = false; // Deferred rendering disabled - forward only
 
     bool showPerformanceStats = true;   // Show FPS and timing overlay
 
@@ -727,10 +759,14 @@ struct GameConfig {
 
         file << "\n[Quality]\n";
         file << "enableSSAO=" << (enableSSAO ? "true" : "false") << "\n";
+        file << "aoType=" << static_cast<int>(aoType) << "\n";
         file << "ssaoSamples=" << ssaoSamples << "\n";
         file << "ssaoRadius=" << ssaoRadius << "\n";
         file << "ssaoBias=" << ssaoBias << "\n";
         file << "ssaoScale=" << ssaoScale << "\n";
+        file << "hbaoIntensity=" << hbaoIntensity << "\n";
+        file << "hbaoDirections=" << hbaoDirections << "\n";
+        file << "hbaoSteps=" << hbaoSteps << "\n";
         file << "aoQuality=" << static_cast<int>(aoQuality) << "\n";
         file << "enableShadows=" << (enableShadows ? "true" : "false") << "\n";
         file << "shadowResolution=" << shadowResolution << "\n";
@@ -832,6 +868,10 @@ struct GameConfig {
             else if (key == "ssaoBias") ssaoBias = std::stof(value);
             else if (key == "ssaoScale") ssaoScale = std::stof(value);
             else if (key == "aoQuality") aoQuality = static_cast<AOQuality>(std::stoi(value));
+            else if (key == "aoType") aoType = static_cast<AOType>(std::stoi(value));
+            else if (key == "hbaoIntensity") hbaoIntensity = std::stof(value);
+            else if (key == "hbaoDirections") hbaoDirections = std::stoi(value);
+            else if (key == "hbaoSteps") hbaoSteps = std::stoi(value);
             else if (key == "enableShadows") enableShadows = (value == "true");
             else if (key == "shadowResolution") shadowResolution = std::stoi(value);
             else if (key == "shadowCascades") shadowCascades = std::stoi(value);
