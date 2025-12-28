@@ -17,6 +17,7 @@
 #include <sstream>
 #include <array>
 #include <chrono>
+#include <queue>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -321,6 +322,10 @@ public:
     std::string worldSavePath = "";      // Path to current world save folder
     bool useChunkCaching = true;         // Enable loading/saving chunks from disk
 
+    // Async chunk saving - queue chunks to save in batches to avoid I/O stalls
+    std::queue<glm::ivec2> pendingSaveQueue;
+    int maxSavesPerFrame = 1;            // Limit disk I/O per frame (1-2 is safe)
+
     // ================================================================
     // PRE-GENERATION (Chunky-style)
     // ================================================================
@@ -538,6 +543,36 @@ public:
         if (chunk) {
             WorldSaveLoad::saveChunk(worldSavePath, *chunk);
         }
+    }
+
+    // Process pending chunk saves in batches
+    // Only called during pause/exit to avoid I/O stalls during gameplay
+    void processPendingSaves(bool forceAll = false) {
+        if (pendingSaveQueue.empty() || worldSavePath.empty()) {
+            return;
+        }
+
+        // During normal gameplay, don't save - too slow
+        // Only save when forceAll is true (pause, exit, etc.)
+        if (!forceAll) {
+            return;
+        }
+
+        // Save all pending chunks (during pause/exit)
+        while (!pendingSaveQueue.empty()) {
+            glm::ivec2 pos = pendingSaveQueue.front();
+            pendingSaveQueue.pop();
+
+            Chunk* chunk = getChunk(pos);
+            if (chunk) {
+                WorldSaveLoad::saveChunk(worldSavePath, *chunk);
+            }
+        }
+    }
+
+    // Get number of chunks waiting to be saved
+    size_t getPendingSaveCount() const {
+        return pendingSaveQueue.size();
     }
 
     // Get block at world position
@@ -840,11 +875,7 @@ public:
 
     // Update world around player - loads new chunks, unloads distant ones
     void update(const glm::vec3& playerPos, float deltaTime = 0.0f) {
-        std::cout << "[World::update] Starting..." << std::endl;
-        std::cout.flush();
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
-        std::cout << "[World::update] playerChunk calculated: (" << playerChunk.x << ", " << playerChunk.y << ")" << std::endl;
-        std::cout.flush();
 
         // Update player velocity for predictive chunk streaming
         if (usePredictiveLoading && deltaTime > 0.0f) {
@@ -882,25 +913,13 @@ public:
         }
 
         // Process chunks completed by worker threads
-        std::cout << "[World::update] Calling processCompletedChunks..." << std::endl;
-        std::cout.flush();
         processCompletedChunks();
-        std::cout << "[World::update] processCompletedChunks done" << std::endl;
-        std::cout.flush();
 
         // Queue new chunks for generation around player
-        std::cout << "[World::update] Calling loadChunksAroundPlayer..." << std::endl;
-        std::cout.flush();
         loadChunksAroundPlayer(playerChunk);
-        std::cout << "[World::update] loadChunksAroundPlayer done" << std::endl;
-        std::cout.flush();
 
         // Unload distant chunks
-        std::cout << "[World::update] Calling unloadDistantChunks..." << std::endl;
-        std::cout.flush();
         unloadDistantChunks(playerChunk);
-        std::cout << "[World::update] unloadDistantChunks done" << std::endl;
-        std::cout.flush();
 
         // Update water simulation (skip during burst mode for faster loading)
         if (!burstMode) {
@@ -912,11 +931,7 @@ public:
         }
 
         // Update meshes
-        std::cout << "[World::update] Calling updateMeshes..." << std::endl;
-        std::cout.flush();
         updateMeshes(playerChunk);
-        std::cout << "[World::update] updateMeshes done" << std::endl;
-        std::cout.flush();
 
         // Lazy meshlet regeneration after burst mode (a few per frame)
         if (meshletRegenerationNeeded && g_generateMeshlets) {
@@ -928,9 +943,10 @@ public:
             updatePregeneration();
         }
 
+        // Process pending chunk saves (batched to avoid I/O stalls)
+        processPendingSaves();
+
         lastPlayerChunk = playerChunk;
-        std::cout << "[World::update] Complete" << std::endl;
-        std::cout.flush();
     }
 
     // Lazily regenerate meshlets for meshes that were created during burst mode
@@ -1092,8 +1108,10 @@ public:
                 markChunkDirty(glm::ivec2(result.position.x, result.position.y - 1));
                 markChunkDirty(glm::ivec2(result.position.x, result.position.y + 1));
 
-                // Save newly generated chunk to disk cache
-                saveChunkToCache(result.position);
+                // Queue chunk for async save (don't save immediately - causes 40ms+ stalls)
+                if (useChunkCaching && !worldSavePath.empty()) {
+                    pendingSaveQueue.push(result.position);
+                }
 
                 // Update pregeneration progress
                 if (pregenerationActive) {
@@ -1132,8 +1150,9 @@ public:
                     glm::ivec2 chunkPos(playerChunk.x + dx, playerChunk.y + dz);
 
                     if (getChunk(chunkPos) == nullptr) {
-                        // Try loading from disk cache first
-                        if (tryLoadChunkFromCache(chunkPos)) {
+                        // Only load from cache during burst mode (initial load)
+                        // During gameplay, skip disk I/O to avoid stalls
+                        if (burstMode && tryLoadChunkFromCache(chunkPos)) {
                             continue;  // Loaded from cache, no need to queue
                         }
 
@@ -1184,8 +1203,9 @@ public:
                         glm::ivec2 chunkPos(playerChunk.x + dx, playerChunk.y + dz);
 
                         if (getChunk(chunkPos) == nullptr) {
-                            // Try loading from disk cache first
-                            if (tryLoadChunkFromCache(chunkPos)) {
+                            // Only load from cache during burst mode (initial load)
+                            // During gameplay, skip disk I/O to avoid stalls
+                            if (burstMode && tryLoadChunkFromCache(chunkPos)) {
                                 continue;  // Loaded from cache, no need to generate
                             }
 
@@ -1234,22 +1254,13 @@ public:
 
     // Update chunk meshes around player - queues async mesh generation
     void updateMeshes(const glm::ivec2& playerChunk) {
-        std::cout << "[updateMeshes] Starting..." << std::endl;
-        std::cout.flush();
         int meshesQueued = 0;
 
         // First, process any completed meshes from worker threads
-        std::cout << "[updateMeshes] Calling processCompletedMeshes..." << std::endl;
-        std::cout.flush();
         processCompletedMeshes();
-        std::cout << "[updateMeshes] processCompletedMeshes done" << std::endl;
-        std::cout.flush();
 
         // Collect dirty chunks within render distance, sorted by distance
         std::vector<std::pair<int, glm::ivec2>> dirtyChunks;
-
-        std::cout << "[updateMeshes] Iterating chunks, count=" << chunks.size() << std::endl;
-        std::cout.flush();
 
         for (auto& [pos, chunk] : chunks) {
             int dx = abs(pos.x - playerChunk.x);

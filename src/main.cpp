@@ -118,7 +118,7 @@ int g_renderDistanceOverride = 0;   // F3+F/Shift+F - Temporary render distance 
 // Set to false to use forward rendering path (more stable, better performance for voxel scenes)
 bool g_useDeferredRendering = false;  // Master toggle - DISABLED
 bool g_enableSSAO = true;             // SSAO toggle (only works with deferred)
-bool g_useRHIRenderer = false;        // Use RHI-based renderer - DISABLED
+bool g_useRHIRenderer = true;         // Use RHI-based renderer - ENABLED for testing
 std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;  // Kept for future use
 
 // Benchmark system
@@ -3320,6 +3320,271 @@ void main() {
 }
 )";
 
+// HBAO (Horizon-Based Ambient Occlusion) shader
+const char* hbaoFragmentSource = R"(
+#version 460 core
+// HBAO (Horizon-Based Ambient Occlusion)
+// Based on NVIDIA's HBAO+ algorithm
+// More accurate than standard SSAO with better contact shadows
+
+layout(location = 0) out float FragColor;
+
+layout(location = 0) in vec2 TexCoords;
+
+layout(binding = 1) uniform sampler2D gPosition;
+layout(binding = 2) uniform sampler2D gNormal;
+layout(binding = 3) uniform sampler2D gDepth;
+layout(binding = 4) uniform sampler2D noiseTexture;
+
+uniform mat4 projection;
+uniform mat4 view;
+uniform mat4 invProjection;
+uniform vec2 noiseScale;
+uniform vec2 resolution;
+uniform float radius;           // World-space radius
+uniform float intensity;        // AO intensity multiplier
+uniform float bias;             // Angle bias to reduce self-occlusion
+uniform float maxRadiusPixels;  // Maximum radius in pixels (for performance)
+uniform float nearPlane;
+uniform float farPlane;
+uniform int numDirections;      // Number of ray directions
+uniform int numSteps;           // Steps per direction
+
+const float PI = 3.14159265359;
+const float TWO_PI = 6.28318530718;
+
+// Get view-space position using depth reconstruction
+vec3 getViewPosFromDepth(vec2 uv, float depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+    vec4 clipPos = vec4(ndc, depth * 2.0 - 1.0, 1.0);
+    vec4 viewPos = invProjection * clipPos;
+    return viewPos.xyz / viewPos.w;
+}
+
+// Compute the horizon angle for a single direction
+float computeHorizonAngle(vec3 viewPos, vec3 viewNormal, vec2 rayDir, float jitter, int steps) {
+    float horizonAngle = -1.0;  // -1 = no horizon found
+
+    // Convert radius to screen-space pixels
+    float radiusPixels = min(radius / abs(viewPos.z) * projection[0][0] * resolution.x * 0.5, maxRadiusPixels);
+
+    // Step size in pixels
+    float stepSize = radiusPixels / float(steps);
+
+    vec2 texelSize = 1.0 / resolution;
+    vec2 stepDir = rayDir * texelSize * stepSize;
+
+    // Apply jitter to reduce banding
+    vec2 sampleUV = TexCoords + stepDir * jitter;
+
+    for (int step = 1; step <= steps; step++) {
+        sampleUV += stepDir;
+
+        // Skip if outside screen
+        if (sampleUV.x < 0.0 || sampleUV.x > 1.0 || sampleUV.y < 0.0 || sampleUV.y > 1.0)
+            continue;
+
+        // Get sample depth
+        float sampleDepth = texture(gDepth, sampleUV).r;
+        if (sampleDepth >= 1.0) continue;
+
+        // Reconstruct sample view position
+        vec3 sampleViewPos = getViewPosFromDepth(sampleUV, sampleDepth);
+
+        // Vector from current pixel to sample
+        vec3 horizonVec = sampleViewPos - viewPos;
+        float horizonDist = length(horizonVec);
+
+        // Skip if too far (falloff)
+        if (horizonDist > radius) continue;
+
+        // Normalize
+        horizonVec /= horizonDist;
+
+        // Calculate horizon angle (angle above the tangent plane)
+        float angle = dot(horizonVec, viewNormal);
+
+        // Apply distance-based falloff
+        float falloff = 1.0 - (horizonDist / radius);
+        falloff = falloff * falloff;
+
+        // Update maximum horizon angle
+        horizonAngle = max(horizonAngle, angle * falloff);
+    }
+
+    return horizonAngle;
+}
+
+// Compute AO from horizon angles
+float computeAO(float horizonAngle, float tangentAngle, float angleBias) {
+    float ao = 0.0;
+
+    if (horizonAngle > tangentAngle + angleBias) {
+        // Integrate occlusion over the angle difference
+        float theta = acos(clamp(tangentAngle, -1.0, 1.0));
+        float phi = acos(clamp(horizonAngle, -1.0, 1.0));
+
+        // Approximate integral of cos over the angle range
+        ao = sin(theta) - sin(phi);
+        ao = max(ao, 0.0);
+    }
+
+    return ao;
+}
+
+void main() {
+    float depth = texture(gDepth, TexCoords).r;
+
+    // Skip sky pixels
+    if (depth >= 1.0) {
+        FragColor = 1.0;
+        return;
+    }
+
+    // Get view-space position and normal
+    vec3 viewPos = getViewPosFromDepth(TexCoords, depth);
+    vec3 worldNormal = normalize(texture(gNormal, TexCoords).xyz);
+    vec3 viewNormal = normalize((view * vec4(worldNormal, 0.0)).xyz);
+
+    // Get random rotation for this pixel (reduces banding)
+    vec2 noise = texture(noiseTexture, TexCoords * noiseScale).xy;
+    float randomAngle = noise.x * TWO_PI;
+    float jitter = noise.y;
+
+    // Tangent angle (angle of the surface normal from the view direction)
+    float tangentAngle = dot(viewNormal, normalize(-viewPos));
+
+    float totalAO = 0.0;
+
+    // Sample in multiple directions around the pixel
+    for (int dir = 0; dir < numDirections; dir++) {
+        // Direction angle (evenly spaced + random offset)
+        float angle = (float(dir) / float(numDirections)) * TWO_PI + randomAngle;
+
+        // Ray direction in screen space
+        vec2 rayDir = vec2(cos(angle), sin(angle));
+
+        // Compute horizon angle for this direction
+        float horizonAngle = computeHorizonAngle(viewPos, viewNormal, rayDir, jitter, numSteps);
+
+        // Compute AO contribution from this direction
+        if (horizonAngle > -0.99) {
+            totalAO += computeAO(horizonAngle, tangentAngle, bias);
+        }
+    }
+
+    // Normalize by number of directions
+    totalAO /= float(numDirections);
+
+    // Apply intensity
+    totalAO *= intensity;
+
+    // Convert to visibility (1 = fully visible, 0 = fully occluded)
+    float visibility = 1.0 - clamp(totalAO, 0.0, 1.0);
+
+    // Increase contrast for more visible effect
+    visibility = pow(visibility, 1.5);
+
+    FragColor = visibility;
+}
+)";
+
+// HBAO Blur - Edge-aware bilateral blur
+const char* hbaoBlurFragmentSource = R"(
+#version 460 core
+// HBAO Blur - Edge-aware bilateral blur
+// Preserves edges while smoothing the AO noise
+
+layout(location = 0) out float FragColor;
+
+layout(location = 0) in vec2 TexCoords;
+
+layout(binding = 0) uniform sampler2D hbaoTexture;
+layout(binding = 1) uniform sampler2D gDepth;
+layout(binding = 2) uniform sampler2D gNormal;
+
+uniform vec2 texelSize;
+uniform vec2 blurDirection;  // (1,0) for horizontal, (0,1) for vertical
+uniform float sharpness;     // Edge-preservation strength
+
+// Gaussian weights for 7-tap blur
+const float weights[4] = float[](0.324, 0.232, 0.0855, 0.0205);
+const int BLUR_RADIUS = 3;
+
+// Compute depth-based weight for bilateral filtering
+float computeDepthWeight(float centerDepth, float sampleDepth) {
+    float depthDiff = abs(centerDepth - sampleDepth);
+    return exp(-depthDiff * sharpness * 100.0);
+}
+
+// Compute normal-based weight for bilateral filtering
+float computeNormalWeight(vec3 centerNormal, vec3 sampleNormal) {
+    float normalDiff = 1.0 - max(dot(centerNormal, sampleNormal), 0.0);
+    return exp(-normalDiff * sharpness * 10.0);
+}
+
+void main() {
+    float centerAO = texture(hbaoTexture, TexCoords).r;
+    float centerDepth = texture(gDepth, TexCoords).r;
+
+    // Skip sky pixels
+    if (centerDepth >= 1.0) {
+        FragColor = 1.0;
+        return;
+    }
+
+    vec3 centerNormal = normalize(texture(gNormal, TexCoords).xyz);
+
+    float totalAO = centerAO * weights[0];
+    float totalWeight = weights[0];
+
+    // Blur in the specified direction
+    for (int i = 1; i <= BLUR_RADIUS; i++) {
+        vec2 offset = blurDirection * texelSize * float(i);
+
+        // Positive direction
+        vec2 sampleUV1 = TexCoords + offset;
+        if (sampleUV1.x >= 0.0 && sampleUV1.x <= 1.0 &&
+            sampleUV1.y >= 0.0 && sampleUV1.y <= 1.0) {
+
+            float sampleAO1 = texture(hbaoTexture, sampleUV1).r;
+            float sampleDepth1 = texture(gDepth, sampleUV1).r;
+            vec3 sampleNormal1 = normalize(texture(gNormal, sampleUV1).xyz);
+
+            if (sampleDepth1 < 1.0) {
+                float depthWeight1 = computeDepthWeight(centerDepth, sampleDepth1);
+                float normalWeight1 = computeNormalWeight(centerNormal, sampleNormal1);
+                float weight1 = weights[i] * depthWeight1 * normalWeight1;
+
+                totalAO += sampleAO1 * weight1;
+                totalWeight += weight1;
+            }
+        }
+
+        // Negative direction
+        vec2 sampleUV2 = TexCoords - offset;
+        if (sampleUV2.x >= 0.0 && sampleUV2.x <= 1.0 &&
+            sampleUV2.y >= 0.0 && sampleUV2.y <= 1.0) {
+
+            float sampleAO2 = texture(hbaoTexture, sampleUV2).r;
+            float sampleDepth2 = texture(gDepth, sampleUV2).r;
+            vec3 sampleNormal2 = normalize(texture(gNormal, sampleUV2).xyz);
+
+            if (sampleDepth2 < 1.0) {
+                float depthWeight2 = computeDepthWeight(centerDepth, sampleDepth2);
+                float normalWeight2 = computeNormalWeight(centerNormal, sampleNormal2);
+                float weight2 = weights[i] * depthWeight2 * normalWeight2;
+
+                totalAO += sampleAO2 * weight2;
+                totalWeight += weight2;
+            }
+        }
+    }
+
+    FragColor = totalAO / totalWeight;
+}
+)";
+
 // Hi-Z downsample compute shader
 const char* hiZDownsampleSource = R"(
 #version 460 core
@@ -3901,6 +4166,48 @@ int main() {
     glDeleteShader(ssaoBlurVertexShader);
     glDeleteShader(ssaoBlurFragmentShader);
 
+    // HBAO shader program (reuses ssao vertex shader source)
+    GLuint hbaoVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(hbaoVertexShader, 1, &ssaoVertexSource, nullptr);
+    glCompileShader(hbaoVertexShader);
+    if (!checkShaderCompilation(hbaoVertexShader, "HBAO_VERTEX")) return -1;
+
+    GLuint hbaoFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(hbaoFragmentShader, 1, &hbaoFragmentSource, nullptr);
+    glCompileShader(hbaoFragmentShader);
+    if (!checkShaderCompilation(hbaoFragmentShader, "HBAO_FRAGMENT")) return -1;
+
+    GLuint hbaoProgram = glCreateProgram();
+    glAttachShader(hbaoProgram, hbaoVertexShader);
+    glAttachShader(hbaoProgram, hbaoFragmentShader);
+    glLinkProgram(hbaoProgram);
+    if (!checkProgramLinking(hbaoProgram)) return -1;
+
+    glDeleteShader(hbaoVertexShader);
+    glDeleteShader(hbaoFragmentShader);
+
+    // HBAO Blur shader program (reuses ssao vertex shader source)
+    GLuint hbaoBlurVertexShader = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(hbaoBlurVertexShader, 1, &ssaoVertexSource, nullptr);
+    glCompileShader(hbaoBlurVertexShader);
+    if (!checkShaderCompilation(hbaoBlurVertexShader, "HBAO_BLUR_VERTEX")) return -1;
+
+    GLuint hbaoBlurFragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(hbaoBlurFragmentShader, 1, &hbaoBlurFragmentSource, nullptr);
+    glCompileShader(hbaoBlurFragmentShader);
+    if (!checkShaderCompilation(hbaoBlurFragmentShader, "HBAO_BLUR_FRAGMENT")) return -1;
+
+    GLuint hbaoBlurProgram = glCreateProgram();
+    glAttachShader(hbaoBlurProgram, hbaoBlurVertexShader);
+    glAttachShader(hbaoBlurProgram, hbaoBlurFragmentShader);
+    glLinkProgram(hbaoBlurProgram);
+    if (!checkProgramLinking(hbaoBlurProgram)) return -1;
+
+    glDeleteShader(hbaoBlurVertexShader);
+    glDeleteShader(hbaoBlurFragmentShader);
+
+    std::cout << "HBAO shaders compiled successfully." << std::endl;
+
     // FSR EASU (upscaling) shader program
     GLuint fsrEASUVertexShader = glCreateShader(GL_VERTEX_SHADER);
     glShaderSource(fsrEASUVertexShader, 1, &fsrVertexSource, nullptr);
@@ -4209,6 +4516,35 @@ int main() {
 
     // SSAO Blur shader uniforms
     GLint ssaoBlurInputLoc = glGetUniformLocation(ssaoBlurProgram, "ssaoInput");
+
+    // HBAO shader uniforms
+    GLint hbaoGPositionLoc = glGetUniformLocation(hbaoProgram, "gPosition");
+    GLint hbaoGNormalLoc = glGetUniformLocation(hbaoProgram, "gNormal");
+    GLint hbaoGDepthLoc = glGetUniformLocation(hbaoProgram, "gDepth");
+    GLint hbaoNoiseLoc = glGetUniformLocation(hbaoProgram, "noiseTexture");
+    GLint hbaoProjectionLoc = glGetUniformLocation(hbaoProgram, "projection");
+    GLint hbaoViewLoc = glGetUniformLocation(hbaoProgram, "view");
+    GLint hbaoInvProjectionLoc = glGetUniformLocation(hbaoProgram, "invProjection");
+    GLint hbaoNoiseScaleLoc = glGetUniformLocation(hbaoProgram, "noiseScale");
+    GLint hbaoResolutionLoc = glGetUniformLocation(hbaoProgram, "resolution");
+    GLint hbaoRadiusLoc = glGetUniformLocation(hbaoProgram, "radius");
+    GLint hbaoIntensityLoc = glGetUniformLocation(hbaoProgram, "intensity");
+    GLint hbaoBiasLoc = glGetUniformLocation(hbaoProgram, "bias");
+    GLint hbaoMaxRadiusPixelsLoc = glGetUniformLocation(hbaoProgram, "maxRadiusPixels");
+    GLint hbaoNearPlaneLoc = glGetUniformLocation(hbaoProgram, "nearPlane");
+    GLint hbaoFarPlaneLoc = glGetUniformLocation(hbaoProgram, "farPlane");
+    GLint hbaoNumDirectionsLoc = glGetUniformLocation(hbaoProgram, "numDirections");
+    GLint hbaoNumStepsLoc = glGetUniformLocation(hbaoProgram, "numSteps");
+
+    // HBAO Blur shader uniforms
+    GLint hbaoBlurInputLoc = glGetUniformLocation(hbaoBlurProgram, "hbaoTexture");
+    GLint hbaoBlurDepthLoc = glGetUniformLocation(hbaoBlurProgram, "gDepth");
+    GLint hbaoBlurNormalLoc = glGetUniformLocation(hbaoBlurProgram, "gNormal");
+    GLint hbaoBlurTexelSizeLoc = glGetUniformLocation(hbaoBlurProgram, "texelSize");
+    GLint hbaoBlurDirectionLoc = glGetUniformLocation(hbaoBlurProgram, "blurDirection");
+    GLint hbaoBlurSharpnessLoc = glGetUniformLocation(hbaoBlurProgram, "sharpness");
+
+    std::cout << "HBAO uniform locations retrieved." << std::endl;
 
     // Hi-Z downsample shader uniforms
     GLint hiZSrcDepthLoc = glGetUniformLocation(hiZDownsampleProgram, "srcDepth");
@@ -5764,12 +6100,11 @@ int main() {
                     // Forward complete - save and finish
                     g_benchmark.saveResults("benchmark_forward_OpenGL.txt");
                     g_benchmarkMode = false;
-                    g_useDeferredRendering = true;  // Restore to deferred
+                    // Keep current rendering mode (don't force switch)
 
                     std::cout << "\n========================================" << std::endl;
                     std::cout << "BENCHMARK COMPLETE!" << std::endl;
                     std::cout << "Results saved to:" << std::endl;
-                    std::cout << "  - benchmark_deferred_OpenGL.txt" << std::endl;
                     std::cout << "  - benchmark_forward_OpenGL.txt" << std::endl;
                     std::cout << "========================================\n" << std::endl;
                 }
@@ -6370,41 +6705,82 @@ int main() {
 
             glEndQuery(GL_TIME_ELAPSED);  // End Hi-Z timer
 
-            // SSAO pass
+            // AO pass (SSAO or HBAO based on config)
             glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries[currentTimerFrame][TIMER_SSAO]);
 
             if (g_enableSSAO) {
+                bool useHBAO = (g_config.aoType == AOType::HBAO);
+
                 glBindFramebuffer(GL_FRAMEBUFFER, ssaoFBO);
                 glClear(GL_COLOR_BUFFER_BIT);
 
-                glUseProgram(ssaoProgram);
+                if (useHBAO) {
+                    // HBAO pass
+                    glUseProgram(hbaoProgram);
 
-                // Bind G-buffer textures
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, gPosition);
-                glUniform1i(ssaoGPositionLoc, 0);
+                    // Bind G-buffer textures
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, gPosition);
+                    glUniform1i(hbaoGPositionLoc, 1);
 
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, gNormal);
-                glUniform1i(ssaoGNormalLoc, 1);
+                    glActiveTexture(GL_TEXTURE2);
+                    glBindTexture(GL_TEXTURE_2D, gNormal);
+                    glUniform1i(hbaoGNormalLoc, 2);
 
-                glActiveTexture(GL_TEXTURE2);
-                glBindTexture(GL_TEXTURE_2D, gDepth);
-                glUniform1i(ssaoGDepthLoc, 2);
+                    glActiveTexture(GL_TEXTURE3);
+                    glBindTexture(GL_TEXTURE_2D, gDepth);
+                    glUniform1i(hbaoGDepthLoc, 3);
 
-                glActiveTexture(GL_TEXTURE3);
-                glBindTexture(GL_TEXTURE_2D, ssaoNoiseTexture);
-                glUniform1i(ssaoNoiseLoc, 3);
+                    glActiveTexture(GL_TEXTURE4);
+                    glBindTexture(GL_TEXTURE_2D, ssaoNoiseTexture);
+                    glUniform1i(hbaoNoiseLoc, 4);
 
-                // Set SSAO uniforms (use render resolution if FSR enabled)
-                glUniformMatrix4fv(ssaoProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
-                glUniformMatrix4fv(ssaoViewLoc, 1, GL_FALSE, glm::value_ptr(view));
-                glUniform2f(ssaoNoiseScaleLoc, renderW / 4.0f, renderH / 4.0f);
-                glUniform1f(ssaoRadiusLoc, ssaoRadius);
-                glUniform1f(ssaoBiasLoc, ssaoBias);
+                    // Set HBAO uniforms
+                    glUniformMatrix4fv(hbaoProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
+                    glUniformMatrix4fv(hbaoViewLoc, 1, GL_FALSE, glm::value_ptr(view));
+                    glm::mat4 invProj = glm::inverse(projection);
+                    glUniformMatrix4fv(hbaoInvProjectionLoc, 1, GL_FALSE, glm::value_ptr(invProj));
+                    glUniform2f(hbaoNoiseScaleLoc, renderW / 4.0f, renderH / 4.0f);
+                    glUniform2f(hbaoResolutionLoc, static_cast<float>(renderW), static_cast<float>(renderH));
+                    glUniform1f(hbaoRadiusLoc, ssaoRadius * 2.0f);  // HBAO uses larger radius
+                    glUniform1f(hbaoIntensityLoc, g_config.hbaoIntensity);
+                    glUniform1f(hbaoBiasLoc, ssaoBias * 0.5f);  // HBAO needs smaller bias
+                    glUniform1f(hbaoMaxRadiusPixelsLoc, 64.0f);  // Max screen-space radius
+                    glUniform1f(hbaoNearPlaneLoc, 0.1f);
+                    glUniform1f(hbaoFarPlaneLoc, 1000.0f);
+                    glUniform1i(hbaoNumDirectionsLoc, g_config.hbaoDirections);
+                    glUniform1i(hbaoNumStepsLoc, g_config.hbaoSteps);
+                } else {
+                    // Standard SSAO pass
+                    glUseProgram(ssaoProgram);
 
-                // OPTIMIZATION: Kernel samples are in UBO (binding 0), uploaded once at init
-                // No per-frame upload needed!
+                    // Bind G-buffer textures
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, gPosition);
+                    glUniform1i(ssaoGPositionLoc, 0);
+
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, gNormal);
+                    glUniform1i(ssaoGNormalLoc, 1);
+
+                    glActiveTexture(GL_TEXTURE2);
+                    glBindTexture(GL_TEXTURE_2D, gDepth);
+                    glUniform1i(ssaoGDepthLoc, 2);
+
+                    glActiveTexture(GL_TEXTURE3);
+                    glBindTexture(GL_TEXTURE_2D, ssaoNoiseTexture);
+                    glUniform1i(ssaoNoiseLoc, 3);
+
+                    // Set SSAO uniforms (use render resolution if FSR enabled)
+                    glUniformMatrix4fv(ssaoProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
+                    glUniformMatrix4fv(ssaoViewLoc, 1, GL_FALSE, glm::value_ptr(view));
+                    glUniform2f(ssaoNoiseScaleLoc, renderW / 4.0f, renderH / 4.0f);
+                    glUniform1f(ssaoRadiusLoc, ssaoRadius);
+                    glUniform1f(ssaoBiasLoc, ssaoBias);
+
+                    // OPTIMIZATION: Kernel samples are in UBO (binding 0), uploaded once at init
+                    // No per-frame upload needed!
+                }
 
                 // Render fullscreen quad
                 glBindVertexArray(quadVAO);
@@ -6413,23 +6789,74 @@ int main() {
 
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
-                // SSAO blur pass
-                glBindFramebuffer(GL_FRAMEBUFFER, ssaoBlurFBO);
-                glClear(GL_COLOR_BUFFER_BIT);
+                // AO blur pass (edge-aware for HBAO, simple for SSAO)
+                if (useHBAO) {
+                    // HBAO uses two-pass bilateral blur for edge preservation
+                    // Horizontal blur pass
+                    glBindFramebuffer(GL_FRAMEBUFFER, ssaoBlurFBO);
+                    glClear(GL_COLOR_BUFFER_BIT);
 
-                glUseProgram(ssaoBlurProgram);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, ssaoColorBuffer);
-                glUniform1i(ssaoBlurInputLoc, 0);
+                    glUseProgram(hbaoBlurProgram);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, ssaoColorBuffer);
+                    glUniform1i(hbaoBlurInputLoc, 0);
 
-                glBindVertexArray(quadVAO);
-                glDrawArrays(GL_TRIANGLES, 0, 6);
-                glBindVertexArray(0);
+                    glActiveTexture(GL_TEXTURE1);
+                    glBindTexture(GL_TEXTURE_2D, gDepth);
+                    glUniform1i(hbaoBlurDepthLoc, 1);
 
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glActiveTexture(GL_TEXTURE2);
+                    glBindTexture(GL_TEXTURE_2D, gNormal);
+                    glUniform1i(hbaoBlurNormalLoc, 2);
+
+                    glUniform2f(hbaoBlurTexelSizeLoc, 1.0f / renderW, 1.0f / renderH);
+                    glUniform2f(hbaoBlurDirectionLoc, 1.0f, 0.0f);  // Horizontal
+                    glUniform1f(hbaoBlurSharpnessLoc, 8.0f);
+
+                    glBindVertexArray(quadVAO);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glBindVertexArray(0);
+
+                    // Vertical blur pass (render back to ssaoFBO, then swap)
+                    glBindFramebuffer(GL_FRAMEBUFFER, ssaoFBO);
+                    glClear(GL_COLOR_BUFFER_BIT);
+
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, ssaoBlurBuffer);
+                    glUniform1i(hbaoBlurInputLoc, 0);
+
+                    glUniform2f(hbaoBlurDirectionLoc, 0.0f, 1.0f);  // Vertical
+
+                    glBindVertexArray(quadVAO);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glBindVertexArray(0);
+
+                    // Copy result to blur buffer for composite shader
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, ssaoFBO);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ssaoBlurFBO);
+                    glBlitFramebuffer(0, 0, renderW, renderH, 0, 0, renderW, renderH,
+                                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                } else {
+                    // Standard SSAO simple blur
+                    glBindFramebuffer(GL_FRAMEBUFFER, ssaoBlurFBO);
+                    glClear(GL_COLOR_BUFFER_BIT);
+
+                    glUseProgram(ssaoBlurProgram);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, ssaoColorBuffer);
+                    glUniform1i(ssaoBlurInputLoc, 0);
+
+                    glBindVertexArray(quadVAO);
+                    glDrawArrays(GL_TRIANGLES, 0, 6);
+                    glBindVertexArray(0);
+
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                }
             }
 
-            glEndQuery(GL_TIME_ELAPSED);  // End SSAO timer
+            glEndQuery(GL_TIME_ELAPSED);  // End AO timer
 
             // Composite pass - render to scene FBO (for FSR) or directly to screen
             glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries[currentTimerFrame][TIMER_COMPOSITE]);
