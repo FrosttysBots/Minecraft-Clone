@@ -21,7 +21,7 @@
 
 // ============================================
 // BENCHMARK SYSTEM
-// Automated performance testing for Voxel Engine
+// Automated performance testing for ForgeBound
 // ============================================
 
 namespace Benchmark {
@@ -572,7 +572,7 @@ public:
         std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
 
         file << "================================================================================\n";
-        file << "VOXEL ENGINE BENCHMARK RESULTS\n";
+        file << "FORGEBOUND BENCHMARK RESULTS\n";
         file << "================================================================================\n";
         file << "Date: " << std::ctime(&nowTime);
         file << "Rendering API: OpenGL 4.6\n";

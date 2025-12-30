@@ -1,4 +1,4 @@
-// Voxel Engine Launcher
+// ForgeBound Launcher
 // Simple Win32 dialog-based launcher
 
 #ifdef _WIN32
@@ -208,7 +208,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW);
-    wc.lpszClassName = "VoxelEngineLauncher";
+    wc.lpszClassName = "ForgeBoundLauncher";
     RegisterClassExA(&wc);
 
     // Create main window
@@ -216,13 +216,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int screenH = GetSystemMetrics(SM_CYSCREEN);
 
-    g_hWnd = CreateWindowExA(0, "VoxelEngineLauncher", "Voxel Engine Launcher",
+    g_hWnd = CreateWindowExA(0, "ForgeBoundLauncher", "ForgeBound Launcher",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         (screenW - winW) / 2, (screenH - winH) / 2, winW, winH,
         NULL, NULL, hInstance, NULL);
 
     // Title
-    HWND hTitle = createLabel(g_hWnd, "VOXEL ENGINE", 150, 15, 150, 25);
+    HWND hTitle = createLabel(g_hWnd, "FORGEBOUND", 150, 15, 150, 25);
     HFONT hTitleFont = CreateFontA(20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
         DEFAULT_QUALITY, DEFAULT_PITCH, "Segoe UI");

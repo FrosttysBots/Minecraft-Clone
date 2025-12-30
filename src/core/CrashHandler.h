@@ -79,8 +79,8 @@ public:
     static CrashHandler& instance();
 
     // Initialize the crash handler (call early in main())
-    void initialize(const std::string& appName = "VoxelEngine",
-                    const std::string& version = "1.0.0");
+    void initialize(const std::string& appName = "ForgeBound",
+                    const std::string& version = "InfDev 2.0");
 
     // Shutdown (call before exit)
     void shutdown();

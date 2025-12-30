@@ -63,7 +63,7 @@ PFNGLDRAWMESHTASKSNVPROC_LOCAL pfn_glDrawMeshTasksNV = nullptr;
 // Window settings
 int WINDOW_WIDTH = 1280;
 int WINDOW_HEIGHT = 720;
-const char* WINDOW_TITLE = "Voxel Engine (Vulkan)";
+const char* WINDOW_TITLE = "ForgeBound (Vulkan)";
 
 // Global state
 Camera camera(glm::vec3(8.0f, 100.0f, 8.0f));
@@ -264,10 +264,10 @@ void processInput(GLFWwindow* window) {
 }
 
 int main() {
-    std::cout << "=== Voxel Engine (Vulkan Backend) ===" << std::endl;
+    std::cout << "=== ForgeBound (Vulkan Backend) ===" << std::endl;
 
     // Initialize crash handler
-    Core::CrashHandler::instance().initialize("VoxelEngineVK");
+    Core::CrashHandler::instance().initialize("ForgeBound-VK", "InfDev 2.0");
 
     // Load config
     g_config.load();
@@ -373,7 +373,7 @@ int main() {
     g_titleScreenWorld.setProjection(WINDOW_WIDTH, WINDOW_HEIGHT);
     std::cout << "Title screen world initialized (Vulkan mode)" << std::endl;
 
-    std::cout << "\n=== Voxel Engine (Vulkan) Started ===" << std::endl;
+    std::cout << "\n=== ForgeBound (Vulkan) Started ===" << std::endl;
     std::cout << "Controls:" << std::endl;
     std::cout << "  WASD - Move, Mouse - Look" << std::endl;
     std::cout << "  Space/Ctrl - Up/Down, Shift - Sprint" << std::endl;

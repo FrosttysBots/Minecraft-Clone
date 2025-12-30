@@ -743,7 +743,7 @@ struct GameConfig {
             return false;
         }
 
-        file << "# Voxel Engine Settings\n\n";
+        file << "# ForgeBound Settings\n\n";
 
         file << "[Renderer]\n";
         file << "renderer=" << (renderer == RendererType::VULKAN ? "vulkan" : "opengl") << "\n";

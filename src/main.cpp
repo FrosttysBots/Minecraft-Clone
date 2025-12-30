@@ -69,7 +69,7 @@ extern "C" {
 // Window dimensions (loaded from config)
 int WINDOW_WIDTH = 1280;
 int WINDOW_HEIGHT = 720;
-const char* WINDOW_TITLE = "Voxel Engine";
+const char* WINDOW_TITLE = "ForgeBound";
 
 // Window-to-framebuffer scaling (for high-DPI displays)
 // GLFW mouse coordinates are in window space, but UI uses framebuffer space
@@ -390,7 +390,7 @@ int g_frameNumber = 0;
 void initRenderTimingLog() {
     g_renderTimeFile.open("RenderTime.txt", std::ios::out | std::ios::trunc);
     if (g_renderTimeFile.is_open()) {
-        g_renderTimeFile << "=== Voxel Engine Render Timing Log ===" << std::endl;
+        g_renderTimeFile << "=== ForgeBound Render Timing Log ===" << std::endl;
         g_renderTimeFile << "Started: " << std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()) << std::endl;
         g_renderTimeFile << std::endl;
         g_renderTimeFile << "Frame,FPS,FrameTimeMs,ShadowMs,GBufferMs,HiZMs,SSAOMs,CompositeMs,WaterMs,PrecipMs,SkyMs,UIMs,TotalGPUMs,WorldUpdateMs,InputMs,ParticleMs,SwapMs,ChunksRendered,SubChunksRendered,WaterSubChunks" << std::endl;
@@ -4142,9 +4142,9 @@ glm::mat4 calculateCascadeLightSpaceMatrix(const glm::vec3& lightDir,
 
 int main() {
     // Initialize crash handler FIRST - before anything else
-    Core::CrashHandler::instance().initialize("VoxelEngine", "1.0.0");
+    Core::CrashHandler::instance().initialize("ForgeBound", "InfDev 2.0");
     Core::Logger::instance().setFileOutput(true, "engine.log");
-    LOG_INFO("Engine", "VoxelEngine starting up...");
+    LOG_INFO("Engine", "ForgeBound starting up...");
 
     // Load configuration
     g_config.load("settings.cfg");
@@ -5652,7 +5652,7 @@ int main() {
         }
     }
 
-    std::cout << "\n=== Voxel Engine Started ===" << std::endl;
+    std::cout << "\n=== ForgeBound Started ===" << std::endl;
     std::cout << "Controls:" << std::endl;
     std::cout << "  WASD - Move" << std::endl;
     std::cout << "  Mouse - Look around" << std::endl;
@@ -6175,7 +6175,7 @@ int main() {
 
             // Update window title with progress
             int progressPercent = static_cast<int>(progress * 100);
-            std::string title = "Voxel Engine - Loading " + std::to_string(progressPercent) + "%";
+            std::string title = "ForgeBound - Loading " + std::to_string(progressPercent) + "%";
             glfwSetWindowTitle(window, title.c_str());
 
             glfwSwapBuffers(window);
@@ -6414,7 +6414,7 @@ int main() {
         // Detect transition into PLAYING state (from any other state)
         static GameState prevState = GameState::MAIN_MENU;
         if (prevState != GameState::PLAYING) {
-            glfwSetWindowTitle(window, "Voxel Engine");
+            glfwSetWindowTitle(window, "ForgeBound");
             std::cout << "Entering PLAYING state - deferred rendering: " << (g_useDeferredRendering ? "ON" : "OFF") << std::endl;
             LOG_INFO("Game", "Entered PLAYING state");
         }
@@ -8058,12 +8058,12 @@ int main() {
             if (currentTime - lastTitleUpdate >= 0.25) {
                 char title[256];
                 if (g_enableSubChunkCulling) {
-                    snprintf(title, sizeof(title), "Voxel Engine | FPS: %.0f | GPU: %.1fms | Solid: %d/%d | Water: %d/%d",
+                    snprintf(title, sizeof(title), "ForgeBound | FPS: %.0f | GPU: %.1fms | Solid: %d/%d | Water: %d/%d",
                              g_perfStats.fps, g_perfStats.totalGpuMs,
                              g_perfStats.subChunksRendered, g_perfStats.subChunksRendered + g_perfStats.subChunksFrustumCulled,
                              g_perfStats.waterSubChunksRendered, g_perfStats.waterSubChunksRendered + g_perfStats.waterSubChunksCulled);
                 } else {
-                    snprintf(title, sizeof(title), "Voxel Engine | FPS: %.0f | GPU: %.1fms | Chunks: %d/%zu",
+                    snprintf(title, sizeof(title), "ForgeBound | FPS: %.0f | GPU: %.1fms | Chunks: %d/%zu",
                              g_perfStats.fps, g_perfStats.totalGpuMs,
                              g_perfStats.chunksRendered, g_perfStats.meshesLoaded);
                 }

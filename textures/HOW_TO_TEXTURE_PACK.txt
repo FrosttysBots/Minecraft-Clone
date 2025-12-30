@@ -1,0 +1,393 @@
+================================================================================
+                        HOW TO CREATE A TEXTURE PACK
+                            ForgeBound Guide
+================================================================================
+
+This guide explains how to create and install custom texture packs for
+ForgeBound.
+
+
+================================================================================
+                              QUICK START
+================================================================================
+
+1. Create a new folder inside the "textures" directory
+   Example: textures/my_pack/
+
+2. Add your PNG texture files to the folder
+   Example: textures/my_pack/stone.png
+
+3. Launch the game and go to TEXTURE PACKS from the main menu or pause menu
+
+4. Select your pack and click APPLY
+
+That's it! Your textures will be loaded immediately.
+
+
+================================================================================
+                            FOLDER STRUCTURE
+================================================================================
+
+textures/
+    my_pack/                    <-- Your texture pack folder (any name)
+        pack.png                <-- Pack icon (displayed in menu, 64x64 recommended)
+        stone.png               <-- Block textures (16x16 recommended)
+        stone_n.png             <-- Normal map (optional, for lighting detail)
+        dirt.png
+        dirt_n.png
+        grass_top.png
+        ... (more textures)
+
+    another_pack/               <-- You can have multiple packs
+        pack.png
+        stone.png
+        dirt.png
+        ...
+
+
+================================================================================
+                         TEXTURE SPECIFICATIONS
+================================================================================
+
+FORMAT:         PNG (with or without transparency)
+SIZE:           16x16 pixels (recommended, will be resized if different)
+COLOR DEPTH:    RGBA (32-bit) or RGB (24-bit)
+NAMING:         Must match exact names listed below (case-sensitive on Linux)
+
+
+================================================================================
+                              PACK ICON
+================================================================================
+
+You can add a custom icon for your texture pack that will be displayed in the
+Texture Packs selection menu. This is OPTIONAL but recommended.
+
+ICON FILE NAMES (in order of priority):
+---------------------------------------
+  pack.png           - Primary icon filename (recommended)
+  icon.png           - Alternative icon filename
+  pack_icon.png      - Another alternative
+
+ICON SPECIFICATIONS:
+-------------------
+  SIZE:              64x64 pixels (recommended, will be scaled to fit)
+  FORMAT:            PNG (RGBA or RGB)
+  CONTENT:           Should represent your pack's style
+                     - A montage of key block textures works well
+                     - Or a custom logo/artwork
+
+TIPS FOR PACK ICONS:
+-------------------
+  - Use a 64x64 or 128x128 image for best quality
+  - Make it recognizable at small sizes (it displays at 50x50 in the menu)
+  - Include distinctive textures from your pack
+  - Keep it simple and visually appealing
+
+
+================================================================================
+                          BLOCK TEXTURE NAMES
+================================================================================
+
+Below is the complete list of texture file names the engine will look for.
+You don't need to include all textures - missing ones will use the default
+procedural textures.
+
+TERRAIN BLOCKS:
+---------------
+  stone.png              - Stone block
+  dirt.png               - Dirt block
+  grass_top.png          - Top of grass block (green)
+  grass_side.png         - Side of grass block (dirt with grass edge)
+  cobblestone.png        - Cobblestone block
+  sand.png               - Sand block
+  gravel.png             - Gravel block
+  bedrock.png            - Bedrock (unbreakable bottom layer)
+  snow.png               - Snow block
+
+WOOD & PLANTS:
+--------------
+  planks_oak.png         - Oak wood planks
+  log_oak.png            - Oak log (side/bark)
+  log_oak_top.png        - Oak log (top/rings)
+  leaves_oak.png         - Oak leaves (use transparency!)
+  cactus_side.png        - Cactus (side)
+  cactus_top.png         - Cactus (top)
+
+ORES:
+-----
+  coal_ore.png           - Coal ore
+  iron_ore.png           - Iron ore
+  gold_ore.png           - Gold ore
+  diamond_ore.png        - Diamond ore
+
+BUILDING BLOCKS:
+----------------
+  glass.png              - Glass (use transparency!)
+  brick.png              - Brick block
+  crafting_table_top.png - Crafting table (top)
+  crafting_table_side.png - Crafting table (side)
+  crafting_table_front.png - Crafting table (front with grid)
+
+LIGHT & LIQUIDS:
+----------------
+  glowstone.png          - Glowstone (emits light)
+  lava_still.png         - Lava (emits light)
+  water_still.png        - Water (use transparency!)
+
+NOTE: Unlike Minecraft, water and lava use standard 16x16 textures.
+      Animation is handled procedurally by the shaders (wave effects,
+      pulsing glow) - you do NOT need animated sprite sheets (16x320).
+
+
+================================================================================
+                          ITEM TEXTURE NAMES
+================================================================================
+
+Items are rendered with a separate 16x16 atlas. Below are all supported items.
+Missing item textures will use procedurally generated placeholders.
+
+MATERIALS:
+----------
+  stick.png              - Wooden stick (crafting ingredient)
+  coal.png               - Coal (fuel and crafting)
+  charcoal.png           - Charcoal (fuel)
+  iron_ingot.png         - Iron ingot
+  gold_ingot.png         - Gold ingot
+  diamond.png            - Diamond gem
+  flint.png              - Flint (from gravel)
+  leather.png            - Leather (armor crafting)
+  string.png             - String
+  feather.png            - Feather
+  bone.png               - Bone
+  brick_item.png         - Brick item (for crafting brick blocks)
+  clay_ball.png          - Clay ball
+
+TOOLS - PICKAXES:
+-----------------
+  wooden_pickaxe.png     - Wooden pickaxe
+  stone_pickaxe.png      - Stone pickaxe
+  iron_pickaxe.png       - Iron pickaxe
+  golden_pickaxe.png     - Golden pickaxe
+  diamond_pickaxe.png    - Diamond pickaxe
+
+TOOLS - AXES:
+-------------
+  wooden_axe.png         - Wooden axe
+  stone_axe.png          - Stone axe
+  iron_axe.png           - Iron axe
+  golden_axe.png         - Golden axe
+  diamond_axe.png        - Diamond axe
+
+TOOLS - SHOVELS:
+----------------
+  wooden_shovel.png      - Wooden shovel
+  stone_shovel.png       - Stone shovel
+  iron_shovel.png        - Iron shovel
+  golden_shovel.png      - Golden shovel
+  diamond_shovel.png     - Diamond shovel
+
+TOOLS - HOES:
+-------------
+  wooden_hoe.png         - Wooden hoe
+  stone_hoe.png          - Stone hoe
+  iron_hoe.png           - Iron hoe
+  golden_hoe.png         - Golden hoe
+  diamond_hoe.png        - Diamond hoe
+
+WEAPONS - SWORDS:
+-----------------
+  wooden_sword.png       - Wooden sword
+  stone_sword.png        - Stone sword
+  iron_sword.png         - Iron sword
+  golden_sword.png       - Golden sword
+  diamond_sword.png      - Diamond sword
+
+ARMOR - HELMETS:
+----------------
+  leather_helmet.png     - Leather helmet
+  iron_helmet.png        - Iron helmet
+  golden_helmet.png      - Golden helmet
+  diamond_helmet.png     - Diamond helmet
+  chainmail_helmet.png   - Chainmail helmet
+
+ARMOR - CHESTPLATES:
+--------------------
+  leather_chestplate.png - Leather chestplate
+  iron_chestplate.png    - Iron chestplate
+  golden_chestplate.png  - Golden chestplate
+  diamond_chestplate.png - Diamond chestplate
+  chainmail_chestplate.png - Chainmail chestplate
+
+ARMOR - LEGGINGS:
+-----------------
+  leather_leggings.png   - Leather leggings
+  iron_leggings.png      - Iron leggings
+  golden_leggings.png    - Golden leggings
+  diamond_leggings.png   - Diamond leggings
+  chainmail_leggings.png - Chainmail leggings
+
+ARMOR - BOOTS:
+--------------
+  leather_boots.png      - Leather boots
+  iron_boots.png         - Iron boots
+  golden_boots.png       - Golden boots
+  diamond_boots.png      - Diamond boots
+  chainmail_boots.png    - Chainmail boots
+
+FOOD:
+-----
+  apple.png              - Apple (restores 4 hunger)
+  bread.png              - Bread (restores 5 hunger)
+  cooked_beef.png        - Steak (restores 8 hunger)
+  cooked_porkchop.png    - Cooked porkchop (restores 8 hunger)
+  cooked_chicken.png     - Cooked chicken (restores 6 hunger)
+  raw_beef.png           - Raw beef
+  raw_porkchop.png       - Raw porkchop
+  raw_chicken.png        - Raw chicken
+  golden_apple.png       - Golden apple (special effects)
+  carrot.png             - Carrot (restores 3 hunger)
+  potato.png             - Potato
+  baked_potato.png       - Baked potato (restores 5 hunger)
+  melon_slice.png        - Melon slice (restores 2 hunger)
+
+
+================================================================================
+                            NORMAL MAPS
+================================================================================
+
+Normal maps add depth and detail to block surfaces by affecting how light
+interacts with them. They are OPTIONAL but recommended for a more realistic
+look.
+
+HOW TO ADD NORMAL MAPS:
+-----------------------
+Simply add a file with "_n" suffix next to your texture:
+  stone.png      <-- Color/albedo texture
+  stone_n.png    <-- Normal map for stone
+
+NORMAL MAP FORMAT:
+------------------
+- Same size as the color texture (16x16 recommended)
+- RGB channels encode the normal direction:
+    R = X direction (left/right)
+    G = Y direction (up/down)
+    B = Z direction (toward viewer)
+- A flat surface has RGB values of (128, 128, 255) - light purple/blue
+- Use normal map generators or create by hand in image editors
+
+TOOLS FOR CREATING NORMAL MAPS:
+-------------------------------
+- GIMP (free) with normalmap plugin
+- Photoshop with NVIDIA Normal Map Filter
+- Materialize (free, automatic generation from photos)
+- NormalMap Online (web-based tool)
+- Substance Designer / Substance Painter
+
+
+================================================================================
+                          BIOME TINTING
+================================================================================
+
+Like Minecraft, this engine supports biome-based color tinting for grass,
+leaves, and water. This creates variety across different biomes.
+
+TINTED TEXTURES:
+----------------
+The following textures are automatically tinted based on biome:
+  grass_top.png    - Tinted by biome temperature/humidity (green variations)
+  grass_side.png   - Partially tinted (grass portion only)
+  leaves_oak.png   - Tinted by biome (various green shades)
+  water_still.png  - Tinted by biome (blue/turquoise/green variations)
+
+GRAYSCALE TEXTURES (OPTIONAL):
+-----------------------------
+For best biome blending results, you can provide grayscale versions of
+tintable textures:
+  - Create the texture in neutral gray tones
+  - The biome colormap will multiply these grays to produce colored results
+  - This gives the most vibrant and varied biome colors
+
+If you use full-color textures instead, the biome tint will still apply,
+but the results may appear slightly washed out or over-saturated.
+
+EXAMPLE:
+--------
+A grayscale grass_top.png with values around RGB(128, 128, 128) will show
+as bright green in jungles, yellowish in savannas, and darker green in
+swamps when the biome colormap is applied.
+
+
+================================================================================
+                               TIPS
+================================================================================
+
+1. START SMALL
+   Begin with just a few key textures (stone, dirt, grass) to test your pack
+   before creating all textures.
+
+2. USE MINECRAFT TEXTURES AS REFERENCE
+   You can use Minecraft's default textures as a starting point. Extract them
+   from your Minecraft installation's assets folder.
+
+3. MAINTAIN CONSISTENCY
+   Keep a consistent art style across all your textures. Mixing photorealistic
+   and pixel art styles usually looks odd.
+
+4. TEST IN-GAME
+   Use the Texture Pack menu to quickly test changes. You can modify textures
+   and re-apply the pack without restarting the game.
+
+5. TRANSPARENCY
+   For blocks like glass, leaves, and water, use PNG with alpha channel
+   (transparency). The engine uses alpha testing - pixels with alpha < 0.1
+   are discarded.
+
+6. SEAMLESS TILING
+   Make sure textures tile seamlessly. The edges should connect smoothly
+   when repeated side by side.
+
+
+================================================================================
+                         TROUBLESHOOTING
+================================================================================
+
+TEXTURE NOT LOADING:
+- Check the filename matches exactly (case-sensitive on some systems)
+- Verify it's a valid PNG file
+- Make sure the file is in the correct folder
+
+TEXTURE LOOKS WRONG:
+- Check the dimensions (16x16 works best)
+- Ensure it's RGB or RGBA format
+- Try re-exporting from your image editor
+
+NORMAL MAP NOT WORKING:
+- File must be named exactly: texturename_n.png
+- Check that normal maps are being detected (shown in pack info)
+- Verify the RGB values are in correct range (128,128,255 = flat)
+
+
+================================================================================
+                           EXAMPLE PACK
+================================================================================
+
+Here's a minimal example pack structure:
+
+textures/
+    my_first_pack/
+        stone.png
+        dirt.png
+        grass_top.png
+        grass_side.png
+
+With just these 4 textures, you'll see your custom look on the most common
+blocks while others fall back to procedural generation.
+
+
+================================================================================
+
+Happy texture creating! Share your packs with the community!
+
+For more help, visit the project repository or ask in the community forums.
+
+================================================================================

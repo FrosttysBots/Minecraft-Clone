@@ -162,7 +162,7 @@ void Logger::setFileOutput(bool enabled, const std::string& path) {
             auto time = std::chrono::system_clock::to_time_t(now);
             std::tm tm;
             localtime_s(&tm, &time);
-            file << "=== VoxelEngine Log Started: " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " ===" << std::endl;
+            file << "=== ForgeBound Log Started: " << std::put_time(&tm, "%Y-%m-%d %H:%M:%S") << " ===" << std::endl;
         }
     }
 }
@@ -394,7 +394,7 @@ std::string CrashHandler::writeCrashReport(const std::string& reason, void* exce
 
     // Header
     file << "================================================================================\n";
-    file << "                         VOXEL ENGINE CRASH REPORT\n";
+    file << "                         FORGEBOUND CRASH REPORT\n";
     file << "================================================================================\n\n";
 
     // Crash info

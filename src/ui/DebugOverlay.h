@@ -79,7 +79,7 @@ public:
     bool isOnGround = false;
     std::string facingDirection = "North";
     std::string biome = "Plains";
-    std::string gameVersion = "VoxelEngine Infdev";
+    std::string gameVersion = "ForgeBound InfDev 2.0";
 
     // GPU info
     std::string gpuName = "";

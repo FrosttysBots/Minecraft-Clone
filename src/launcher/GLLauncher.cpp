@@ -1,4 +1,4 @@
-// Voxel Engine OpenGL Launcher
+// ForgeBound OpenGL Launcher
 // Bethesda-style launcher with dark theme and modern UI
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -498,7 +498,7 @@ public:
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
-        window = glfwCreateWindow(1024, 640, "Voxel Engine Launcher", nullptr, nullptr);
+        window = glfwCreateWindow(1024, 640, "ForgeBound Launcher", nullptr, nullptr);
         if (!window) {
             std::cerr << "Failed to create window" << std::endl;
             glfwTerminate();
@@ -1003,11 +1003,11 @@ public:
 
     void renderMainMenu() {
         // Title (positioned to fit on screen)
-        ui.drawText("VOXEL", 1024 - 100 - 200, 80, Colors::ACCENT, 2.5f);
-        ui.drawText("ENGINE", 1024 - 100 - 200, 130, Colors::ACCENT, 2.5f);
+        ui.drawText("FORGE", 1024 - 100 - 200, 80, Colors::ACCENT, 2.5f);
+        ui.drawText("BOUND", 1024 - 100 - 200, 130, Colors::ACCENT, 2.5f);
 
         // Version
-        ui.drawText("Infdev", 1024 - 100 - 200, 180, Colors::TEXT_DIM, 1.0f);
+        ui.drawText("InfDev 2.0", 1024 - 100 - 200, 180, Colors::TEXT_DIM, 1.0f);
 
         // Menu buttons
         playButton.render(ui);

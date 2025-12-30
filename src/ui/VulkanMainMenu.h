@@ -1,44 +1,33 @@
 #pragma once
 
-// Main Menu Screen
-// Displays Play Game, Multiplayer, Settings, Exit buttons
+// Vulkan Main Menu Screen
+// Mirrors MainMenu.h but uses VulkanMenuUIRenderer
 
-#include "MenuUI.h"
+#include "VulkanMenuUI.h"
+#include "MainMenu.h"  // For MenuAction enum
 #include <functional>
 
-// Menu action types
-enum class MenuAction {
-    NONE,
-    PLAY_GAME,
-    MULTIPLAYER,
-    SETTINGS,
-    TEXTURE_PACKS,
-    EXIT,
-    COPY_SEED,
-    REFRESH_WORLD
-};
-
-class MainMenu {
+class VulkanMainMenu {
 public:
-    MenuUIRenderer* ui = nullptr;
-    MenuInputHandler input;
+    VulkanMenuUIRenderer* ui = nullptr;
+    VulkanMenuInputHandler input;
 
     // Buttons
-    MenuButton playButton;
-    MenuButton multiplayerButton;
-    MenuButton settingsButton;
-    MenuButton texturePacksButton;
-    MenuButton exitButton;
-    MenuButton copySeedButton;
-    MenuButton refreshWorldButton;
+    VulkanMenuButton playButton;
+    VulkanMenuButton multiplayerButton;
+    VulkanMenuButton settingsButton;
+    VulkanMenuButton texturePacksButton;
+    VulkanMenuButton exitButton;
+    VulkanMenuButton copySeedButton;
+    VulkanMenuButton refreshWorldButton;
 
-    // Current action (set when button is clicked)
+    // Current action
     MenuAction currentAction = MenuAction::NONE;
 
     // Version string
     std::string version = "InfDev 2.0";
 
-    void init(MenuUIRenderer* uiRenderer) {
+    void init(VulkanMenuUIRenderer* uiRenderer) {
         ui = uiRenderer;
         setupButtons();
     }
@@ -67,7 +56,7 @@ public:
             [this]() { currentAction = MenuAction::MULTIPLAYER; }
         };
         multiplayerButton.textScale = 1.5f;
-        multiplayerButton.enabled = false;  // Greyed out
+        multiplayerButton.enabled = false;
 
         // Settings button
         settingsButton = {
@@ -168,7 +157,7 @@ public:
                     MenuColors::TEXT_DIM, 1.0f);
 
         // Credits/Footer
-        ui->drawTextCentered("Powered by OpenGL", 0, static_cast<float>(ui->windowHeight) - 40,
+        ui->drawTextCentered("Powered by Vulkan", 0, static_cast<float>(ui->windowHeight) - 40,
                             static_cast<float>(ui->windowWidth), MenuColors::TEXT_DIM, 0.9f);
     }
 

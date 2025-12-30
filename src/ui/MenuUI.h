@@ -1,6 +1,6 @@
 #pragma once
 
-// Menu UI System for VoxelEngine
+// Menu UI System for ForgeBound
 // Adapted from GLLauncher.cpp for in-game menus
 
 #include <glad/gl.h>
