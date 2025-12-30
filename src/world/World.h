@@ -14,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include <thread>
+#include <shared_mutex>
 #include <iostream>
 #include <sstream>
 #include <array>
@@ -227,8 +228,9 @@ public:
     std::unordered_map<glm::ivec2, std::unique_ptr<Chunk>> chunks;
 
     // Mutex for thread-safe chunk access (used by mesh worker threads)
-    // Using recursive_mutex to allow nested locking from methods that call getChunk
-    mutable std::recursive_mutex chunksMutex;
+    // Using shared_mutex: read operations (getChunk, getBlock) use shared_lock
+    // Write operations (createChunk, etc.) use unique_lock
+    mutable std::shared_mutex chunksMutex;
 
     // Chunk meshes stored by position
     std::unordered_map<glm::ivec2, std::unique_ptr<ChunkMesh>> meshes;
@@ -290,12 +292,16 @@ public:
     // Max chunks to generate per frame (reasonable default)
     int maxChunksPerFrame = 8;
 
-    // Max meshes to build per frame (reasonable default)
-    int maxMeshesPerFrame = 8;
+    // Max meshes to build per frame (strictly limited to prevent lag spikes)
+    int maxMeshesPerFrame = 2;  // Increased from 1 for better responsiveness
+
+    // Priority chunks - chunks modified by player get immediate mesh updates
+    std::unordered_set<glm::ivec2> priorityChunks;
+    std::mutex priorityMutex;
 
     // OPTIMIZATION: Frame time budget system
     // Limits chunk/mesh processing based on available frame time
-    float frameTimeBudgetMs = 4.0f;  // Max ms to spend on chunk loading per frame
+    float frameTimeBudgetMs = 3.0f;  // Max ms to spend on mesh uploads per frame
     float lastChunkProcessTimeMs = 0.0f;  // Track actual time spent
     float lastMeshProcessTimeMs = 0.0f;
     bool useFrameTimeBudget = true;  // Enable adaptive throttling
@@ -368,6 +374,12 @@ public:
 
     // Initialize indirect rendering buffers
     void initIndirectRendering() {
+        // Skip OpenGL initialization if not using OpenGL meshes (e.g., Vulkan backend)
+        if (!useOpenGLMeshes) {
+            std::cout << "Indirect rendering skipped (Vulkan mode)" << std::endl;
+            return;
+        }
+
         // Create indirect command buffer
         glGenBuffers(1, &indirectCommandBuffer);
         glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectCommandBuffer);
@@ -402,16 +414,18 @@ public:
         if (chunkThreadPool) {
             chunkThreadPool->shutdown();
         }
-        // Cleanup indirect rendering resources
-        if (indirectCommandBuffer != 0) glDeleteBuffers(1, &indirectCommandBuffer);
-        if (drawDataSSBO != 0) glDeleteBuffers(1, &drawDataSSBO);
-        if (batchedVAO != 0) glDeleteVertexArrays(1, &batchedVAO);
-        if (batchedVBO != 0) glDeleteBuffers(1, &batchedVBO);
+        // Cleanup indirect rendering resources (only if using OpenGL)
+        if (useOpenGLMeshes) {
+            if (indirectCommandBuffer != 0) glDeleteBuffers(1, &indirectCommandBuffer);
+            if (drawDataSSBO != 0) glDeleteBuffers(1, &drawDataSSBO);
+            if (batchedVAO != 0) glDeleteVertexArrays(1, &batchedVAO);
+            if (batchedVBO != 0) glDeleteBuffers(1, &batchedVBO);
+        }
     }
 
     // Get or create chunk at position
     Chunk* getChunk(glm::ivec2 pos) {
-        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        std::shared_lock<std::shared_mutex> lock(chunksMutex);  // Read lock - multiple threads can read
         auto it = chunks.find(pos);
         if (it != chunks.end()) {
             return it->second.get();
@@ -421,7 +435,7 @@ public:
 
     // Get chunk at position (const)
     const Chunk* getChunk(glm::ivec2 pos) const {
-        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        std::shared_lock<std::shared_mutex> lock(chunksMutex);  // Read lock - multiple threads can read
         auto it = chunks.find(pos);
         if (it != chunks.end()) {
             return it->second.get();
@@ -431,7 +445,7 @@ public:
 
     // Create a new chunk at position
     Chunk* createChunk(glm::ivec2 pos) {
-        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        std::unique_lock<std::shared_mutex> lock(chunksMutex);  // Write lock - exclusive access
         auto chunk = std::make_unique<Chunk>(pos);
         Chunk* ptr = chunk.get();
         chunks[pos] = std::move(chunk);
@@ -518,7 +532,7 @@ public:
                     chunk->isDirty = true;
                     chunk->recalculateHeightmaps();
                     {
-                        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                        std::unique_lock<std::shared_mutex> lock(chunksMutex);  // Write lock
                         chunks[chunkPos] = std::move(chunk);
                     }
                     pregenerationProgress++;
@@ -546,7 +560,7 @@ public:
                 chunk->isDirty = true;
                 chunk->recalculateHeightmaps();
                 {
-                    std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                    std::unique_lock<std::shared_mutex> lock(chunksMutex);  // Write lock
                     chunks[chunkPos] = std::move(chunk);
                 }
                 return true;
@@ -668,8 +682,8 @@ public:
         return chunk->getBlock(localX, y, localZ);
     }
 
-    // Set block at world position
-    void setBlock(int x, int y, int z, BlockType type) {
+    // Set block at world position (priority = true for player interactions for immediate mesh update)
+    void setBlock(int x, int y, int z, BlockType type, bool priority = true) {
         glm::ivec2 chunkPos(
             static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X)),
             static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z))
@@ -688,22 +702,139 @@ public:
 
         chunk->setBlock(localX, y, localZ, type);
 
-        // Mark this chunk dirty and modified (needs saving)
-        chunk->isDirty = true;
+        // Mark this chunk modified (needs saving)
         chunk->isModified = true;
 
-        // Mark neighboring chunks as dirty if on edge
-        if (localX == 0) markChunkDirty(glm::ivec2(chunkPos.x - 1, chunkPos.y));
-        if (localX == CHUNK_SIZE_X - 1) markChunkDirty(glm::ivec2(chunkPos.x + 1, chunkPos.y));
-        if (localZ == 0) markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y - 1));
-        if (localZ == CHUNK_SIZE_Z - 1) markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y + 1));
+        // For player interactions, rebuild mesh immediately for instant feedback
+        if (priority) {
+            rebuildMeshImmediate(chunkPos);
+
+            // Also rebuild neighboring chunks immediately if block is on edge
+            if (localX == 0) rebuildMeshImmediate(glm::ivec2(chunkPos.x - 1, chunkPos.y));
+            if (localX == CHUNK_SIZE_X - 1) rebuildMeshImmediate(glm::ivec2(chunkPos.x + 1, chunkPos.y));
+            if (localZ == 0) rebuildMeshImmediate(glm::ivec2(chunkPos.x, chunkPos.y - 1));
+            if (localZ == CHUNK_SIZE_Z - 1) rebuildMeshImmediate(glm::ivec2(chunkPos.x, chunkPos.y + 1));
+        } else {
+            // Non-priority: use async path
+            chunk->isDirty = true;
+            if (localX == 0) markChunkDirty(glm::ivec2(chunkPos.x - 1, chunkPos.y));
+            if (localX == CHUNK_SIZE_X - 1) markChunkDirty(glm::ivec2(chunkPos.x + 1, chunkPos.y));
+            if (localZ == 0) markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y - 1));
+            if (localZ == CHUNK_SIZE_Z - 1) markChunkDirty(glm::ivec2(chunkPos.x, chunkPos.y + 1));
+        }
     }
 
     // Mark chunk as needing mesh rebuild
-    void markChunkDirty(glm::ivec2 pos) {
+    void markChunkDirty(glm::ivec2 pos, bool priority = false) {
         Chunk* chunk = getChunk(pos);
         if (chunk) {
             chunk->isDirty = true;
+            if (priority) {
+                std::lock_guard<std::mutex> lock(priorityMutex);
+                priorityChunks.insert(pos);
+            }
+        }
+    }
+
+    // Immediately rebuild mesh for a chunk (synchronous, for instant block feedback)
+    void rebuildMeshImmediate(glm::ivec2 pos) {
+        if (!chunkThreadPool || !useOpenGLMeshes) return;
+
+        Chunk* chunk = getChunk(pos);
+        if (!chunk) return;
+
+        // Get neighbor chunks
+        Chunk* chunkNegX = getChunk(glm::ivec2(pos.x - 1, pos.y));
+        Chunk* chunkPosX = getChunk(glm::ivec2(pos.x + 1, pos.y));
+        Chunk* chunkNegZ = getChunk(glm::ivec2(pos.x, pos.y - 1));
+        Chunk* chunkPosZ = getChunk(glm::ivec2(pos.x, pos.y + 1));
+
+        // Need all neighbors for proper meshing
+        if (!chunkNegX || !chunkPosX || !chunkNegZ || !chunkPosZ) return;
+
+        // Create block getter lambdas
+        const bool renderBorders = this->renderChunkBorderFaces;
+        auto getSafeBlock = [chunk, chunkNegX, chunkPosX, chunkNegZ, chunkPosZ, pos, renderBorders](int x, int y, int z) -> BlockType {
+            if (y < 0 || y >= CHUNK_SIZE_Y) return BlockType::AIR;
+            int cx = static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X));
+            int cz = static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z));
+            const Chunk* c = nullptr;
+            if (cx == pos.x && cz == pos.y) c = chunk;
+            else if (cx == pos.x - 1 && cz == pos.y) c = chunkNegX;
+            else if (cx == pos.x + 1 && cz == pos.y) c = chunkPosX;
+            else if (cx == pos.x && cz == pos.y - 1) c = chunkNegZ;
+            else if (cx == pos.x && cz == pos.y + 1) c = chunkPosZ;
+            if (!c) return renderBorders ? BlockType::AIR : BlockType::STONE;
+            int lx = x - cx * CHUNK_SIZE_X;
+            int lz = z - cz * CHUNK_SIZE_Z;
+            return c->getBlock(lx, y, lz);
+        };
+
+        auto getLightLevel = [chunk, chunkNegX, chunkPosX, chunkNegZ, chunkPosZ, pos](int x, int y, int z) -> uint8_t {
+            if (y < 0 || y >= CHUNK_SIZE_Y) return 15;
+            int cx = static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X));
+            int cz = static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z));
+            const Chunk* c = nullptr;
+            if (cx == pos.x && cz == pos.y) c = chunk;
+            else if (cx == pos.x - 1 && cz == pos.y) c = chunkNegX;
+            else if (cx == pos.x + 1 && cz == pos.y) c = chunkPosX;
+            else if (cx == pos.x && cz == pos.y - 1) c = chunkNegZ;
+            else if (cx == pos.x && cz == pos.y + 1) c = chunkPosZ;
+            if (!c) return 15;
+            int lx = x - cx * CHUNK_SIZE_X;
+            int lz = z - cz * CHUNK_SIZE_Z;
+            return c->getLightLevel(lx, y, lz);
+        };
+
+        // Generate mesh data synchronously
+        ChunkThreadPool::MeshResult result;
+        result.position = pos;
+        result.worldOffset = glm::vec3(pos.x * CHUNK_SIZE_X, 0.0f, pos.y * CHUNK_SIZE_Z);
+
+        // Dummy functions for unused parameters
+        auto dummyBlock = [](int, int, int) -> BlockType { return BlockType::AIR; };
+
+        chunkThreadPool->generateMeshData(result, *chunk, dummyBlock, dummyBlock, getSafeBlock, getLightLevel);
+
+        // Upload to GPU immediately
+        auto it = meshes.find(pos);
+        if (it == meshes.end()) {
+            meshes[pos] = std::make_unique<ChunkMesh>();
+        }
+
+        ChunkMesh* mesh = meshes[pos].get();
+        mesh->worldOffset = result.worldOffset;
+
+        // Upload each sub-chunk
+        for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
+            auto& subData = result.subChunks[subY];
+            auto& subChunk = mesh->subChunks[subY];
+
+            subChunk.subChunkY = subData.subChunkY;
+            subChunk.isEmpty = subData.isEmpty;
+            subChunk.hasWater = subData.hasWater;
+
+            // Upload solid geometry
+            if (subData.getLOD0VertexCount() > 0) {
+                mesh->uploadFaceBucketsToSubChunk(subY, subData.faceBucketVertices);
+            }
+
+            // Upload water geometry
+            if (!subData.waterVertices.empty()) {
+                mesh->uploadWaterToSubChunk(subY, subData.waterVertices);
+            }
+        }
+
+        // Update lightmap
+        mesh->updateLightmap(*chunk);
+
+        // Mark chunk as no longer dirty since we just rebuilt it
+        chunk->isDirty = false;
+
+        // Remove from priority set since we handled it
+        {
+            std::lock_guard<std::mutex> lock(priorityMutex);
+            priorityChunks.erase(pos);
         }
     }
 
@@ -731,7 +862,10 @@ public:
             chunkThreadPool->clearPendingChunks();
         }
 
-        // Clear all meshes first (they reference chunks)
+        // Clear deferred mesh deletions queue first
+        deferredMeshDeletions.clear();
+
+        // Clear all meshes (they reference chunks)
         for (auto& [pos, mesh] : meshes) {
             if (mesh) {
                 mesh->destroy();
@@ -921,7 +1055,7 @@ public:
             // Enable burst mode until we have most chunks loaded
             int loadedChunks;
             {
-                std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                std::shared_lock<std::shared_mutex> lock(chunksMutex);  // Read lock
                 loadedChunks = static_cast<int>(chunks.size());
             }
             int loadedMeshes = static_cast<int>(meshes.size());
@@ -941,14 +1075,21 @@ public:
             }
         }
 
+        // Timing for debug
+        static int updateTimingCounter = 0;
+        auto t0 = std::chrono::high_resolution_clock::now();
+
         // Process chunks completed by worker threads
         processCompletedChunks();
+        auto t1 = std::chrono::high_resolution_clock::now();
 
         // Queue new chunks for generation around player
         loadChunksAroundPlayer(playerChunk);
+        auto t2 = std::chrono::high_resolution_clock::now();
 
         // Unload distant chunks
         unloadDistantChunks(playerChunk);
+        auto t3 = std::chrono::high_resolution_clock::now();
 
         // Update water simulation (skip during burst mode for faster loading)
         if (!burstMode) {
@@ -958,9 +1099,18 @@ public:
                 waterUpdateTimer = 0.0f;
             }
         }
+        auto t4 = std::chrono::high_resolution_clock::now();
 
         // Update meshes
         updateMeshes(playerChunk);
+        auto t5 = std::chrono::high_resolution_clock::now();
+
+        // Print timing every 30 frames or if any step takes >100ms
+        auto ms = [](auto start, auto end) { return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count(); };
+        if (updateTimingCounter++ % 30 == 0 || ms(t0, t5) > 100) {
+            std::cout << "[World.update] processCompletedChunks=" << ms(t0,t1) << "ms, loadChunks=" << ms(t1,t2)
+                      << "ms, unload=" << ms(t2,t3) << "ms, water=" << ms(t3,t4) << "ms, updateMeshes=" << ms(t4,t5) << "ms" << std::endl;
+        }
 
         // Lazy meshlet regeneration after burst mode (a few per frame)
         if (meshletRegenerationNeeded && g_generateMeshlets) {
@@ -974,6 +1124,9 @@ public:
 
         // Process pending chunk saves (batched to avoid I/O stalls)
         processPendingSaves();
+
+        // Process deferred mesh deletions (spread GPU cleanup across frames)
+        processDeferredMeshDeletions();
 
         // Decrement warmup counter (skip frustum culling for first few frames)
         if (warmupFrames > 0) warmupFrames--;
@@ -1025,6 +1178,10 @@ public:
 
     // Simulate water flow
     void updateWater(const glm::ivec2& playerChunk) {
+        auto startTime = std::chrono::high_resolution_clock::now();
+        constexpr float WATER_TIME_BUDGET_MS = 2.0f;  // Max 2ms for water updates per frame
+        int chunksProcessed = 0;
+
         // Process chunks near the player
         for (auto& [pos, chunk] : chunks) {
             // Skip chunks without water (uses cached flag for fast culling)
@@ -1036,13 +1193,77 @@ public:
             // Only simulate water in nearby chunks AND visible chunks
             if (dx <= 4 && dz <= 4 && frustum.isChunkVisible(pos)) {
                 updateChunkWater(*chunk);
+                chunksProcessed++;
+
+                // Time budget check - limit water processing per frame
+                if (chunksProcessed >= 2) {  // At least process 2 chunks
+                    auto now = std::chrono::high_resolution_clock::now();
+                    float elapsedMs = std::chrono::duration<float, std::milli>(now - startTime).count();
+                    if (elapsedMs > WATER_TIME_BUDGET_MS) {
+                        break;  // Continue next frame
+                    }
+                }
             }
         }
     }
 
     // Update water in a single chunk
+    // OPTIMIZED: Cache chunk pointers to avoid millions of mutex locks
     void updateChunkWater(Chunk& chunk) {
         bool anyUpdates = false;
+
+        // Cache chunk pointers upfront (5 mutex locks instead of millions)
+        // This is the key optimization - we only lock once per neighbor chunk
+        const glm::ivec2 pos = chunk.position;
+        Chunk* chunkCenter = &chunk;
+        Chunk* chunkPosX = getChunk(glm::ivec2(pos.x + 1, pos.y));  // East
+        Chunk* chunkNegX = getChunk(glm::ivec2(pos.x - 1, pos.y));  // West
+        Chunk* chunkPosZ = getChunk(glm::ivec2(pos.x, pos.y + 1));  // South
+        Chunk* chunkNegZ = getChunk(glm::ivec2(pos.x, pos.y - 1));  // North
+
+        // Helper to get chunk for world coordinates (no mutex - uses cached pointers)
+        auto getChunkForWorld = [&](int wx, int wz) -> Chunk* {
+            int cx = static_cast<int>(floor(static_cast<float>(wx) / CHUNK_SIZE_X));
+            int cz = static_cast<int>(floor(static_cast<float>(wz) / CHUNK_SIZE_Z));
+            if (cx == pos.x && cz == pos.y) return chunkCenter;
+            if (cx == pos.x + 1 && cz == pos.y) return chunkPosX;
+            if (cx == pos.x - 1 && cz == pos.y) return chunkNegX;
+            if (cx == pos.x && cz == pos.y + 1) return chunkPosZ;
+            if (cx == pos.x && cz == pos.y - 1) return chunkNegZ;
+            return nullptr;  // Outside cached area
+        };
+
+        // Helper to get block without mutex (uses cached chunks)
+        auto getBlockCached = [&](int wx, int y, int wz) -> BlockType {
+            if (y < 0 || y >= CHUNK_SIZE_Y) return BlockType::AIR;
+            Chunk* c = getChunkForWorld(wx, wz);
+            if (!c) return BlockType::AIR;
+            int lx = wx - c->position.x * CHUNK_SIZE_X;
+            int lz = wz - c->position.y * CHUNK_SIZE_Z;
+            return c->getBlock(lx, y, lz);
+        };
+
+        // Helper to get water level without mutex
+        auto getWaterCached = [&](int wx, int y, int wz) -> uint8_t {
+            if (y < 0 || y >= CHUNK_SIZE_Y) return 0;
+            Chunk* c = getChunkForWorld(wx, wz);
+            if (!c) return 0;
+            int lx = wx - c->position.x * CHUNK_SIZE_X;
+            int lz = wz - c->position.y * CHUNK_SIZE_Z;
+            return c->getWaterLevel(lx, y, lz);
+        };
+
+        // Helper to set water level without mutex
+        auto setWaterCached = [&](int wx, int y, int wz, uint8_t level) -> bool {
+            if (y < 0 || y >= CHUNK_SIZE_Y) return false;
+            Chunk* c = getChunkForWorld(wx, wz);
+            if (!c) return false;
+            int lx = wx - c->position.x * CHUNK_SIZE_X;
+            int lz = wz - c->position.y * CHUNK_SIZE_Z;
+            c->setWaterLevel(lx, y, lz, level);
+            if (c != chunkCenter) c->isDirty = true;  // Mark neighbor as dirty too
+            return true;
+        };
 
         // Process from top to bottom so water flows down first
         for (int y = CHUNK_SIZE_Y - 1; y >= 0; y--) {
@@ -1052,20 +1273,20 @@ public:
                     if (level == 0) continue;
 
                     // Get world coordinates
-                    int wx = chunk.position.x * CHUNK_SIZE_X + x;
-                    int wz = chunk.position.y * CHUNK_SIZE_Z + z;
+                    int wx = pos.x * CHUNK_SIZE_X + x;
+                    int wz = pos.y * CHUNK_SIZE_Z + z;
 
                     // Try to flow down first
-                    BlockType below = getBlock(wx, y - 1, wz);
-                    uint8_t belowLevel = getWaterLevel(wx, y - 1, wz);
+                    BlockType below = getBlockCached(wx, y - 1, wz);
+                    uint8_t belowLevel = getWaterCached(wx, y - 1, wz);
 
                     if (y > 0 && !isBlockSolid(below) && below != BlockType::WATER) {
                         // Flow down - water below becomes source-like
-                        setWaterLevel(wx, y - 1, wz, WATER_SOURCE);
+                        setWaterCached(wx, y - 1, wz, WATER_SOURCE);
                         anyUpdates = true;
                     } else if (y > 0 && below == BlockType::WATER && belowLevel < WATER_SOURCE) {
                         // Fill up water below
-                        setWaterLevel(wx, y - 1, wz, WATER_SOURCE);
+                        setWaterCached(wx, y - 1, wz, WATER_SOURCE);
                         anyUpdates = true;
                     }
 
@@ -1075,8 +1296,8 @@ public:
 
                         if (spreadLevel > 0) {
                             // Check if we can spread (not blocked below or on solid ground)
-                            bool canSpread = (y == 0) || isBlockSolid(getBlock(wx, y - 1, wz)) ||
-                                           getWaterLevel(wx, y - 1, wz) == WATER_SOURCE;
+                            bool canSpread = (y == 0) || isBlockSolid(getBlockCached(wx, y - 1, wz)) ||
+                                           getWaterCached(wx, y - 1, wz) == WATER_SOURCE;
 
                             if (canSpread) {
                                 // Try spreading in each horizontal direction
@@ -1085,11 +1306,11 @@ public:
                                     int nx = wx + dir[0];
                                     int nz = wz + dir[1];
 
-                                    BlockType neighbor = getBlock(nx, y, nz);
-                                    uint8_t neighborLevel = getWaterLevel(nx, y, nz);
+                                    BlockType neighbor = getBlockCached(nx, y, nz);
+                                    uint8_t neighborLevel = getWaterCached(nx, y, nz);
 
                                     if (!isBlockSolid(neighbor) && neighborLevel < spreadLevel) {
-                                        setWaterLevel(nx, y, nz, spreadLevel);
+                                        setWaterCached(nx, y, nz, spreadLevel);
                                         anyUpdates = true;
                                     }
                                 }
@@ -1131,7 +1352,7 @@ public:
 
             // Only add if not already present (could have been unloaded while generating)
             {
-                std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+                std::unique_lock<std::shared_mutex> lock(chunksMutex);  // Write lock
                 auto it = chunks.find(result.position);
                 if (it == chunks.end()) {
                     chunks[result.position] = std::move(result.chunk);
@@ -1164,8 +1385,18 @@ public:
     // Load chunks around player position
     void loadChunksAroundPlayer(const glm::ivec2& playerChunk) {
         int chunksQueued = 0;
+        int cacheChecks = 0;
+        auto loadStart = std::chrono::high_resolution_clock::now();
+
         // OPTIMIZATION: Limit queue size to prevent overwhelming the thread pool
         int maxToQueue = burstMode ? 64 : maxChunksPerFrame * 2;  // Reduced burst from 10000
+
+        // Debug: print render distance
+        static int loadChunksDebugCounter = 0;
+        if (loadChunksDebugCounter++ % 30 == 0) {
+            std::cout << "[loadChunks] renderDistance=" << renderDistance << ", burstMode=" << burstMode
+                      << ", useChunkCaching=" << useChunkCaching << ", worldSavePath=" << worldSavePath << std::endl;
+        }
 
         // Predictive chunk streaming: prioritize chunks in movement direction
         if (usePredictiveLoading && !burstMode && glm::length(playerVelocity) > 0.5f) {
@@ -1268,30 +1499,70 @@ public:
     }
 
     // Unload chunks that are too far from the player
-    void unloadDistantChunks(const glm::ivec2& playerChunk) {
-        std::vector<glm::ivec2> toRemove;
+    // Limit unloads per frame to prevent lag spikes from mesh destruction
+    static constexpr int MAX_UNLOADS_PER_FRAME = 8;
 
-        // Find chunks to unload (with lock)
+    // Deferred mesh destruction queue - meshes are queued here and destroyed gradually
+    std::vector<std::unique_ptr<ChunkMesh>> deferredMeshDeletions;
+    static constexpr int MAX_MESH_DELETIONS_PER_FRAME = 4;
+
+    void unloadDistantChunks(const glm::ivec2& playerChunk) {
+        std::vector<std::pair<int, glm::ivec2>> toRemove;  // (distance, pos) for sorting
+
+        // Find chunks to unload (with read lock first)
         {
-            std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+            std::shared_lock<std::shared_mutex> lock(chunksMutex);  // Read lock for iteration
             for (auto& [pos, chunk] : chunks) {
                 int dx = abs(pos.x - playerChunk.x);
                 int dz = abs(pos.y - playerChunk.y);
 
                 if (dx > unloadDistance || dz > unloadDistance) {
-                    toRemove.push_back(pos);
+                    int distSq = dx * dx + dz * dz;
+                    toRemove.push_back({distSq, pos});
                 }
-            }
-
-            // Remove distant chunks (inside lock)
-            for (const auto& pos : toRemove) {
-                chunks.erase(pos);
             }
         }
 
-        // Remove meshes (no lock needed - meshes accessed only from main thread)
-        for (const auto& pos : toRemove) {
-            meshes.erase(pos);
+        // If nothing to unload, return early
+        if (toRemove.empty()) return;
+
+        // Sort by distance (farthest first) so we prioritize unloading the most distant chunks
+        std::sort(toRemove.begin(), toRemove.end(),
+            [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        // Limit how many we unload this frame to prevent lag spikes
+        int unloadCount = std::min(static_cast<int>(toRemove.size()), MAX_UNLOADS_PER_FRAME);
+
+        // Remove chunks (with write lock)
+        {
+            std::unique_lock<std::shared_mutex> lock(chunksMutex);  // Write lock for erase
+            for (int i = 0; i < unloadCount; i++) {
+                chunks.erase(toRemove[i].second);
+            }
+        }
+
+        // Queue meshes for deferred destruction (no lock needed - meshes accessed only from main thread)
+        // This spreads GPU resource cleanup across multiple frames
+        for (int i = 0; i < unloadCount; i++) {
+            auto it = meshes.find(toRemove[i].second);
+            if (it != meshes.end()) {
+                // Move mesh to deferred deletion queue
+                deferredMeshDeletions.push_back(std::move(it->second));
+                meshes.erase(it);
+            }
+        }
+    }
+
+    // Process deferred mesh deletions (call once per frame)
+    void processDeferredMeshDeletions() {
+        if (deferredMeshDeletions.empty()) return;
+
+        // Delete a limited number of meshes per frame to avoid spikes
+        int deleteCount = std::min(static_cast<int>(deferredMeshDeletions.size()), MAX_MESH_DELETIONS_PER_FRAME);
+
+        // Remove from back (faster for vector)
+        for (int i = 0; i < deleteCount; i++) {
+            deferredMeshDeletions.pop_back();  // unique_ptr destructor calls mesh->destroy()
         }
     }
 
@@ -1302,7 +1573,16 @@ public:
         // First, process any completed meshes from worker threads
         processCompletedMeshes();
 
+        // Get priority chunks (player-modified) - these bypass normal limits
+        std::unordered_set<glm::ivec2> currentPriority;
+        {
+            std::lock_guard<std::mutex> lock(priorityMutex);
+            currentPriority = std::move(priorityChunks);
+            priorityChunks.clear();
+        }
+
         // Collect dirty chunks within render distance, sorted by distance
+        // Priority chunks go first with distance -1 to ensure they're processed immediately
         std::vector<std::pair<int, glm::ivec2>> dirtyChunks;
 
         for (auto& [pos, chunk] : chunks) {
@@ -1311,61 +1591,122 @@ public:
 
             if (dx <= renderDistance && dz <= renderDistance) {
                 if (chunk->isDirty && chunkThreadPool && !chunkThreadPool->isMeshGenerating(pos)) {
-                    int distSq = dx * dx + dz * dz;
+                    // Priority chunks get distance -1 so they sort first
+                    bool isPriority = currentPriority.count(pos) > 0;
+                    int distSq = isPriority ? -1 : (dx * dx + dz * dz);
                     dirtyChunks.push_back({distSq, pos});
                 }
             }
         }
 
-        // Sort by distance (closest first)
+        // Sort by distance (priority chunks with -1 come first, then closest)
         std::sort(dirtyChunks.begin(), dirtyChunks.end(),
             [](const auto& a, const auto& b) { return a.first < b.first; });
 
         // Queue meshes for async generation
         // OPTIMIZATION: Limit queue size to prevent frame spikes
+        // Priority chunks (distSq == -1) bypass the limit for immediate player feedback
         int maxToQueue = burstMode ? 64 : maxMeshesPerFrame * 2;  // Reduced burst from 10000
+        int normalQueued = 0;
         for (auto& [distSq, pos] : dirtyChunks) {
-            if (meshesQueued >= maxToQueue) break;  // Queue more since it's async
+            bool isPriority = (distSq == -1);
+            // Priority chunks always get queued; normal chunks respect the limit
+            if (!isPriority && normalQueued >= maxToQueue) break;
 
             Chunk* chunk = getChunk(pos);
             if (!chunk) continue;
 
-            // Only queue if ALL 4 neighboring chunks exist
-            bool allNeighborsExist =
-                getChunk(glm::ivec2(pos.x - 1, pos.y)) != nullptr &&
-                getChunk(glm::ivec2(pos.x + 1, pos.y)) != nullptr &&
-                getChunk(glm::ivec2(pos.x, pos.y - 1)) != nullptr &&
-                getChunk(glm::ivec2(pos.x, pos.y + 1)) != nullptr;
+            // OPTIMIZATION: Cache all 5 chunk pointers upfront (1 lock instead of thousands)
+            // This is the same pattern used in updateChunkWater()
+            Chunk* chunkNegX = getChunk(glm::ivec2(pos.x - 1, pos.y));  // West
+            Chunk* chunkPosX = getChunk(glm::ivec2(pos.x + 1, pos.y));  // East
+            Chunk* chunkNegZ = getChunk(glm::ivec2(pos.x, pos.y - 1));  // North
+            Chunk* chunkPosZ = getChunk(glm::ivec2(pos.x, pos.y + 1));  // South
 
-            if (!allNeighborsExist) {
+            // Only queue if ALL 4 neighboring chunks exist
+            if (!chunkNegX || !chunkPosX || !chunkNegZ || !chunkPosZ) {
                 continue;
             }
 
-            // Create mesh request with block getters
-            // Note: These lambdas capture 'this' - must ensure World outlives mesh generation
+            // Create mesh request with OPTIMIZED block getters
+            // Lambdas capture chunk pointers directly - NO mutex locks during meshing!
             ChunkThreadPool::MeshRequest request;
             request.position = pos;
             request.chunk = chunk;
+            request.isPriority = isPriority;  // Player-modified chunks get priority processing
+            request.distanceSquared = isPriority ? 0 : distSq;  // Priority: closer chunks processed first
 
-            request.getWorldBlock = [this](int x, int y, int z) -> BlockType {
-                return this->getBlock(x, y, z);
+            // Capture cached chunk pointers by value for thread safety
+            const bool renderBorders = this->renderChunkBorderFaces;
+            request.getWorldBlock = [chunk, chunkNegX, chunkPosX, chunkNegZ, chunkPosZ, pos](int x, int y, int z) -> BlockType {
+                if (y < 0 || y >= CHUNK_SIZE_Y) return BlockType::AIR;
+                // Determine which chunk contains this block
+                int cx = static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X));
+                int cz = static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z));
+                const Chunk* c = nullptr;
+                if (cx == pos.x && cz == pos.y) c = chunk;
+                else if (cx == pos.x - 1 && cz == pos.y) c = chunkNegX;
+                else if (cx == pos.x + 1 && cz == pos.y) c = chunkPosX;
+                else if (cx == pos.x && cz == pos.y - 1) c = chunkNegZ;
+                else if (cx == pos.x && cz == pos.y + 1) c = chunkPosZ;
+                if (!c) return BlockType::AIR;
+                int lx = x - cx * CHUNK_SIZE_X;
+                int lz = z - cz * CHUNK_SIZE_Z;
+                return c->getBlock(lx, y, lz);
             };
-            request.getWaterBlock = [this](int x, int y, int z) -> BlockType {
-                return this->getBlockForWater(x, y, z);
+
+            request.getWaterBlock = [chunk, chunkNegX, chunkPosX, chunkNegZ, chunkPosZ, pos](int x, int y, int z) -> BlockType {
+                if (y < 0 || y >= CHUNK_SIZE_Y) return BlockType::WATER;
+                int cx = static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X));
+                int cz = static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z));
+                const Chunk* c = nullptr;
+                if (cx == pos.x && cz == pos.y) c = chunk;
+                else if (cx == pos.x - 1 && cz == pos.y) c = chunkNegX;
+                else if (cx == pos.x + 1 && cz == pos.y) c = chunkPosX;
+                else if (cx == pos.x && cz == pos.y - 1) c = chunkNegZ;
+                else if (cx == pos.x && cz == pos.y + 1) c = chunkPosZ;
+                if (!c) return BlockType::WATER;  // Assume water continues into unloaded chunks
+                int lx = x - cx * CHUNK_SIZE_X;
+                int lz = z - cz * CHUNK_SIZE_Z;
+                return c->getBlock(lx, y, lz);
             };
-            request.getSafeBlock = [this](int x, int y, int z) -> BlockType {
-                // Use getBlockBorder when rendering chunk edges (title screen)
-                // getBlockBorder returns AIR for unloaded chunks, causing faces to render
-                // getBlockSafe returns STONE for unloaded chunks, hiding border faces
-                return this->renderChunkBorderFaces ? this->getBlockBorder(x, y, z) : this->getBlockSafe(x, y, z);
+
+            request.getSafeBlock = [chunk, chunkNegX, chunkPosX, chunkNegZ, chunkPosZ, pos, renderBorders](int x, int y, int z) -> BlockType {
+                if (y < 0 || y >= CHUNK_SIZE_Y) return BlockType::AIR;
+                int cx = static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X));
+                int cz = static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z));
+                const Chunk* c = nullptr;
+                if (cx == pos.x && cz == pos.y) c = chunk;
+                else if (cx == pos.x - 1 && cz == pos.y) c = chunkNegX;
+                else if (cx == pos.x + 1 && cz == pos.y) c = chunkPosX;
+                else if (cx == pos.x && cz == pos.y - 1) c = chunkNegZ;
+                else if (cx == pos.x && cz == pos.y + 1) c = chunkPosZ;
+                if (!c) return renderBorders ? BlockType::AIR : BlockType::STONE;
+                int lx = x - cx * CHUNK_SIZE_X;
+                int lz = z - cz * CHUNK_SIZE_Z;
+                return c->getBlock(lx, y, lz);
             };
-            request.getLightLevel = [this](int x, int y, int z) -> uint8_t {
-                return this->getLightLevel(x, y, z);
+
+            request.getLightLevel = [chunk, chunkNegX, chunkPosX, chunkNegZ, chunkPosZ, pos](int x, int y, int z) -> uint8_t {
+                if (y < 0 || y >= CHUNK_SIZE_Y) return 15;
+                int cx = static_cast<int>(floor(static_cast<float>(x) / CHUNK_SIZE_X));
+                int cz = static_cast<int>(floor(static_cast<float>(z) / CHUNK_SIZE_Z));
+                const Chunk* c = nullptr;
+                if (cx == pos.x && cz == pos.y) c = chunk;
+                else if (cx == pos.x - 1 && cz == pos.y) c = chunkNegX;
+                else if (cx == pos.x + 1 && cz == pos.y) c = chunkPosX;
+                else if (cx == pos.x && cz == pos.y - 1) c = chunkNegZ;
+                else if (cx == pos.x && cz == pos.y + 1) c = chunkPosZ;
+                if (!c) return 15;
+                int lx = x - cx * CHUNK_SIZE_X;
+                int lz = z - cz * CHUNK_SIZE_Z;
+                return c->getLightLevel(lx, y, lz);
             };
 
             chunkThreadPool->queueMesh(std::move(request));
             chunk->isDirty = false;  // Mark as not dirty so we don't queue again
             meshesQueued++;
+            if (!isPriority) normalQueued++;  // Only count non-priority toward limit
         }
     }
 
@@ -1412,26 +1753,39 @@ public:
 
         auto startTime = std::chrono::high_resolution_clock::now();
 
-        // OPTIMIZATION: Limit mesh uploads to prevent GPU stalls
-        // GPU uploads are slow and can cause frame spikes
-        // During burst mode, limit to 8 meshes to avoid overwhelming GPU
-        int maxToProcess = burstMode ? 8 : maxMeshesPerFrame;
+        // OPTIMIZATION: Strict limits to prevent GPU stalls and lag spikes
+        // During burst mode (initial load), process more but still limit
+        // During normal gameplay, process very few to maintain smooth framerate
+        // Priority meshes (player-modified) always get processed immediately
+        int maxToProcess = burstMode ? 8 : maxMeshesPerFrame + 4;  // +4 for potential priority meshes
         auto completedMeshes = chunkThreadPool->getCompletedMeshes(maxToProcess);
         int processed = 0;
+        int normalProcessed = 0;  // Track non-priority meshes separately
+        int subChunksUploaded = 0;
+        bool timeExceeded = false;
+
+        // Helper to check time budget - called frequently during upload
+        auto checkTimeBudget = [&]() -> bool {
+            if (burstMode) return false;  // No limit during burst mode
+            if (!useFrameTimeBudget) return false;
+            auto now = std::chrono::high_resolution_clock::now();
+            float elapsedMs = std::chrono::duration<float, std::milli>(now - startTime).count();
+            return elapsedMs > frameTimeBudgetMs;
+        };
 
         for (auto& meshResult : completedMeshes) {
-            // OPTIMIZATION: Check frame time budget to prevent stalls
-            if (!burstMode && useFrameTimeBudget && processed > 0) {
-                auto now = std::chrono::high_resolution_clock::now();
-                float elapsedMs = std::chrono::duration<float, std::milli>(now - startTime).count();
-                if (elapsedMs > frameTimeBudgetMs * 0.5f) {
+            if (timeExceeded) break;
+
+            // Priority meshes always get processed; normal meshes respect limits
+            bool isPriority = meshResult.isPriority;
+            if (!isPriority) {
+                // Check time budget BEFORE processing each non-priority mesh
+                if (!burstMode && useFrameTimeBudget && normalProcessed > 0 && checkTimeBudget()) {
                     break;  // Leave remaining meshes for next frame
                 }
-            }
-
-            // During burst mode, let GPU catch up every few meshes to prevent stalls
-            if (burstMode && processed > 0 && (processed % 4) == 0) {
-                glFlush();  // Submit commands, don't block
+                if (!burstMode && normalProcessed >= maxMeshesPerFrame) {
+                    break;  // Hit normal mesh limit
+                }
             }
 
             glm::ivec2 pos = meshResult.position;
@@ -1449,7 +1803,7 @@ public:
             ChunkMesh* mesh = meshes[pos].get();
             mesh->worldOffset = meshResult.worldOffset;
 
-            // Update world info for crash reports
+            // Update world info for crash reports (only during burst mode to reduce overhead)
             if (burstMode && (processed % 10 == 0)) {
                 std::stringstream worldInfo;
                 worldInfo << "Meshes processed: " << processed << "\n";
@@ -1459,7 +1813,16 @@ public:
             }
 
             // Upload each sub-chunk's data to GPU
+            // Check time budget BEFORE each sub-chunk to prevent long stalls
             for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
+                // Strict time check before EACH sub-chunk during normal gameplay
+                if (!burstMode && subChunksUploaded > 0) {
+                    if (checkTimeBudget()) {
+                        timeExceeded = true;
+                        break;
+                    }
+                }
+
                 auto& subData = meshResult.subChunks[subY];
                 auto& subChunk = mesh->subChunks[subY];
 
@@ -1470,6 +1833,7 @@ public:
                 bool hasLOD0Data = subData.getLOD0VertexCount() > 0;
                 if (hasLOD0Data) {
                     mesh->uploadFaceBucketsToSubChunk(subY, subData.faceBucketVertices);
+                    subChunksUploaded++;
                 }
 
                 // Upload solid geometry for LOD 1+ (no face buckets for distant geometry)
@@ -1479,9 +1843,8 @@ public:
                     }
                 }
 
-                // Generate meshlets for mesh shader rendering (if enabled)
-                // Must be done on main thread (OpenGL calls)
-                // Use combined vertices from face buckets for meshlet generation
+                // OPTIMIZATION: Always defer meshlet generation to avoid lag spikes
+                // Meshlets are optional and can be generated lazily later
                 if (g_generateMeshlets && hasLOD0Data) {
                     // Combine face buckets into a single vertex array for meshlet generation
                     std::vector<PackedChunkVertex> combinedVertices;
@@ -1489,15 +1852,9 @@ public:
                     for (const auto& bucket : subData.faceBucketVertices) {
                         combinedVertices.insert(combinedVertices.end(), bucket.begin(), bucket.end());
                     }
-
-                    if (burstMode) {
-                        // During burst mode, cache vertices for later meshlet generation
-                        subChunk.cachedVerticesForMeshlets = std::move(combinedVertices);
-                        subChunk.needsMeshletGeneration = true;
-                    } else {
-                        // Normal mode: generate meshlets immediately
-                        mesh->generateMeshlets(subY, combinedVertices);
-                    }
+                    // Always cache for deferred generation - never block main thread
+                    subChunk.cachedVerticesForMeshlets = std::move(combinedVertices);
+                    subChunk.needsMeshletGeneration = true;
                 }
 
                 // Upload pre-generated water vertices (generated on worker thread)
@@ -1507,11 +1864,24 @@ public:
                 }
             }
 
-            // Update 3D lightmap texture for smooth lighting across greedy-meshed quads
-            // This must be done after all sub-chunk uploads so the lightmap is ready for rendering
-            mesh->updateLightmap(*chunk);
+            // Only update lightmap if we finished the entire mesh
+            if (!timeExceeded) {
+                // Update 3D lightmap texture for smooth lighting across greedy-meshed quads
+                mesh->updateLightmap(*chunk);
+            }
+
+            // Flush GPU commands after each mesh to prevent command buffer buildup
+            if (!burstMode && processed > 0) {
+                glFlush();
+            }
 
             processed++;
+            if (!isPriority) normalProcessed++;
+
+            // During burst mode, flush every 4 meshes
+            if (burstMode && (processed % 4) == 0) {
+                glFlush();
+            }
         }
 
         auto endTime = std::chrono::high_resolution_clock::now();
@@ -1565,7 +1935,6 @@ public:
         // LOD 3 (8x scale) for 80-100% - heavy fog, silhouettes only
         return 3;
     }
-
     // Shadow render distance override (temporarily changes renderDistance for shadow pass)
     int shadowRenderDistance = -1;  // -1 means use default, otherwise use this value
 
@@ -1665,7 +2034,6 @@ public:
     // This provides better vertical culling - underground and sky sub-chunks are culled individually
     void renderSubChunks(const glm::vec3& playerPos, GLint chunkOffsetLoc = -1) {
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
-        int playerSubY = static_cast<int>(playerPos.y) / SUB_CHUNK_HEIGHT;
         lastRenderedChunks = 0;
         lastCulledChunks = 0;
         lastHiZCulledChunks = 0;
@@ -1676,7 +2044,8 @@ public:
         struct SubChunkToDraw {
             ChunkMesh* mesh;
             int subChunkY;
-            float distSq;
+            float distSq;           // Combined distance for sorting
+            float horizontalDistSq; // Horizontal distance for LOD calculation
         };
         std::vector<SubChunkToDraw> visibleSubChunks;
         visibleSubChunks.reserve(meshes.size() * 8);  // Estimate: avg 8 non-empty sub-chunks per column
@@ -1713,10 +2082,7 @@ public:
                         }
                     }
 
-                    // Add Y distance component for better sorting
-                    int dy = subY - playerSubY;
-                    float distSq = baseDistSq + static_cast<float>(dy * dy) * 0.25f;
-                    visibleSubChunks.push_back({mesh.get(), subY, distSq});
+                    visibleSubChunks.push_back({mesh.get(), subY, baseDistSq, baseDistSq});
                 }
             }
         }
@@ -1740,7 +2106,7 @@ public:
                 lastMesh = sub.mesh;
             }
 
-            // Calculate LOD level based on distance (or use forced LOD for shadow pass)
+            // Calculate LOD level based on horizontal distance
             int lodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(sub.distSq);
             sub.mesh->renderSubChunk(sub.subChunkY, lodLevel);
             lastRenderedSubChunks++;
@@ -1897,6 +2263,7 @@ public:
                         if (it != hiZSubChunkVisibility.end() && !it->second) continue;
                     }
 
+                    // Calculate LOD based on horizontal distance
                     int lodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(distSq);
                     col.subChunks.push_back({subY, lodLevel});
                 }
@@ -1967,11 +2334,13 @@ public:
 
             if (abs(dx) <= renderDistance && abs(dz) <= renderDistance) {
                 float distSq = static_cast<float>(dx * dx + dz * dz);
-                int baseLodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(distSq);
 
                 for (int subY = 0; subY < SUB_CHUNKS_PER_COLUMN; subY++) {
                     const auto& subChunk = mesh->subChunks[subY];
                     if (subChunk.isEmpty) continue;
+
+                    // Calculate LOD based on horizontal distance
+                    int baseLodLevel = (forcedLOD >= 0) ? forcedLOD : calculateLOD(distSq);
 
                     // Calculate bounding sphere for this sub-chunk
                     // Center is at chunk world position + sub-chunk center
@@ -2242,7 +2611,6 @@ public:
     // Render water using sub-chunk culling
     void renderWaterSubChunks(const glm::vec3& playerPos, GLint chunkOffsetLoc = -1) {
         glm::ivec2 playerChunk = Chunk::worldToChunkPos(playerPos);
-        int playerSubY = static_cast<int>(playerPos.y) / SUB_CHUNK_HEIGHT;
         lastRenderedWaterSubChunks = 0;
         lastCulledWaterSubChunks = 0;
 
@@ -2294,9 +2662,7 @@ public:
                     }
                 }
 
-                int dy = subY - playerSubY;
-                float distSq = baseDistSq + static_cast<float>(dy * dy) * 0.25f;
-                waterSubChunks.push_back({mesh.get(), pos, subY, distSq});
+                waterSubChunks.push_back({mesh.get(), pos, subY, baseDistSq});
             }
         }
 
@@ -2341,7 +2707,7 @@ public:
 
     // Get number of loaded chunks
     size_t getChunkCount() const {
-        std::lock_guard<std::recursive_mutex> lock(chunksMutex);
+        std::shared_lock<std::shared_mutex> lock(chunksMutex);  // Read lock
         return chunks.size();
     }
 

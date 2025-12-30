@@ -44,6 +44,51 @@ public:
     bool isInWater = false;      // Feet in water
     bool isUnderwater = false;   // Head underwater
 
+    // ===== SURVIVAL MECHANICS =====
+    // Survival constants
+    static constexpr int MAX_HEALTH = 20;           // 10 hearts (2 HP each)
+    static constexpr int MAX_HUNGER = 20;           // 10 drumsticks
+    static constexpr int MAX_AIR = 300;             // 15 seconds underwater (20 ticks/sec)
+    static constexpr int FALL_DAMAGE_THRESHOLD = 3; // Blocks before taking damage
+    static constexpr int REGEN_HUNGER_THRESHOLD = 18; // Need 9+ drumsticks to heal
+    static constexpr int DROWN_DAMAGE = 2;          // Per second when out of air
+    static constexpr int LAVA_DAMAGE = 4;           // Per 0.5 seconds
+    static constexpr int STARVATION_DAMAGE = 1;     // Per 4 seconds at 0 hunger
+    static constexpr float DAMAGE_IMMUNITY_TIME = 0.5f;  // Seconds after taking damage
+
+    // Survival stats
+    int health = MAX_HEALTH;
+    int hunger = MAX_HUNGER;
+    int air = MAX_AIR;
+    float saturation = 5.0f;     // Hidden hunger buffer
+
+    // Fall tracking
+    float fallStartY = 0.0f;
+    bool wasFalling = false;
+
+    // Hazard state
+    bool isInLava = false;
+
+    // Timers
+    float regenTimer = 0.0f;
+    float starvationTimer = 0.0f;
+    float drownTimer = 0.0f;
+    float hungerDecayTimer = 0.0f;
+    float damageImmunityTimer = 0.0f;
+    float lavaTimer = 0.0f;
+
+    // Death state
+    bool isDead = false;
+    float deathTimer = 0.0f;
+    glm::vec3 spawnPoint = glm::vec3(0, 80, 0);
+
+    // Eating state
+    bool isEating = false;
+    float eatingTimer = 0.0f;
+    static constexpr float EATING_DURATION = 1.6f;  // 32 ticks in MC
+    int eatingFoodHunger = 0;      // Hunger to restore when finished
+    float eatingFoodSaturation = 0.0f;  // Saturation to restore
+
     // Reference to camera for view direction
     Camera* camera = nullptr;
 
@@ -129,6 +174,243 @@ public:
             isFlying = true;  // Noclip requires flying
             velocity = glm::vec3(0.0f);
         }
+    }
+
+    // ===== SURVIVAL METHODS =====
+
+    // Take damage with optional armor reduction
+    // armorReduction: 0.0 to 0.8 (from Inventory::getDamageReduction())
+    // Returns actual damage taken (for damaging armor)
+    int takeDamage(int amount, float armorReduction = 0.0f) {
+        if (isDead || damageImmunityTimer > 0.0f) return 0;
+
+        // Apply armor reduction
+        int reducedDamage = static_cast<int>(std::ceil(amount * (1.0f - armorReduction)));
+        reducedDamage = std::max(1, reducedDamage);  // Always take at least 1 damage
+
+        health -= reducedDamage;
+        damageImmunityTimer = DAMAGE_IMMUNITY_TIME;
+
+        if (health <= 0) {
+            health = 0;
+            isDead = true;
+            deathTimer = 0.0f;
+        }
+
+        return reducedDamage;  // Caller can use this to damage armor
+    }
+
+    void heal(int amount) {
+        if (isDead) return;
+        health = std::min(health + amount, MAX_HEALTH);
+    }
+
+    // ===== EATING METHODS =====
+
+    // Start eating food (called when right-click held with food item)
+    // Returns true if eating can start
+    bool startEating(int foodHunger, float foodSaturation) {
+        if (isDead || isEating) return false;
+        // Can only eat if not full (Minecraft behavior)
+        if (hunger >= MAX_HUNGER) return false;
+
+        isEating = true;
+        eatingTimer = 0.0f;
+        eatingFoodHunger = foodHunger;
+        eatingFoodSaturation = foodSaturation;
+        return true;
+    }
+
+    // Update eating progress (call every frame while right mouse held)
+    // Returns true if finished eating
+    bool updateEating(float deltaTime) {
+        if (!isEating) return false;
+
+        eatingTimer += deltaTime;
+        if (eatingTimer >= EATING_DURATION) {
+            // Finished eating - consume the food
+            eat(eatingFoodHunger, eatingFoodSaturation);
+            isEating = false;
+            eatingTimer = 0.0f;
+            return true;
+        }
+        return false;
+    }
+
+    // Cancel eating (called when right-click released early)
+    void cancelEating() {
+        isEating = false;
+        eatingTimer = 0.0f;
+        eatingFoodHunger = 0;
+        eatingFoodSaturation = 0.0f;
+    }
+
+    // Get eating progress (0.0 to 1.0) for UI
+    float getEatingProgress() const {
+        if (!isEating) return 0.0f;
+        return std::min(eatingTimer / EATING_DURATION, 1.0f);
+    }
+
+    // Actually consume the food (restore hunger/saturation)
+    void eat(int foodHunger, float foodSaturation) {
+        hunger = std::min(hunger + foodHunger, MAX_HUNGER);
+        // Saturation can't exceed hunger level
+        saturation = std::min(saturation + foodSaturation, static_cast<float>(hunger));
+    }
+
+    void respawn() {
+        health = MAX_HEALTH;
+        hunger = MAX_HUNGER;
+        air = MAX_AIR;
+        saturation = 5.0f;
+        isDead = false;
+        deathTimer = 0.0f;
+        damageImmunityTimer = 0.0f;
+        regenTimer = 0.0f;
+        starvationTimer = 0.0f;
+        drownTimer = 0.0f;
+        hungerDecayTimer = 0.0f;
+        lavaTimer = 0.0f;
+        wasFalling = false;
+        isInLava = false;
+        isEating = false;
+        eatingTimer = 0.0f;
+        velocity = glm::vec3(0.0f);
+        position = spawnPoint;
+        updateCameraPosition();
+    }
+
+    void checkLavaStatus(World& world) {
+        // Check at feet level for lava
+        int feetX = static_cast<int>(std::floor(position.x));
+        int feetY = static_cast<int>(std::floor(position.y + 0.1f));
+        int feetZ = static_cast<int>(std::floor(position.z));
+
+        isInLava = world.getBlock(feetX, feetY, feetZ) == BlockType::LAVA;
+    }
+
+    // armorReduction: 0.0 to 0.8, from Inventory::getDamageReduction()
+    // Returns total damage taken (for damaging armor)
+    int updateSurvival(float deltaTime, World& world, float armorReduction = 0.0f) {
+        int totalDamageTaken = 0;
+
+        // Skip survival in creative-like modes
+        if (isFlying || isNoclip || isDead) return 0;
+
+        // Update immunity timer
+        if (damageImmunityTimer > 0.0f) {
+            damageImmunityTimer -= deltaTime;
+        }
+
+        // Check hazards
+        checkLavaStatus(world);
+
+        // ===== FALL DAMAGE =====
+        bool isFalling = velocity.y < -0.1f && !onGround && !isInWater;
+
+        if (isFalling && !wasFalling) {
+            // Started falling - record start height
+            fallStartY = position.y;
+        }
+
+        if (wasFalling && (onGround || isInWater)) {
+            // Landed - calculate fall damage
+            if (!isInWater) { // Water cancels fall damage
+                float fallDistance = fallStartY - position.y;
+                int damage = static_cast<int>(std::floor(fallDistance)) - FALL_DAMAGE_THRESHOLD;
+                if (damage > 0) {
+                    totalDamageTaken += takeDamage(damage, armorReduction);
+                }
+            }
+        }
+        wasFalling = isFalling;
+
+        // ===== DROWNING =====
+        if (isUnderwater) {
+            drownTimer += deltaTime;
+            if (drownTimer >= 0.05f) { // 20 ticks per second
+                drownTimer -= 0.05f;
+                air--;
+                if (air <= 0) {
+                    air = 0;
+                    // Deal drowning damage every second
+                    static float drownDamageTimer = 0.0f;
+                    drownDamageTimer += 0.05f;
+                    if (drownDamageTimer >= 1.0f) {
+                        drownDamageTimer -= 1.0f;
+                        totalDamageTaken += takeDamage(DROWN_DAMAGE, armorReduction);
+                    }
+                }
+            }
+        } else {
+            // Surfaced - restore air quickly
+            drownTimer += deltaTime;
+            if (drownTimer >= 0.0166f) { // ~60 per second
+                drownTimer -= 0.0166f;
+                air = std::min(air + 1, MAX_AIR);
+            }
+        }
+
+        // ===== LAVA DAMAGE =====
+        if (isInLava) {
+            lavaTimer += deltaTime;
+            if (lavaTimer >= 0.5f) {
+                lavaTimer -= 0.5f;
+                totalDamageTaken += takeDamage(LAVA_DAMAGE, armorReduction);
+            }
+        } else {
+            lavaTimer = 0.0f;
+        }
+
+        // ===== HUNGER DECAY =====
+        hungerDecayTimer += deltaTime;
+        float decayRate = 80.0f; // Base: lose 1 hunger every 80 seconds
+        if (isSprinting) decayRate *= 0.5f; // Sprint: 2x decay
+        if (isInWater) decayRate *= 0.67f;  // Swim: 1.5x decay
+
+        if (hungerDecayTimer >= decayRate) {
+            hungerDecayTimer -= decayRate;
+            if (saturation > 0.0f) {
+                saturation -= 1.0f;
+                if (saturation < 0.0f) saturation = 0.0f;
+            } else if (hunger > 0) {
+                hunger--;
+            }
+        }
+
+        // ===== NATURAL REGENERATION =====
+        if (hunger >= REGEN_HUNGER_THRESHOLD && health < MAX_HEALTH) {
+            regenTimer += deltaTime;
+            if (regenTimer >= 0.5f) { // Heal every 0.5 seconds
+                regenTimer -= 0.5f;
+                heal(1);
+                // Costs saturation/hunger
+                if (saturation >= 1.5f) {
+                    saturation -= 1.5f;
+                } else {
+                    saturation = 0.0f;
+                    hunger = std::max(0, hunger - 1);
+                }
+            }
+        } else {
+            regenTimer = 0.0f;
+        }
+
+        // ===== STARVATION =====
+        if (hunger == 0 && health > 1) {
+            starvationTimer += deltaTime;
+            if (starvationTimer >= 4.0f) { // Damage every 4 seconds
+                starvationTimer -= 4.0f;
+                // Don't kill player with starvation (stop at 1 HP)
+                if (health > 1) {
+                    health--;
+                }
+            }
+        } else {
+            starvationTimer = 0.0f;
+        }
+
+        return totalDamageTaken;
     }
 
 private:

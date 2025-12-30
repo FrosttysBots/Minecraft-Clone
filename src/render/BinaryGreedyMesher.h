@@ -311,8 +311,10 @@ private:
             // Each bit represents whether a face should be rendered at (x, z)
             std::array<uint32_t, CHUNK_SIZE_Z> faceMask;
             std::array<int, CHUNK_SIZE_X * CHUNK_SIZE_Z> textureMask;
+            std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> aoMask;  // Pre-computed AO for each face
             faceMask.fill(0);
             std::fill(textureMask.begin(), textureMask.end(), -1);
+            aoMask.fill(0);
 
             for (int z = 0; z < CHUNK_SIZE_Z; z++) {
                 uint32_t rowMask = 0;
@@ -326,13 +328,15 @@ private:
                     if (!isBlockOpaque(neighbor)) {
                         rowMask |= (1u << x);
                         textureMask[z * CHUNK_SIZE_X + x] = getTexture(block, face);
+                        // Pre-compute AO for this 1x1 face (used for merge constraint)
+                        aoMask[z * CHUNK_SIZE_X + x] = calculateAOSingle(getBlock, baseX + x, y, baseZ + z, face);
                     }
                 }
                 faceMask[z] = rowMask;
             }
 
-            // Greedy merge the mask
-            greedyMergeXZ(result, faceMask, textureMask, face, y, chunk, baseX, baseZ, getBlock);
+            // Greedy merge the mask (with AO constraint)
+            greedyMergeXZ(result, faceMask, textureMask, aoMask, face, y, chunk, baseX, baseZ, getBlock);
         }
     }
 
@@ -353,6 +357,7 @@ private:
             int yRange = yEnd - yStart + 1;
             std::vector<uint32_t> faceMask(yRange, 0);
             std::vector<int> textureMask(CHUNK_SIZE_X * yRange, -1);
+            std::vector<uint8_t> aoMask(CHUNK_SIZE_X * yRange, 0);  // Pre-computed AO
 
             for (int yRel = 0; yRel < yRange; yRel++) {
                 int y = yStart + yRel;
@@ -366,13 +371,14 @@ private:
                     if (!isBlockOpaque(neighbor)) {
                         rowMask |= (1u << x);
                         textureMask[yRel * CHUNK_SIZE_X + x] = getTexture(block, face);
+                        aoMask[yRel * CHUNK_SIZE_X + x] = calculateAOSingle(getBlock, baseX + x, y, baseZ + z, face);
                     }
                 }
                 faceMask[yRel] = rowMask;
             }
 
-            // Greedy merge the mask
-            greedyMergeXY(result, faceMask, textureMask, face, z, yStart, chunk, baseX, baseZ, getBlock);
+            // Greedy merge the mask (with AO constraint)
+            greedyMergeXY(result, faceMask, textureMask, aoMask, face, z, yStart, chunk, baseX, baseZ, getBlock);
         }
     }
 
@@ -393,6 +399,7 @@ private:
             int yRange = yEnd - yStart + 1;
             std::vector<uint32_t> faceMask(yRange, 0);
             std::vector<int> textureMask(CHUNK_SIZE_Z * yRange, -1);
+            std::vector<uint8_t> aoMask(CHUNK_SIZE_Z * yRange, 0);  // Pre-computed AO
 
             for (int yRel = 0; yRel < yRange; yRel++) {
                 int y = yStart + yRel;
@@ -406,27 +413,32 @@ private:
                     if (!isBlockOpaque(neighbor)) {
                         rowMask |= (1u << z);
                         textureMask[yRel * CHUNK_SIZE_Z + z] = getTexture(block, face);
+                        aoMask[yRel * CHUNK_SIZE_Z + z] = calculateAOSingle(getBlock, baseX + x, y, baseZ + z, face);
                     }
                 }
                 faceMask[yRel] = rowMask;
             }
 
-            // Greedy merge the mask
-            greedyMergeZY(result, faceMask, textureMask, face, x, yStart, chunk, baseX, baseZ, getBlock);
+            // Greedy merge the mask (with AO constraint)
+            greedyMergeZY(result, faceMask, textureMask, aoMask, face, x, yStart, chunk, baseX, baseZ, getBlock);
         }
     }
 
     // Binary greedy merge for XZ plane (Y-facing faces)
+    // With AO constraint: only merge faces with identical AO values
     void greedyMergeXZ(
         BinaryMeshResult& result,
         std::array<uint32_t, CHUNK_SIZE_Z>& faceMask,
         std::array<int, CHUNK_SIZE_X * CHUNK_SIZE_Z>& textureMask,
+        std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z>& aoMask,  // Pre-computed AO per face
         BGMFace face,
         int y,
         const Chunk& chunk,
         int baseX, int baseZ,
         const BlockGetter& getBlock
     ) {
+        // chunk, baseX, baseZ, getBlock needed for calculateAO on merged quads
+
         for (int z = 0; z < CHUNK_SIZE_Z; z++) {
             uint32_t row = faceMask[z];
             while (row != 0) {
@@ -440,30 +452,38 @@ private:
                     continue;
                 }
 
-                // Find width: count consecutive bits with same texture
+                uint8_t baseAO = aoMask[z * CHUNK_SIZE_X + x];
+
+                // Find width: count consecutive bits with same texture AND same AO
                 int width = 1;
                 uint32_t runMask = 1u << x;
                 while (x + width < CHUNK_SIZE_X) {
                     if (!(row & (1u << (x + width)))) break;
                     if (textureMask[z * CHUNK_SIZE_X + x + width] != texSlot) break;
+                    if (aoMask[z * CHUNK_SIZE_X + x + width] != baseAO) break;  // AO constraint
                     runMask |= (1u << (x + width));
                     width++;
                 }
 
-                // Find height: check subsequent rows
+                // Find height: check subsequent rows with same texture AND same AO
                 int height = 1;
                 while (z + height < CHUNK_SIZE_Z) {
                     uint32_t nextRow = faceMask[z + height];
-                    // Check if all bits in our run are set in next row with same texture
+                    // Check if all bits in our run are set in next row
                     if ((nextRow & runMask) != runMask) break;
-                    bool sameTexture = true;
+                    bool canMerge = true;
                     for (int dx = 0; dx < width; dx++) {
-                        if (textureMask[(z + height) * CHUNK_SIZE_X + x + dx] != texSlot) {
-                            sameTexture = false;
+                        int idx = (z + height) * CHUNK_SIZE_X + x + dx;
+                        if (textureMask[idx] != texSlot) {
+                            canMerge = false;
+                            break;
+                        }
+                        if (aoMask[idx] != baseAO) {  // AO constraint
+                            canMerge = false;
                             break;
                         }
                     }
-                    if (!sameTexture) break;
+                    if (!canMerge) break;
                     height++;
                 }
 
@@ -475,9 +495,10 @@ private:
                     }
                 }
 
-                // Calculate AO and light
+                // Calculate AO at the merged quad's actual corner positions
+                // baseAO constraint ensures interior uniformity, but corners need edge checks
                 uint8_t ao = calculateAO(chunk, getBlock, baseX, baseZ, x, y, z, width, height, face);
-                uint8_t light = calculateLight(chunk, x, y, z);
+                uint8_t light = 255;  // Full brightness (lighting handled by sun/ambient)
 
                 // Emit quad
                 BinaryQuad quad;
@@ -492,10 +513,12 @@ private:
     }
 
     // Binary greedy merge for XY plane (Z-facing faces)
+    // With AO constraint: only merge faces with identical AO values
     void greedyMergeXY(
         BinaryMeshResult& result,
         std::vector<uint32_t>& faceMask,
         std::vector<int>& textureMask,
+        std::vector<uint8_t>& aoMask,  // Pre-computed AO per face
         BGMFace face,
         int z,
         int yStart,
@@ -503,6 +526,7 @@ private:
         int baseX, int baseZ,
         const BlockGetter& getBlock
     ) {
+        // chunk, baseX, baseZ, getBlock needed for calculateAO on merged quads
         int yRange = static_cast<int>(faceMask.size());
 
         for (int yRel = 0; yRel < yRange; yRel++) {
@@ -517,29 +541,37 @@ private:
                     continue;
                 }
 
-                // Find width
+                uint8_t baseAO = aoMask[yRel * CHUNK_SIZE_X + x];
+
+                // Find width with AO constraint
                 int width = 1;
                 uint32_t runMask = 1u << x;
                 while (x + width < CHUNK_SIZE_X) {
                     if (!(row & (1u << (x + width)))) break;
                     if (textureMask[yRel * CHUNK_SIZE_X + x + width] != texSlot) break;
+                    if (aoMask[yRel * CHUNK_SIZE_X + x + width] != baseAO) break;  // AO constraint
                     runMask |= (1u << (x + width));
                     width++;
                 }
 
-                // Find height (in Y direction)
+                // Find height (in Y direction) with AO constraint
                 int height = 1;
                 while (yRel + height < yRange) {
                     uint32_t nextRow = faceMask[yRel + height];
                     if ((nextRow & runMask) != runMask) break;
-                    bool sameTexture = true;
+                    bool canMerge = true;
                     for (int dx = 0; dx < width; dx++) {
-                        if (textureMask[(yRel + height) * CHUNK_SIZE_X + x + dx] != texSlot) {
-                            sameTexture = false;
+                        int idx = (yRel + height) * CHUNK_SIZE_X + x + dx;
+                        if (textureMask[idx] != texSlot) {
+                            canMerge = false;
+                            break;
+                        }
+                        if (aoMask[idx] != baseAO) {  // AO constraint
+                            canMerge = false;
                             break;
                         }
                     }
-                    if (!sameTexture) break;
+                    if (!canMerge) break;
                     height++;
                 }
 
@@ -552,8 +584,9 @@ private:
                 }
 
                 int y = yStart + yRel;
+                // Calculate AO at the merged quad's actual corner positions
                 uint8_t ao = calculateAO(chunk, getBlock, baseX, baseZ, x, y, z, width, height, face);
-                uint8_t light = calculateLight(chunk, x, y, z);
+                uint8_t light = 255;  // Full brightness
 
                 BinaryQuad quad;
                 quad.positionSize = BinaryQuad::encodePositionSize(x, y, z, width, height);
@@ -566,10 +599,12 @@ private:
     }
 
     // Binary greedy merge for ZY plane (X-facing faces)
+    // With AO constraint: only merge faces with identical AO values
     void greedyMergeZY(
         BinaryMeshResult& result,
         std::vector<uint32_t>& faceMask,
         std::vector<int>& textureMask,
+        std::vector<uint8_t>& aoMask,  // Pre-computed AO per face
         BGMFace face,
         int x,
         int yStart,
@@ -577,6 +612,7 @@ private:
         int baseX, int baseZ,
         const BlockGetter& getBlock
     ) {
+        // chunk, baseX, baseZ, getBlock needed for calculateAO on merged quads
         int yRange = static_cast<int>(faceMask.size());
 
         for (int yRel = 0; yRel < yRange; yRel++) {
@@ -591,29 +627,37 @@ private:
                     continue;
                 }
 
-                // Find width (in Z direction)
+                uint8_t baseAO = aoMask[yRel * CHUNK_SIZE_Z + z];
+
+                // Find width (in Z direction) with AO constraint
                 int width = 1;
                 uint32_t runMask = 1u << z;
                 while (z + width < CHUNK_SIZE_Z) {
                     if (!(row & (1u << (z + width)))) break;
                     if (textureMask[yRel * CHUNK_SIZE_Z + z + width] != texSlot) break;
+                    if (aoMask[yRel * CHUNK_SIZE_Z + z + width] != baseAO) break;  // AO constraint
                     runMask |= (1u << (z + width));
                     width++;
                 }
 
-                // Find height (in Y direction)
+                // Find height (in Y direction) with AO constraint
                 int height = 1;
                 while (yRel + height < yRange) {
                     uint32_t nextRow = faceMask[yRel + height];
                     if ((nextRow & runMask) != runMask) break;
-                    bool sameTexture = true;
+                    bool canMerge = true;
                     for (int dz = 0; dz < width; dz++) {
-                        if (textureMask[(yRel + height) * CHUNK_SIZE_Z + z + dz] != texSlot) {
-                            sameTexture = false;
+                        int idx = (yRel + height) * CHUNK_SIZE_Z + z + dz;
+                        if (textureMask[idx] != texSlot) {
+                            canMerge = false;
+                            break;
+                        }
+                        if (aoMask[idx] != baseAO) {  // AO constraint
+                            canMerge = false;
                             break;
                         }
                     }
-                    if (!sameTexture) break;
+                    if (!canMerge) break;
                     height++;
                 }
 
@@ -626,8 +670,9 @@ private:
                 }
 
                 int y = yStart + yRel;
+                // Calculate AO at the merged quad's actual corner positions
                 uint8_t ao = calculateAO(chunk, getBlock, baseX, baseZ, x, y, z, width, height, face);
-                uint8_t light = calculateLight(chunk, x, y, z);
+                uint8_t light = 255;  // Full brightness
 
                 BinaryQuad quad;
                 // For X-facing, position is (x, y, z), size is (width in Z, height in Y)
@@ -653,8 +698,145 @@ private:
         return 3 - (side1 ? 1 : 0) - (side2 ? 1 : 0) - (corner ? 1 : 0);
     }
 
+    // Calculate AO for a single 1x1 block face (used for greedy merge constraints)
+    // Returns packed AO: 2 bits per corner (corners 0,1,2,3 in bits 0-1, 2-3, 4-5, 6-7)
+    // For each corner, we check the 3 blocks that share the corner vertex and are outside the face
+    uint8_t calculateAOSingle(
+        const BlockGetter& getBlock,
+        int wx, int y, int wz,  // World coordinates of the block
+        BGMFace face
+    ) {
+        int ao0 = 3, ao1 = 3, ao2 = 3, ao3 = 3;
+
+        switch (face) {
+            case BGMFace::POS_Y: {
+                // Top face at y+1 - check blocks at level y+1 around each corner vertex
+                int fy = y + 1;
+                // Corner 0 at vertex (wx, fy, wz): check blocks at (-1,0), (0,-1), (-1,-1)
+                ao0 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
+                              isSolidForAO(getBlock, wx, fy, wz-1),
+                              isSolidForAO(getBlock, wx-1, fy, wz-1));
+                // Corner 1 at vertex (wx+1, fy, wz): check blocks at (+1,0), (0,-1), (+1,-1)
+                ao1 = cornerAO(isSolidForAO(getBlock, wx+1, fy, wz),
+                              isSolidForAO(getBlock, wx+1, fy, wz-1),
+                              isSolidForAO(getBlock, wx, fy, wz-1));
+                // Corner 2 at vertex (wx+1, fy, wz+1): check blocks at (+1,0), (0,+1), (+1,+1)
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+1, fy, wz),
+                              isSolidForAO(getBlock, wx, fy, wz+1),
+                              isSolidForAO(getBlock, wx+1, fy, wz+1));
+                // Corner 3 at vertex (wx, fy, wz+1): check blocks at (-1,0), (0,+1), (-1,+1)
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
+                              isSolidForAO(getBlock, wx, fy, wz+1),
+                              isSolidForAO(getBlock, wx-1, fy, wz+1));
+                break;
+            }
+            case BGMFace::NEG_Y: {
+                // Bottom face at y-1
+                int fy = y - 1;
+                ao0 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
+                              isSolidForAO(getBlock, wx, fy, wz-1),
+                              isSolidForAO(getBlock, wx-1, fy, wz-1));
+                ao1 = cornerAO(isSolidForAO(getBlock, wx+1, fy, wz),
+                              isSolidForAO(getBlock, wx+1, fy, wz-1),
+                              isSolidForAO(getBlock, wx, fy, wz-1));
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+1, fy, wz),
+                              isSolidForAO(getBlock, wx, fy, wz+1),
+                              isSolidForAO(getBlock, wx+1, fy, wz+1));
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
+                              isSolidForAO(getBlock, wx, fy, wz+1),
+                              isSolidForAO(getBlock, wx-1, fy, wz+1));
+                break;
+            }
+            case BGMFace::POS_Z: {
+                // Front face at z+1 - check blocks at level z+1
+                int fz = wz + 1;
+                // Corner 0 at (wx, y, fz): check (-1,0), (0,-1), (-1,-1) in XY
+                ao0 = cornerAO(isSolidForAO(getBlock, wx-1, y, fz),
+                              isSolidForAO(getBlock, wx, y-1, fz),
+                              isSolidForAO(getBlock, wx-1, y-1, fz));
+                // Corner 1 at (wx+1, y, fz)
+                ao1 = cornerAO(isSolidForAO(getBlock, wx+1, y, fz),
+                              isSolidForAO(getBlock, wx+1, y-1, fz),
+                              isSolidForAO(getBlock, wx, y-1, fz));
+                // Corner 2 at (wx+1, y+1, fz)
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+1, y, fz),
+                              isSolidForAO(getBlock, wx, y+1, fz),
+                              isSolidForAO(getBlock, wx+1, y+1, fz));
+                // Corner 3 at (wx, y+1, fz)
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, y, fz),
+                              isSolidForAO(getBlock, wx, y+1, fz),
+                              isSolidForAO(getBlock, wx-1, y+1, fz));
+                break;
+            }
+            case BGMFace::NEG_Z: {
+                // Back face at z-1
+                int fz = wz - 1;
+                // Corner ordering is mirrored for back face
+                ao0 = cornerAO(isSolidForAO(getBlock, wx+1, y, fz),
+                              isSolidForAO(getBlock, wx, y-1, fz),
+                              isSolidForAO(getBlock, wx+1, y-1, fz));
+                ao1 = cornerAO(isSolidForAO(getBlock, wx-1, y, fz),
+                              isSolidForAO(getBlock, wx-1, y-1, fz),
+                              isSolidForAO(getBlock, wx, y-1, fz));
+                ao2 = cornerAO(isSolidForAO(getBlock, wx-1, y, fz),
+                              isSolidForAO(getBlock, wx, y+1, fz),
+                              isSolidForAO(getBlock, wx-1, y+1, fz));
+                ao3 = cornerAO(isSolidForAO(getBlock, wx+1, y, fz),
+                              isSolidForAO(getBlock, wx, y+1, fz),
+                              isSolidForAO(getBlock, wx+1, y+1, fz));
+                break;
+            }
+            case BGMFace::POS_X: {
+                // Right face at x+1 - check blocks at level x+1 (in ZY plane)
+                int fx = wx + 1;
+                // Corner 0 at (fx, y, wz)
+                ao0 = cornerAO(isSolidForAO(getBlock, fx, y, wz-1),
+                              isSolidForAO(getBlock, fx, y-1, wz),
+                              isSolidForAO(getBlock, fx, y-1, wz-1));
+                // Corner 1 at (fx, y, wz+1)
+                ao1 = cornerAO(isSolidForAO(getBlock, fx, y, wz+1),
+                              isSolidForAO(getBlock, fx, y-1, wz+1),
+                              isSolidForAO(getBlock, fx, y-1, wz));
+                // Corner 2 at (fx, y+1, wz+1)
+                ao2 = cornerAO(isSolidForAO(getBlock, fx, y, wz+1),
+                              isSolidForAO(getBlock, fx, y+1, wz),
+                              isSolidForAO(getBlock, fx, y+1, wz+1));
+                // Corner 3 at (fx, y+1, wz)
+                ao3 = cornerAO(isSolidForAO(getBlock, fx, y, wz-1),
+                              isSolidForAO(getBlock, fx, y+1, wz),
+                              isSolidForAO(getBlock, fx, y+1, wz-1));
+                break;
+            }
+            case BGMFace::NEG_X: {
+                // Left face at x-1
+                int fx = wx - 1;
+                // Corner ordering is mirrored for left face
+                ao0 = cornerAO(isSolidForAO(getBlock, fx, y, wz+1),
+                              isSolidForAO(getBlock, fx, y-1, wz),
+                              isSolidForAO(getBlock, fx, y-1, wz+1));
+                ao1 = cornerAO(isSolidForAO(getBlock, fx, y, wz-1),
+                              isSolidForAO(getBlock, fx, y-1, wz-1),
+                              isSolidForAO(getBlock, fx, y-1, wz));
+                ao2 = cornerAO(isSolidForAO(getBlock, fx, y, wz-1),
+                              isSolidForAO(getBlock, fx, y+1, wz),
+                              isSolidForAO(getBlock, fx, y+1, wz-1));
+                ao3 = cornerAO(isSolidForAO(getBlock, fx, y, wz+1),
+                              isSolidForAO(getBlock, fx, y+1, wz),
+                              isSolidForAO(getBlock, fx, y+1, wz+1));
+                break;
+            }
+        }
+
+        return static_cast<uint8_t>((ao0 & 0x3) | ((ao1 & 0x3) << 2) |
+                                    ((ao2 & 0x3) << 4) | ((ao3 & 0x3) << 6));
+    }
+
     // Calculate ambient occlusion for all 4 corners of a quad
     // Returns packed AO: 2 bits per corner (corners 0,1,2,3 in bits 0-1, 2-3, 4-5, 6-7)
+    //
+    // Minecraft-style AO: combines two effects:
+    // 1. Overhang shadows (0fps algorithm) - blocks ABOVE the face
+    // 2. Contact shadows - blocks at SAME level creating edge darkening
     uint8_t calculateAO(
         const Chunk& chunk,
         const BlockGetter& getBlock,
@@ -672,27 +854,34 @@ private:
         // AO values for 4 corners (default fully lit)
         int ao0 = 3, ao1 = 3, ao2 = 3, ao3 = 3;
 
-        // Calculate AO based on face direction
-        // Each corner checks 3 neighbors: two sides and one diagonal
+        // 0fps algorithm: For each vertex, check 3 neighbors at FACE level
+        // side1, side2 = two perpendicular neighbors
+        // corner = diagonal neighbor
+        // vertexAO = if(side1 && side2) 0 else 3-(side1+side2+corner)
         switch (face) {
             case BGMFace::POS_Y: {
+                // Top face - vertices are at y+1, check neighbors at y+1
                 int fy = y + 1;
-                // Corner 0: back-left, Corner 1: back-right, Corner 2: front-right, Corner 3: front-left
+                // Vertex 0 at (wx, wz): check (-1,0), (0,-1), (-1,-1)
                 ao0 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
                               isSolidForAO(getBlock, wx, fy, wz-1),
                               isSolidForAO(getBlock, wx-1, fy, wz-1));
+                // Vertex 1 at (wx+width, wz): check (+1,0), (0,-1), (+1,-1)
                 ao1 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz),
                               isSolidForAO(getBlock, wx+width-1, fy, wz-1),
                               isSolidForAO(getBlock, wx+width, fy, wz-1));
-                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz+height),
-                              isSolidForAO(getBlock, wx+width-1, fy, wz+height+1),
-                              isSolidForAO(getBlock, wx+width, fy, wz+height+1));
-                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz+height),
-                              isSolidForAO(getBlock, wx, fy, wz+height+1),
-                              isSolidForAO(getBlock, wx-1, fy, wz+height+1));
+                // Vertex 2 at (wx+width, wz+height): check (+1,0), (0,+1), (+1,+1)
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz+height-1),
+                              isSolidForAO(getBlock, wx+width-1, fy, wz+height),
+                              isSolidForAO(getBlock, wx+width, fy, wz+height));
+                // Vertex 3 at (wx, wz+height): check (-1,0), (0,+1), (-1,+1)
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz+height-1),
+                              isSolidForAO(getBlock, wx, fy, wz+height),
+                              isSolidForAO(getBlock, wx-1, fy, wz+height));
                 break;
             }
             case BGMFace::NEG_Y: {
+                // Bottom face - vertices are at y, check neighbors at y-1
                 int fy = y - 1;
                 ao0 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz),
                               isSolidForAO(getBlock, wx, fy, wz-1),
@@ -700,15 +889,16 @@ private:
                 ao1 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz),
                               isSolidForAO(getBlock, wx+width-1, fy, wz-1),
                               isSolidForAO(getBlock, wx+width, fy, wz-1));
-                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz+height),
-                              isSolidForAO(getBlock, wx+width-1, fy, wz+height+1),
-                              isSolidForAO(getBlock, wx+width, fy, wz+height+1));
-                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz+height),
-                              isSolidForAO(getBlock, wx, fy, wz+height+1),
-                              isSolidForAO(getBlock, wx-1, fy, wz+height+1));
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, fy, wz+height-1),
+                              isSolidForAO(getBlock, wx+width-1, fy, wz+height),
+                              isSolidForAO(getBlock, wx+width, fy, wz+height));
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, fy, wz+height-1),
+                              isSolidForAO(getBlock, wx, fy, wz+height),
+                              isSolidForAO(getBlock, wx-1, fy, wz+height));
                 break;
             }
             case BGMFace::POS_Z: {
+                // Front face (+Z) - vertices at z+1, check neighbors at z+1
                 int fz = wz + 1;
                 ao0 = cornerAO(isSolidForAO(getBlock, wx-1, y, fz),
                               isSolidForAO(getBlock, wx, y-1, fz),
@@ -716,15 +906,16 @@ private:
                 ao1 = cornerAO(isSolidForAO(getBlock, wx+width, y, fz),
                               isSolidForAO(getBlock, wx+width-1, y-1, fz),
                               isSolidForAO(getBlock, wx+width, y-1, fz));
-                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, y+height, fz),
-                              isSolidForAO(getBlock, wx+width-1, y+height+1, fz),
-                              isSolidForAO(getBlock, wx+width, y+height+1, fz));
-                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, y+height, fz),
-                              isSolidForAO(getBlock, wx, y+height+1, fz),
-                              isSolidForAO(getBlock, wx-1, y+height+1, fz));
+                ao2 = cornerAO(isSolidForAO(getBlock, wx+width, y+height-1, fz),
+                              isSolidForAO(getBlock, wx+width-1, y+height, fz),
+                              isSolidForAO(getBlock, wx+width, y+height, fz));
+                ao3 = cornerAO(isSolidForAO(getBlock, wx-1, y+height-1, fz),
+                              isSolidForAO(getBlock, wx, y+height, fz),
+                              isSolidForAO(getBlock, wx-1, y+height, fz));
                 break;
             }
             case BGMFace::NEG_Z: {
+                // Back face (-Z) - vertices at z, check neighbors at z-1
                 int fz = wz - 1;
                 ao0 = cornerAO(isSolidForAO(getBlock, wx+width, y, fz),
                               isSolidForAO(getBlock, wx+width-1, y-1, fz),
@@ -732,15 +923,16 @@ private:
                 ao1 = cornerAO(isSolidForAO(getBlock, wx-1, y, fz),
                               isSolidForAO(getBlock, wx, y-1, fz),
                               isSolidForAO(getBlock, wx-1, y-1, fz));
-                ao2 = cornerAO(isSolidForAO(getBlock, wx-1, y+height, fz),
-                              isSolidForAO(getBlock, wx, y+height+1, fz),
-                              isSolidForAO(getBlock, wx-1, y+height+1, fz));
-                ao3 = cornerAO(isSolidForAO(getBlock, wx+width, y+height, fz),
-                              isSolidForAO(getBlock, wx+width-1, y+height+1, fz),
-                              isSolidForAO(getBlock, wx+width, y+height+1, fz));
+                ao2 = cornerAO(isSolidForAO(getBlock, wx-1, y+height-1, fz),
+                              isSolidForAO(getBlock, wx, y+height, fz),
+                              isSolidForAO(getBlock, wx-1, y+height, fz));
+                ao3 = cornerAO(isSolidForAO(getBlock, wx+width, y+height-1, fz),
+                              isSolidForAO(getBlock, wx+width-1, y+height, fz),
+                              isSolidForAO(getBlock, wx+width, y+height, fz));
                 break;
             }
             case BGMFace::NEG_X: {
+                // Left face (-X) - vertices at x, check neighbors at x-1
                 int fx = wx - 1;
                 ao0 = cornerAO(isSolidForAO(getBlock, fx, y, wz-1),
                               isSolidForAO(getBlock, fx, y-1, wz),
@@ -748,15 +940,16 @@ private:
                 ao1 = cornerAO(isSolidForAO(getBlock, fx, y, wz+width),
                               isSolidForAO(getBlock, fx, y-1, wz+width-1),
                               isSolidForAO(getBlock, fx, y-1, wz+width));
-                ao2 = cornerAO(isSolidForAO(getBlock, fx, y+height, wz+width),
-                              isSolidForAO(getBlock, fx, y+height+1, wz+width-1),
-                              isSolidForAO(getBlock, fx, y+height+1, wz+width));
-                ao3 = cornerAO(isSolidForAO(getBlock, fx, y+height, wz-1),
-                              isSolidForAO(getBlock, fx, y+height+1, wz),
-                              isSolidForAO(getBlock, fx, y+height+1, wz-1));
+                ao2 = cornerAO(isSolidForAO(getBlock, fx, y+height-1, wz+width),
+                              isSolidForAO(getBlock, fx, y+height, wz+width-1),
+                              isSolidForAO(getBlock, fx, y+height, wz+width));
+                ao3 = cornerAO(isSolidForAO(getBlock, fx, y+height-1, wz-1),
+                              isSolidForAO(getBlock, fx, y+height, wz),
+                              isSolidForAO(getBlock, fx, y+height, wz-1));
                 break;
             }
             case BGMFace::POS_X: {
+                // Right face (+X) - vertices at x+1, check neighbors at x+1
                 int fx = wx + 1;
                 ao0 = cornerAO(isSolidForAO(getBlock, fx, y, wz+width),
                               isSolidForAO(getBlock, fx, y-1, wz+width-1),
@@ -764,12 +957,12 @@ private:
                 ao1 = cornerAO(isSolidForAO(getBlock, fx, y, wz-1),
                               isSolidForAO(getBlock, fx, y-1, wz),
                               isSolidForAO(getBlock, fx, y-1, wz-1));
-                ao2 = cornerAO(isSolidForAO(getBlock, fx, y+height, wz-1),
-                              isSolidForAO(getBlock, fx, y+height+1, wz),
-                              isSolidForAO(getBlock, fx, y+height+1, wz-1));
-                ao3 = cornerAO(isSolidForAO(getBlock, fx, y+height, wz+width),
-                              isSolidForAO(getBlock, fx, y+height+1, wz+width-1),
-                              isSolidForAO(getBlock, fx, y+height+1, wz+width));
+                ao2 = cornerAO(isSolidForAO(getBlock, fx, y+height-1, wz-1),
+                              isSolidForAO(getBlock, fx, y+height, wz),
+                              isSolidForAO(getBlock, fx, y+height, wz-1));
+                ao3 = cornerAO(isSolidForAO(getBlock, fx, y+height-1, wz+width),
+                              isSolidForAO(getBlock, fx, y+height, wz+width-1),
+                              isSolidForAO(getBlock, fx, y+height, wz+width));
                 break;
             }
         }
@@ -779,10 +972,219 @@ private:
                                     ((ao2 & 0x3) << 4) | ((ao3 & 0x3) << 6));
     }
 
-    // Get light level at position
+    // Get light level at position (0-15 range)
+    int getLightAt(const Chunk& chunk, int x, int y, int z) const {
+        if (y < 0 || y >= CHUNK_SIZE_Y) return 15;  // Full light outside bounds
+        return chunk.getLightLevel(x, y, z);
+    }
+
+    // Get light level at position (legacy - returns 0-255)
     uint8_t calculateLight(const Chunk& chunk, int x, int y, int z) {
         if (y < 0 || y >= CHUNK_SIZE_Y) return 255;
         return chunk.getLightLevel(x, y, z) * 17;  // Scale 0-15 to 0-255
+    }
+
+    // Calculate smooth lighting for all 4 corners of a quad
+    // Returns packed light: 2 bits per corner (corners 0,1,2,3 in bits 0-1, 2-3, 4-5, 6-7)
+    // Each corner averages light from 4 adjacent blocks for smooth interpolation
+    uint8_t calculateLightCorners(
+        const Chunk& chunk,
+        int x, int y, int z,
+        int width, int height,
+        BGMFace face
+    ) {
+        // Helper to average 4 light values and convert to 2-bit (0-3)
+        auto avgLight = [&](int l0, int l1, int l2, int l3) -> int {
+            int avg = (l0 + l1 + l2 + l3 + 2) / 4;  // Average with rounding
+            return std::min(3, avg / 4);  // Map 0-15 to 0-3
+        };
+
+        int light0 = 3, light1 = 3, light2 = 3, light3 = 3;
+
+        switch (face) {
+            case BGMFace::POS_Y: {
+                // Top face - sample light above the face
+                int fy = y + 1;
+                // Corner 0 (x, z+height)
+                light0 = avgLight(
+                    getLightAt(chunk, x, fy, z+height),
+                    getLightAt(chunk, x-1, fy, z+height),
+                    getLightAt(chunk, x, fy, z+height+1),
+                    getLightAt(chunk, x-1, fy, z+height+1)
+                );
+                // Corner 1 (x+width, z+height)
+                light1 = avgLight(
+                    getLightAt(chunk, x+width-1, fy, z+height),
+                    getLightAt(chunk, x+width, fy, z+height),
+                    getLightAt(chunk, x+width-1, fy, z+height+1),
+                    getLightAt(chunk, x+width, fy, z+height+1)
+                );
+                // Corner 2 (x+width, z)
+                light2 = avgLight(
+                    getLightAt(chunk, x+width-1, fy, z),
+                    getLightAt(chunk, x+width, fy, z),
+                    getLightAt(chunk, x+width-1, fy, z-1),
+                    getLightAt(chunk, x+width, fy, z-1)
+                );
+                // Corner 3 (x, z)
+                light3 = avgLight(
+                    getLightAt(chunk, x, fy, z),
+                    getLightAt(chunk, x-1, fy, z),
+                    getLightAt(chunk, x, fy, z-1),
+                    getLightAt(chunk, x-1, fy, z-1)
+                );
+                break;
+            }
+            case BGMFace::NEG_Y: {
+                // Bottom face - sample light below the face
+                int fy = y - 1;
+                light0 = avgLight(
+                    getLightAt(chunk, x, fy, z),
+                    getLightAt(chunk, x-1, fy, z),
+                    getLightAt(chunk, x, fy, z-1),
+                    getLightAt(chunk, x-1, fy, z-1)
+                );
+                light1 = avgLight(
+                    getLightAt(chunk, x+width-1, fy, z),
+                    getLightAt(chunk, x+width, fy, z),
+                    getLightAt(chunk, x+width-1, fy, z-1),
+                    getLightAt(chunk, x+width, fy, z-1)
+                );
+                light2 = avgLight(
+                    getLightAt(chunk, x+width-1, fy, z+height),
+                    getLightAt(chunk, x+width, fy, z+height),
+                    getLightAt(chunk, x+width-1, fy, z+height+1),
+                    getLightAt(chunk, x+width, fy, z+height+1)
+                );
+                light3 = avgLight(
+                    getLightAt(chunk, x, fy, z+height),
+                    getLightAt(chunk, x-1, fy, z+height),
+                    getLightAt(chunk, x, fy, z+height+1),
+                    getLightAt(chunk, x-1, fy, z+height+1)
+                );
+                break;
+            }
+            case BGMFace::POS_Z: {
+                // Front face (+Z) - sample light in front
+                int fz = z + 1;
+                light0 = avgLight(
+                    getLightAt(chunk, x, y, fz),
+                    getLightAt(chunk, x-1, y, fz),
+                    getLightAt(chunk, x, y-1, fz),
+                    getLightAt(chunk, x-1, y-1, fz)
+                );
+                light1 = avgLight(
+                    getLightAt(chunk, x+width-1, y, fz),
+                    getLightAt(chunk, x+width, y, fz),
+                    getLightAt(chunk, x+width-1, y-1, fz),
+                    getLightAt(chunk, x+width, y-1, fz)
+                );
+                light2 = avgLight(
+                    getLightAt(chunk, x+width-1, y+height-1, fz),
+                    getLightAt(chunk, x+width, y+height-1, fz),
+                    getLightAt(chunk, x+width-1, y+height, fz),
+                    getLightAt(chunk, x+width, y+height, fz)
+                );
+                light3 = avgLight(
+                    getLightAt(chunk, x, y+height-1, fz),
+                    getLightAt(chunk, x-1, y+height-1, fz),
+                    getLightAt(chunk, x, y+height, fz),
+                    getLightAt(chunk, x-1, y+height, fz)
+                );
+                break;
+            }
+            case BGMFace::NEG_Z: {
+                // Back face (-Z) - sample light behind
+                int fz = z - 1;
+                light0 = avgLight(
+                    getLightAt(chunk, x+width-1, y, fz),
+                    getLightAt(chunk, x+width, y, fz),
+                    getLightAt(chunk, x+width-1, y-1, fz),
+                    getLightAt(chunk, x+width, y-1, fz)
+                );
+                light1 = avgLight(
+                    getLightAt(chunk, x, y, fz),
+                    getLightAt(chunk, x-1, y, fz),
+                    getLightAt(chunk, x, y-1, fz),
+                    getLightAt(chunk, x-1, y-1, fz)
+                );
+                light2 = avgLight(
+                    getLightAt(chunk, x, y+height-1, fz),
+                    getLightAt(chunk, x-1, y+height-1, fz),
+                    getLightAt(chunk, x, y+height, fz),
+                    getLightAt(chunk, x-1, y+height, fz)
+                );
+                light3 = avgLight(
+                    getLightAt(chunk, x+width-1, y+height-1, fz),
+                    getLightAt(chunk, x+width, y+height-1, fz),
+                    getLightAt(chunk, x+width-1, y+height, fz),
+                    getLightAt(chunk, x+width, y+height, fz)
+                );
+                break;
+            }
+            case BGMFace::NEG_X: {
+                // Left face (-X) - sample light to the left
+                int fx = x - 1;
+                light0 = avgLight(
+                    getLightAt(chunk, fx, y, z),
+                    getLightAt(chunk, fx, y, z-1),
+                    getLightAt(chunk, fx, y-1, z),
+                    getLightAt(chunk, fx, y-1, z-1)
+                );
+                light1 = avgLight(
+                    getLightAt(chunk, fx, y, z+width-1),
+                    getLightAt(chunk, fx, y, z+width),
+                    getLightAt(chunk, fx, y-1, z+width-1),
+                    getLightAt(chunk, fx, y-1, z+width)
+                );
+                light2 = avgLight(
+                    getLightAt(chunk, fx, y+height-1, z+width-1),
+                    getLightAt(chunk, fx, y+height-1, z+width),
+                    getLightAt(chunk, fx, y+height, z+width-1),
+                    getLightAt(chunk, fx, y+height, z+width)
+                );
+                light3 = avgLight(
+                    getLightAt(chunk, fx, y+height-1, z),
+                    getLightAt(chunk, fx, y+height-1, z-1),
+                    getLightAt(chunk, fx, y+height, z),
+                    getLightAt(chunk, fx, y+height, z-1)
+                );
+                break;
+            }
+            case BGMFace::POS_X: {
+                // Right face (+X) - sample light to the right
+                int fx = x + 1;
+                light0 = avgLight(
+                    getLightAt(chunk, fx, y, z+width-1),
+                    getLightAt(chunk, fx, y, z+width),
+                    getLightAt(chunk, fx, y-1, z+width-1),
+                    getLightAt(chunk, fx, y-1, z+width)
+                );
+                light1 = avgLight(
+                    getLightAt(chunk, fx, y, z),
+                    getLightAt(chunk, fx, y, z-1),
+                    getLightAt(chunk, fx, y-1, z),
+                    getLightAt(chunk, fx, y-1, z-1)
+                );
+                light2 = avgLight(
+                    getLightAt(chunk, fx, y+height-1, z),
+                    getLightAt(chunk, fx, y+height-1, z-1),
+                    getLightAt(chunk, fx, y+height, z),
+                    getLightAt(chunk, fx, y+height, z-1)
+                );
+                light3 = avgLight(
+                    getLightAt(chunk, fx, y+height-1, z+width-1),
+                    getLightAt(chunk, fx, y+height-1, z+width),
+                    getLightAt(chunk, fx, y+height, z+width-1),
+                    getLightAt(chunk, fx, y+height, z+width)
+                );
+                break;
+            }
+        }
+
+        // Pack 4 corners into 8 bits (2 bits per corner, values 0-3)
+        return static_cast<uint8_t>((light0 & 0x3) | ((light1 & 0x3) << 2) |
+                                    ((light2 & 0x3) << 4) | ((light3 & 0x3) << 6));
     }
 
     // Check if block is opaque
@@ -796,9 +1198,12 @@ private:
 
 // Utility function to expand a single face bucket to vertices
 // Internal helper - use expandFaceBucketsToVertices for the main API
+// biomeTemp/biomeHumid arrays are indexed by (x + z * CHUNK_SIZE_X), can be nullptr for no biome tinting
 inline void expandSingleBucketToVertices(
     const std::vector<BinaryQuad>& quads,
-    std::vector<PackedChunkVertex>& vertices
+    std::vector<PackedChunkVertex>& vertices,
+    const uint8_t* biomeTemp = nullptr,
+    const uint8_t* biomeHumid = nullptr
 ) {
     vertices.reserve(vertices.size() + quads.size() * 6);  // 6 vertices per quad (2 triangles)
 
@@ -810,15 +1215,25 @@ inline void expandSingleBucketToVertices(
         int height = quad.getHeight();
         int normalIdx = quad.getNormal();
         int texSlot = quad.getTexSlot();
-        uint8_t light = quad.getLight();
+        uint8_t packedLight = quad.getLight();
         uint8_t packedAO = quad.getAO();
 
         // Unpack AO values for each corner (2 bits each, 0-3 range)
-        // Maps 0-3 to 140-255 range for visible but subtle AO
+        // Maps 0-3 to brightness range for visible AO
         std::array<uint8_t, 4> aoValues;
         for (int i = 0; i < 4; i++) {
             int aoVal = (packedAO >> (i * 2)) & 0x3;
-            aoValues[i] = static_cast<uint8_t>(140 + aoVal * 38);
+            // Map AO 0-3 to 50-255 for very pronounced ambient occlusion
+            // AO 0 = 50 (20%), AO 1 = 118, AO 2 = 186, AO 3 = 255 (100%)
+            aoValues[i] = static_cast<uint8_t>(50 + aoVal * 68);
+        }
+
+        // Unpack per-corner light values (2 bits each, 0-3 range)
+        // Maps 0-3 to 100-255 range for smooth lighting interpolation
+        std::array<uint8_t, 4> lightValues;
+        for (int i = 0; i < 4; i++) {
+            int lightVal = (packedLight >> (i * 2)) & 0x3;
+            lightValues[i] = static_cast<uint8_t>(100 + lightVal * 51);  // 100, 151, 202, 253
         }
 
         // Local positions (scaled by 256 for precision)
@@ -927,7 +1342,19 @@ inline void expandSingleBucketToVertices(
             }
         }
 
-        // Create vertex helper - uses per-corner AO values
+        // Lookup biome data at quad origin (x, z)
+        // For greedy merged quads spanning multiple columns, use first corner's biome
+        uint8_t bTemp = 128;  // Default to neutral (0.5 temperature)
+        uint8_t bHumid = 128; // Default to neutral (0.5 humidity)
+        if (biomeTemp && biomeHumid) {
+            int colIdx = x + z * CHUNK_SIZE_X;
+            if (colIdx >= 0 && colIdx < CHUNK_SIZE_X * CHUNK_SIZE_Z) {
+                bTemp = biomeTemp[colIdx];
+                bHumid = biomeHumid[colIdx];
+            }
+        }
+
+        // Create vertex helper - uses per-corner AO and light values for smooth lighting
         auto makeVertex = [&](int cornerIdx) -> PackedChunkVertex {
             return PackedChunkVertex{
                 localCorners[cornerIdx][0],
@@ -936,33 +1363,56 @@ inline void expandSingleBucketToVertices(
                 uvCorners[cornerIdx][0],
                 uvCorners[cornerIdx][1],
                 packedNormalIndex,
-                aoValues[cornerIdx],  // Per-corner AO
-                light,
+                aoValues[cornerIdx],     // Per-corner AO
+                lightValues[cornerIdx],  // Per-corner light for smooth lighting
                 static_cast<uint8_t>(texSlot),
-                0  // padding
+                bTemp,   // Biome temperature (0-255 maps to 0.0-1.0)
+                bHumid   // Biome humidity (0-255 maps to 0.0-1.0)
             };
         };
 
-        // Emit triangles with correct winding order: (0,1,2) and (2,3,0)
-        vertices.push_back(makeVertex(0));
-        vertices.push_back(makeVertex(1));
-        vertices.push_back(makeVertex(2));
-        vertices.push_back(makeVertex(2));
-        vertices.push_back(makeVertex(3));
-        vertices.push_back(makeVertex(0));
+        // Get raw AO values (0-3) for flip decision
+        int ao0 = (packedAO >> 0) & 0x3;
+        int ao1 = (packedAO >> 2) & 0x3;
+        int ao2 = (packedAO >> 4) & 0x3;
+        int ao3 = (packedAO >> 6) & 0x3;
+
+        // Flip quad diagonal to reduce AO anisotropy artifacts
+        // When opposite corners have different AO, the diagonal creates visible stripes
+        // By choosing which diagonal to use based on AO values, we minimize this artifact
+        if (ao0 + ao2 > ao1 + ao3) {
+            // Use diagonal from corner 0 to corner 2: triangles (0,1,2) and (0,2,3)
+            vertices.push_back(makeVertex(0));
+            vertices.push_back(makeVertex(1));
+            vertices.push_back(makeVertex(2));
+            vertices.push_back(makeVertex(0));
+            vertices.push_back(makeVertex(2));
+            vertices.push_back(makeVertex(3));
+        } else {
+            // Use diagonal from corner 1 to corner 3: triangles (0,1,3) and (1,2,3)
+            vertices.push_back(makeVertex(0));
+            vertices.push_back(makeVertex(1));
+            vertices.push_back(makeVertex(3));
+            vertices.push_back(makeVertex(1));
+            vertices.push_back(makeVertex(2));
+            vertices.push_back(makeVertex(3));
+        }
     }
 }
 
 // Main API: Expand face buckets to 6 separate vertex arrays
 // Each array corresponds to one face direction for efficient culling
 // faceBucketVertices[i] contains vertices for face direction i (0=+X, 1=-X, 2=+Y, 3=-Y, 4=+Z, 5=-Z)
+// biomeTemp/biomeHumid arrays are indexed by (x + z * CHUNK_SIZE_X), can be nullptr for no biome tinting
 inline void expandFaceBucketsToVertices(
     const BinaryMeshResult& result,
-    std::array<std::vector<PackedChunkVertex>, FACE_BUCKET_COUNT>& faceBucketVertices
+    std::array<std::vector<PackedChunkVertex>, FACE_BUCKET_COUNT>& faceBucketVertices,
+    const uint8_t* biomeTemp = nullptr,
+    const uint8_t* biomeHumid = nullptr
 ) {
     for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
         faceBucketVertices[i].clear();
-        expandSingleBucketToVertices(result.faceBuckets[i], faceBucketVertices[i]);
+        expandSingleBucketToVertices(result.faceBuckets[i], faceBucketVertices[i], biomeTemp, biomeHumid);
     }
 }
 
@@ -970,14 +1420,16 @@ inline void expandFaceBucketsToVertices(
 // Use this when face-orientation culling is not needed (e.g., deferred rendering)
 inline void expandQuadsToVertices(
     const BinaryMeshResult& result,
-    std::vector<PackedChunkVertex>& vertices
+    std::vector<PackedChunkVertex>& vertices,
+    const uint8_t* biomeTemp = nullptr,
+    const uint8_t* biomeHumid = nullptr
 ) {
     vertices.clear();
     size_t totalQuads = result.getTotalQuadCount();
     vertices.reserve(totalQuads * 6);
-    
+
     for (int i = 0; i < FACE_BUCKET_COUNT; i++) {
-        expandSingleBucketToVertices(result.faceBuckets[i], vertices);
+        expandSingleBucketToVertices(result.faceBuckets[i], vertices, biomeTemp, biomeHumid);
     }
 }
 

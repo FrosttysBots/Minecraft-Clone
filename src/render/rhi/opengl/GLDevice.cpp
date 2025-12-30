@@ -7,8 +7,10 @@
 #include "GLDescriptorSet.h"
 #include "GLCommandBuffer.h"
 
-// Vulkan device for factory method
+// WIP: Vulkan device for factory method (disabled while focusing on OpenGL)
+#ifndef DISABLE_VULKAN
 #include "../vulkan/VKDevice.h"
+#endif
 
 #include <iostream>
 #include <sstream>
@@ -24,9 +26,11 @@ std::unique_ptr<RHIDevice> RHIDevice::create(Backend backend, void* window) {
         case Backend::OpenGL:
             std::cout << "[RHI] Creating OpenGL device" << std::endl;
             return std::make_unique<GLDevice>(static_cast<GLFWwindow*>(window));
+#ifndef DISABLE_VULKAN
         case Backend::Vulkan:
             std::cout << "[RHI] Creating Vulkan device" << std::endl;
             return std::make_unique<VKDevice>(static_cast<GLFWwindow*>(window));
+#endif
         default:
             std::cerr << "[RHI] Unknown backend" << std::endl;
             return nullptr;
@@ -37,9 +41,11 @@ bool RHIDevice::isBackendSupported(Backend backend) {
     switch (backend) {
         case Backend::OpenGL:
             return true;
+#ifndef DISABLE_VULKAN
         case Backend::Vulkan:
             // Check if Vulkan is available
             return glfwVulkanSupported() == GLFW_TRUE;
+#endif
         default:
             return false;
     }

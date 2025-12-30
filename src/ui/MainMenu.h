@@ -12,7 +12,10 @@ enum class MenuAction {
     PLAY_GAME,
     MULTIPLAYER,
     SETTINGS,
-    EXIT
+    TEXTURE_PACKS,
+    EXIT,
+    COPY_SEED,
+    REFRESH_WORLD
 };
 
 class MainMenu {
@@ -24,7 +27,10 @@ public:
     MenuButton playButton;
     MenuButton multiplayerButton;
     MenuButton settingsButton;
+    MenuButton texturePacksButton;
     MenuButton exitButton;
+    MenuButton copySeedButton;
+    MenuButton refreshWorldButton;
 
     // Current action (set when button is clicked)
     MenuAction currentAction = MenuAction::NONE;
@@ -72,14 +78,48 @@ public:
         };
         settingsButton.textScale = 1.5f;
 
+        // Texture Packs button
+        texturePacksButton = {
+            centerX - btnWidth / 2, startY + 3 * (btnHeight + btnSpacing),
+            btnWidth, btnHeight,
+            "TEXTURE PACKS",
+            [this]() { currentAction = MenuAction::TEXTURE_PACKS; }
+        };
+        texturePacksButton.textScale = 1.5f;
+
         // Exit button
         exitButton = {
-            centerX - btnWidth / 2, startY + 3 * (btnHeight + btnSpacing),
+            centerX - btnWidth / 2, startY + 4 * (btnHeight + btnSpacing),
             btnWidth, btnHeight,
             "EXIT",
             [this]() { currentAction = MenuAction::EXIT; }
         };
         exitButton.textScale = 1.5f;
+
+        // Bottom right corner buttons
+        float bottomBtnWidth = 220.0f;
+        float bottomBtnHeight = 35.0f;
+        float bottomBtnSpacing = 10.0f;
+
+        // Refresh World button
+        refreshWorldButton = {
+            static_cast<float>(ui->windowWidth) - bottomBtnWidth - 20,
+            static_cast<float>(ui->windowHeight) - bottomBtnHeight - 55 - bottomBtnHeight - bottomBtnSpacing,
+            bottomBtnWidth, bottomBtnHeight,
+            "REFRESH WORLD",
+            [this]() { currentAction = MenuAction::REFRESH_WORLD; }
+        };
+        refreshWorldButton.textScale = 0.9f;
+
+        // Copy Background Seed button
+        copySeedButton = {
+            static_cast<float>(ui->windowWidth) - bottomBtnWidth - 20,
+            static_cast<float>(ui->windowHeight) - bottomBtnHeight - 55,
+            bottomBtnWidth, bottomBtnHeight,
+            "COPY BACKGROUND SEED",
+            [this]() { currentAction = MenuAction::COPY_SEED; }
+        };
+        copySeedButton.textScale = 0.9f;
     }
 
     void resize(int width, int height) {
@@ -96,7 +136,10 @@ public:
         input.handleButton(playButton);
         input.handleButton(multiplayerButton);
         input.handleButton(settingsButton);
+        input.handleButton(texturePacksButton);
         input.handleButton(exitButton);
+        input.handleButton(refreshWorldButton);
+        input.handleButton(copySeedButton);
     }
 
     void render() {
@@ -115,7 +158,10 @@ public:
         playButton.render(*ui);
         multiplayerButton.render(*ui);
         settingsButton.render(*ui);
+        texturePacksButton.render(*ui);
         exitButton.render(*ui);
+        refreshWorldButton.render(*ui);
+        copySeedButton.render(*ui);
 
         // Version
         ui->drawText(version, 20, static_cast<float>(ui->windowHeight) - 40,

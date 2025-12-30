@@ -3,6 +3,7 @@
 layout (location = 0) in vec3 aPackedPos;     // int16 * 3, scaled by 256
 layout (location = 1) in vec2 aPackedTexCoord; // uint16 * 2, 8.8 fixed point
 layout (location = 2) in uvec4 aPackedData;   // normalIndex, ao, light, texSlot
+layout (location = 3) in uvec2 aBiomeData;    // biomeTemp, biomeHumid (0-255)
 
 layout(location = 0) out vec2 texCoord;
 layout(location = 1) out vec2 texSlotBase;  // Pass to fragment shader for tiling
@@ -13,6 +14,8 @@ layout(location = 5) out float lightLevel;
 layout(location = 6) out float fogDepth;
 layout(location = 7) out vec2 screenPos;
 layout(location = 8) out vec4 fragPosLightSpace;
+flat out uint texSlotIndex;  // For biome tinting check in fragment shader
+out vec2 biomeCoord;         // Biome colormap UV (temperature, humidity)
 
 uniform mat4 view;
 uniform mat4 projection;
@@ -57,6 +60,10 @@ void main() {
     float slotX = float(texSlot % 16u);
     float slotY = float(texSlot / 16u);
     texSlotBase = vec2(slotX * SLOT_SIZE, slotY * SLOT_SIZE);
+    texSlotIndex = texSlot;  // Pass to fragment for biome tinting check
+
+    // Biome colormap coordinates (0-255 -> 0.0-1.0)
+    biomeCoord = vec2(float(aBiomeData.x) / 255.0, float(aBiomeData.y) / 255.0);
 
     // Transform to clip space
     vec4 viewPos = view * vec4(worldPos, 1.0);

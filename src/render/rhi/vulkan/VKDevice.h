@@ -1,3 +1,10 @@
+// ============================================================================
+// WIP: VULKAN BACKEND - Work In Progress
+// This file is part of the Vulkan rendering backend which is currently disabled.
+// Development is focused on OpenGL. To re-enable Vulkan, remove DISABLE_VULKAN
+// from CMakeLists.txt and uncomment the Vulkan build targets.
+// ============================================================================
+
 #pragma once
 
 #include "../RHI.h"
@@ -56,6 +63,11 @@ public:
 
     void submit(const std::vector<RHICommandBuffer*>& commandBuffers) override;
     void waitIdle() override;
+
+    // Submit with swapchain synchronization (wait and signal semaphores, fence)
+    void submitWithSync(const std::vector<RHICommandBuffer*>& commandBuffers,
+                       VkSemaphore waitSemaphore, VkSemaphore signalSemaphore,
+                       VkFence fence);
 
     VkQueue getVkQueue() const { return m_queue; }
     uint32_t getFamilyIndex() const { return m_familyIndex; }

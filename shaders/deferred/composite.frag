@@ -32,11 +32,69 @@ uniform float fogDensity;
 uniform float isUnderwater;
 uniform mat4 invViewProj;
 uniform float renderDistanceBlocks;  // Render distance in blocks (chunks * 16)
+uniform float waterSurfaceY;  // Y level of water surface for caustics
+uniform float brightness;  // Overall brightness multiplier (0.5 - 1.5)
 
 const float FOG_HEIGHT_FALLOFF = 0.015;
 const float FOG_BASE_HEIGHT = 64.0;
 
 uniform int debugMode;  // 0=normal, 1=albedo, 2=normals, 3=position, 4=depth
+
+// ============================================================
+// Noise for caustics
+// ============================================================
+vec3 permute3(vec3 x) { return mod(((x*34.0)+1.0)*x, 289.0); }
+
+float snoise2(vec2 v) {
+    const vec4 C = vec4(0.211324865405187, 0.366025403784439,
+                        -0.577350269189626, 0.024390243902439);
+    vec2 i  = floor(v + dot(v, C.yy));
+    vec2 x0 = v - i + dot(i, C.xx);
+    vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+    vec4 x12 = x0.xyxy + C.xxzz;
+    x12.xy -= i1;
+    i = mod(i, 289.0);
+    vec3 p = permute3(permute3(i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+    vec3 m = max(0.5 - vec3(dot(x0,x0), dot(x12.xy,x12.xy), dot(x12.zw,x12.zw)), 0.0);
+    m = m*m;
+    m = m*m;
+    vec3 x = 2.0 * fract(p * C.www) - 1.0;
+    vec3 h = abs(x) - 0.5;
+    vec3 ox = floor(x + 0.5);
+    vec3 a0 = x - ox;
+    m *= 1.79284291400159 - 0.85373472095314 * (a0*a0 + h*h);
+    vec3 g;
+    g.x = a0.x * x0.x + h.x * x0.y;
+    g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+    return 130.0 * dot(m, g);
+}
+
+// ============================================================
+// Underwater caustics - light patterns on submerged surfaces
+// ============================================================
+float calculateCaustics(vec3 worldPos, float t) {
+    vec2 uv = worldPos.xz;
+
+    // Multiple layers of animated noise for caustic pattern
+    vec2 uv1 = uv * 0.15 + t * vec2(0.02, 0.015);
+    vec2 uv2 = uv * 0.15 + t * vec2(-0.018, 0.022);
+    vec2 uv3 = uv * 0.25 + t * vec2(0.01, -0.02);
+
+    float c1 = snoise2(uv1 * 4.0);
+    float c2 = snoise2(uv2 * 4.0);
+    float c3 = snoise2(uv3 * 6.0) * 0.5;
+
+    // Voronoi-like caustic pattern
+    float caustic = (c1 * c2 + c3) * 0.5 + 0.5;
+    caustic = smoothstep(0.3, 0.7, caustic);
+
+    // Add sharper highlights
+    float highlight = snoise2(uv * 0.3 + t * 0.03);
+    highlight = pow(max(highlight * 0.5 + 0.5, 0.0), 4.0);
+    caustic += highlight * 0.3;
+
+    return caustic;
+}
 
 float getFogDensity(float y) {
     float heightAboveBase = max(y - FOG_BASE_HEIGHT, 0.0);
@@ -219,6 +277,29 @@ void main() {
         result = glowColor;
     } else {
         result = albedo * lighting;
+
+        // Apply underwater caustics to submerged terrain
+        // Caustics appear on surfaces that are below water level
+        float seaLevel = 62.0;  // Standard sea level
+        if (fragPos.y < seaLevel && isUnderwater < 0.5) {
+            // Calculate depth below water
+            float depthBelowWater = seaLevel - fragPos.y;
+
+            // Caustics strength based on depth and surface normal
+            float causticStrength = exp(-depthBelowWater * 0.08);  // Fade with depth
+            causticStrength *= max(normal.y, 0.0);  // Stronger on upward-facing surfaces
+
+            // Get caustic pattern
+            float caustic = calculateCaustics(fragPos, time);
+
+            // Sun contribution to caustics
+            vec3 sunDir = normalize(lightDir);
+            float sunUp = max(sunDir.y, 0.0);
+
+            // Apply caustics as additive light
+            vec3 causticColor = lightColor * caustic * causticStrength * sunUp * 0.4;
+            result += causticColor;
+        }
     }
 
     // Distance fog with LOD-hiding enhancement
@@ -244,6 +325,9 @@ void main() {
         result = mix(result, underwaterColor, underwaterFog);
         result = mix(result, result * vec3(0.4, 0.7, 0.9), 0.4);
     }
+
+    // Apply brightness adjustment
+    result *= brightness;
 
     FragColor = vec4(result, 1.0);
 }

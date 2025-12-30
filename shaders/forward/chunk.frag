@@ -8,15 +8,30 @@ layout(location = 5) in float lightLevel;
 layout(location = 6) in float fogDepth;
 layout(location = 7) in vec2 screenPos;
 layout(location = 8) in vec4 fragPosLightSpace;
+flat in uint texSlotIndex;  // For biome tinting check
+in vec2 biomeCoord;         // Biome colormap UV (temperature, humidity)
 
 layout(location = 0) out vec4 FragColor;
 
 layout(binding = 0) uniform sampler2D texAtlas;
+layout(binding = 1) uniform sampler2D shadowMap;
+layout(binding = 2) uniform sampler3D lightmapTexture;  // 3D lightmap for smooth lighting
+layout(binding = 3) uniform sampler2D normalMap;  // Normal map atlas
+layout(binding = 4) uniform sampler2D grassColormap;  // Biome colormap for grass/foliage tinting
+
+uniform bool useNormalMap;  // Enable normal mapping
+
+// Tintable texture slot indices (must match BiomeColormap.h TintableSlots)
+const uint TINT_GRASS_TOP = 2u;   // grass_top
+const uint TINT_GRASS_SIDE = 3u;  // grass_side (partial tint)
+const uint TINT_LEAVES = 8u;      // leaves_oak
+const uint TINT_WATER = 11u;      // water_still
 
 // Texture atlas constants for greedy meshing tiling
 const float ATLAS_SIZE = 16.0;
 const float SLOT_SIZE = 1.0 / ATLAS_SIZE;  // 0.0625
-layout(binding = 1) uniform sampler2D shadowMap;
+
+uniform vec3 chunkOffset;  // World position of chunk origin (for lightmap sampling)
 uniform vec3 lightDir;
 uniform vec3 lightColor;
 uniform vec3 ambientColor;
@@ -27,6 +42,7 @@ uniform float isUnderwater;
 uniform float time;
 uniform float shadowStrength;
 uniform float renderDistanceBlocks;  // For LOD-hiding fog
+uniform float brightness;  // Overall brightness multiplier
 
 // ============================================================
 // Shadow Mapping with PCF (Percentage Closer Filtering)
@@ -150,6 +166,29 @@ vec2 computeVolumetricFog(vec3 rayStart, vec3 rayEnd, vec3 sunDir) {
     return vec2(transmittance, inScatter);
 }
 
+// ============================================================
+// Biome Tinting System
+// Apply temperature/humidity based color to grass/leaves
+// ============================================================
+vec3 applyBiomeTint(vec3 baseColor, uint slot, vec2 biomeUV) {
+    vec3 tintColor = texture(grassColormap, biomeUV).rgb;
+
+    // Grass top and leaves: full tint
+    if (slot == TINT_GRASS_TOP || slot == TINT_LEAVES) {
+        return baseColor * tintColor * 1.4;
+    }
+    // Grass side: partial tint for natural look
+    if (slot == TINT_GRASS_SIDE) {
+        return mix(baseColor, baseColor * tintColor * 1.4, 0.6);
+    }
+    // Water: subtle blue tint based on biome (optional)
+    if (slot == TINT_WATER) {
+        return baseColor * mix(vec3(1.0), tintColor * 1.2, 0.3);
+    }
+    // Non-tintable blocks: return unchanged
+    return baseColor;
+}
+
 // Check if texture coordinates indicate an emissive block
 // Texture atlas is 16x16, each slot is 1/16 = 0.0625
 // Glowstone = slot 22 (row 1, col 6), Lava = slot 23 (row 1, col 7)
@@ -173,11 +212,62 @@ void main() {
     // Discard very transparent pixels (for glass, leaves)
     if (texColor.a < 0.1) discard;
 
+    // Apply biome-based tinting to grass, leaves, and water
+    texColor.rgb = applyBiomeTint(texColor.rgb, texSlotIndex, biomeCoord);
+
     // Check for emissive blocks (use tiledUV to identify block type)
     float emission = getEmission(tiledUV);
 
-    // Lighting calculation
+    // Sample 3D lightmap for smooth block lighting (from emissive blocks like torches/glowstone)
+    // Note: This is BLOCK LIGHT only, not skylight. Skylight comes from sun/ambient calculations.
+    // Calculate local position within chunk (0-16 for X/Z, 0-256 for Y)
+    vec3 localPos = fragPos - chunkOffset;
+    // Convert to normalized texture coordinates (0-1 range)
+    // Add 0.5 to sample at block center, divide by chunk dimensions
+    vec3 lightmapCoord = vec3(
+        (localPos.x + 0.5) / 16.0,   // X: 0-16 -> 0-1
+        (localPos.z + 0.5) / 16.0,   // Z maps to texture Y (height in 3D tex)
+        (localPos.y + 0.5) / 256.0   // Y maps to texture Z (depth in 3D tex)
+    );
+    // Clamp to valid range to avoid edge artifacts
+    lightmapCoord = clamp(lightmapCoord, 0.001, 0.999);
+    // Sample lightmap (GL_LINEAR filtering provides smooth interpolation)
+    float sampledLight = texture(lightmapTexture, lightmapCoord).r;
+    // Use the higher of sampled lightmap or vertex light to ensure we don't darken areas
+    // that should be lit (vertex light is passed through as fallback)
+    float finalBlockLight = max(sampledLight, lightLevel);
+
+    // Normal mapping with TBN matrix for voxel faces
     vec3 norm = normalize(fragNormal);
+
+    if (useNormalMap) {
+        // Sample normal map at the same UV as albedo
+        vec3 normalSample = texture(normalMap, tiledUV).rgb;
+        normalSample = normalSample * 2.0 - 1.0;  // Convert from [0,1] to [-1,1]
+
+        // Compute TBN matrix for axis-aligned voxel faces
+        // For voxel faces, we can derive tangent/bitangent from the face normal
+        vec3 tangent, bitangent;
+        vec3 absNormal = abs(fragNormal);
+
+        if (absNormal.y > 0.9) {
+            // Top/bottom face (Y-aligned): tangent = X, bitangent = Z
+            tangent = vec3(1.0, 0.0, 0.0);
+            bitangent = vec3(0.0, 0.0, fragNormal.y > 0.0 ? 1.0 : -1.0);
+        } else if (absNormal.x > 0.9) {
+            // Left/right face (X-aligned): tangent = Z, bitangent = Y
+            tangent = vec3(0.0, 0.0, fragNormal.x > 0.0 ? -1.0 : 1.0);
+            bitangent = vec3(0.0, 1.0, 0.0);
+        } else {
+            // Front/back face (Z-aligned): tangent = X, bitangent = Y
+            tangent = vec3(fragNormal.z > 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+            bitangent = vec3(0.0, 1.0, 0.0);
+        }
+
+        mat3 TBN = mat3(tangent, bitangent, norm);
+        norm = normalize(TBN * normalSample);
+    }
+
     vec3 lightDirection = normalize(lightDir);
 
     // Calculate shadow
@@ -191,8 +281,8 @@ void main() {
     vec3 diffuse = diff * lightColor * 0.6 * (1.0 - shadow);
 
     // Point light contribution from emissive blocks (glowstone, lava)
-    // Light level is 0-1, add warm colored light - not affected by shadow
-    vec3 pointLight = lightLevel * vec3(1.0, 0.85, 0.6) * 1.2;
+    // Use combined lightmap + vertex light for smooth lighting across greedy-meshed quads
+    vec3 pointLight = finalBlockLight * vec3(1.0, 0.85, 0.6) * 1.2;
 
     // Combine lighting with smooth AO
     // Point lights are added on top (not multiplied by AO for better effect near sources)
@@ -273,6 +363,9 @@ void main() {
         // Apply fog: attenuate object color and add in-scattered light
         result = result * transmittance + fogAmbientColor * (1.0 - transmittance) + fogScatterColor * inScatter;
     }
+
+    // Apply brightness adjustment
+    result *= brightness;
 
     FragColor = vec4(result, texColor.a);
 }

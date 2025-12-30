@@ -111,6 +111,16 @@ public:
     // Resize swapchain (call after window resize)
     virtual void resize(uint32_t width, uint32_t height) = 0;
 
+    // Get render pass for swapchain rendering (backend-specific)
+    // For Vulkan: Returns the VkRenderPass for swapchain images
+    // For OpenGL: Returns a render pass descriptor for the default framebuffer
+    virtual RHIRenderPass* getSwapchainRenderPass() = 0;
+
+    // Get current framebuffer for swapchain rendering (backend-specific)
+    // For Vulkan: Returns VkFramebuffer for current swapchain image
+    // For OpenGL: Returns wrapper for default framebuffer (FBO 0)
+    virtual RHIFramebuffer* getCurrentFramebufferRHI() = 0;
+
 protected:
     RHISwapchain() = default;
 };

@@ -57,61 +57,65 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(meshoptimizer)
 
 # ============================================================================
-# VULKAN DEPENDENCIES
+# VULKAN DEPENDENCIES - WIP: Disabled while focusing on OpenGL
 # ============================================================================
+# TODO: Re-enable when returning to Vulkan backend development
+#
+# # Vulkan-Headers - Official Vulkan API headers
+# FetchContent_Declare(
+#     vulkan_headers
+#     GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+#     GIT_TAG vulkan-sdk-1.3.275.0
+# )
+# FetchContent_MakeAvailable(vulkan_headers)
+#
+# # volk - Meta-loader for Vulkan (loads all functions dynamically)
+# FetchContent_Declare(
+#     volk
+#     GIT_REPOSITORY https://github.com/zeux/volk.git
+#     GIT_TAG vulkan-sdk-1.3.275.0
+# )
+# set(VOLK_STATIC_DEFINES ON CACHE BOOL "" FORCE)
+# set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
+# set(VOLK_HEADERS_ONLY ON CACHE BOOL "" FORCE)
+# FetchContent_MakeAvailable(volk)
+#
+# # VulkanMemoryAllocator - Efficient GPU memory management (header-only)
+# FetchContent_Declare(
+#     vma
+#     GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
+#     GIT_TAG v3.0.1
+# )
+# # VMA is header-only, just fetch the content without building
+# FetchContent_GetProperties(vma)
+# if(NOT vma_POPULATED)
+#     FetchContent_Populate(vma)
+# endif()
+#
+# # glslang - GLSL to SPIR-V compiler
+# FetchContent_Declare(
+#     glslang
+#     GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+#     GIT_TAG 14.0.0
+# )
+# set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+# set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+# set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
+# set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
+# set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+# set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+# set(ENABLE_OPT OFF CACHE BOOL "" FORCE)  # Disable SPIRV-Tools optimizer
+# set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
+# FetchContent_MakeAvailable(glslang)
 
-# Vulkan-Headers - Official Vulkan API headers
-FetchContent_Declare(
-    vulkan_headers
-    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
-    GIT_TAG vulkan-sdk-1.3.275.0
-)
-FetchContent_MakeAvailable(vulkan_headers)
-
-# volk - Meta-loader for Vulkan (loads all functions dynamically)
-FetchContent_Declare(
-    volk
-    GIT_REPOSITORY https://github.com/zeux/volk.git
-    GIT_TAG vulkan-sdk-1.3.275.0
-)
-set(VOLK_STATIC_DEFINES ON CACHE BOOL "" FORCE)
-set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
-set(VOLK_HEADERS_ONLY ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(volk)
-
-# VulkanMemoryAllocator - Efficient GPU memory management (header-only)
-FetchContent_Declare(
-    vma
-    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
-    GIT_TAG v3.0.1
-)
-# VMA is header-only, just fetch the content without building
-FetchContent_GetProperties(vma)
-if(NOT vma_POPULATED)
-    FetchContent_Populate(vma)
-endif()
-
-# glslang - GLSL to SPIR-V compiler
-FetchContent_Declare(
-    glslang
-    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
-    GIT_TAG 14.0.0
-)
-set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
-set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
-set(ENABLE_CTEST OFF CACHE BOOL "" FORCE)
-set(ENABLE_HLSL OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
-set(ENABLE_OPT OFF CACHE BOOL "" FORCE)  # Disable SPIRV-Tools optimizer
-set(SKIP_GLSLANG_INSTALL ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(glslang)
-
-# Source files for main game (exclude launcher)
+# Source files for main game (exclude launcher, vulkan files, and main_vulkan.cpp)
 file(GLOB_RECURSE GAME_SOURCES
     "src/*.cpp"
 )
 list(FILTER GAME_SOURCES EXCLUDE REGEX ".*launcher/.*")
+list(FILTER GAME_SOURCES EXCLUDE REGEX ".*main_vulkan\\.cpp$")
+# WIP: Exclude Vulkan RHI implementation files
+list(FILTER GAME_SOURCES EXCLUDE REGEX ".*/vulkan/.*")
 
 # GLAD (OpenGL loader) - we'll add this manually
 set(GLAD_DIR ${CMAKE_SOURCE_DIR}/vendor/glad)
@@ -128,27 +132,30 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${GLAD_DIR}/include
     ${stb_SOURCE_DIR}
     ${fastnoiselite_SOURCE_DIR}/Cpp
-    # Vulkan includes
-    ${vulkan_headers_SOURCE_DIR}/include
-    ${volk_SOURCE_DIR}
-    ${vma_SOURCE_DIR}/include
-    # glslang includes
-    ${glslang_SOURCE_DIR}
+    # WIP: Vulkan includes disabled
+    # ${vulkan_headers_SOURCE_DIR}/include
+    # ${volk_SOURCE_DIR}
+    # ${vma_SOURCE_DIR}/include
+    # ${glslang_SOURCE_DIR}
 )
 
-# Vulkan platform defines
-if(WIN32)
-    target_compile_definitions(${PROJECT_NAME} PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-endif()
+# WIP: Vulkan platform defines disabled
+# if(WIN32)
+#     target_compile_definitions(${PROJECT_NAME} PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+# endif()
+
+# WIP: Disable Vulkan backend at compile time (OpenGL-only mode)
+target_compile_definitions(${PROJECT_NAME} PRIVATE DISABLE_VULKAN)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     glfw
     glm::glm
     opengl32
     meshoptimizer
-    glslang
-    SPIRV
-    glslang-default-resource-limits
+    # WIP: glslang disabled (only needed for Vulkan SPIR-V compilation)
+    # glslang
+    # SPIRV
+    # glslang-default-resource-limits
 )
 
 # OpenGL Launcher executable (Windows only)
@@ -205,133 +212,134 @@ else()
 endif()
 
 # ============================================================================
-# VULKAN ENGINE EXECUTABLE (Vulkan backend)
+# VULKAN ENGINE EXECUTABLE - WIP: Disabled while focusing on OpenGL
 # ============================================================================
-
-# Get all game sources except main.cpp
-file(GLOB_RECURSE VULKAN_GAME_SOURCES
-    "src/*.cpp"
-)
-list(FILTER VULKAN_GAME_SOURCES EXCLUDE REGEX ".*launcher/.*")
-list(FILTER VULKAN_GAME_SOURCES EXCLUDE REGEX ".*main\\.cpp$")
-
-add_executable(VoxelEngineVK
-    ${VULKAN_GAME_SOURCES}
-    src/main_vulkan.cpp
-    ${GLAD_DIR}/src/gl.c
-)
-
-target_include_directories(VoxelEngineVK PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${CMAKE_SOURCE_DIR}/src
-    ${GLAD_DIR}/include
-    ${stb_SOURCE_DIR}
-    ${fastnoiselite_SOURCE_DIR}/Cpp
-    ${vulkan_headers_SOURCE_DIR}/include
-    ${volk_SOURCE_DIR}
-    ${vma_SOURCE_DIR}/include
-    ${glslang_SOURCE_DIR}
-)
-
-if(WIN32)
-    target_compile_definitions(VoxelEngineVK PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-endif()
-
-target_link_libraries(VoxelEngineVK PRIVATE
-    glfw
-    glm::glm
-    opengl32
-    meshoptimizer
-    glslang
-    SPIRV
-    glslang-default-resource-limits
-)
-
-set_target_properties(VoxelEngineVK PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
-
-# Copy assets and shaders for Vulkan build
-add_custom_command(TARGET VoxelEngineVK POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/assets
-    $<TARGET_FILE_DIR:VoxelEngineVK>/assets
-)
-
-add_custom_command(TARGET VoxelEngineVK POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-    ${CMAKE_SOURCE_DIR}/shaders
-    $<TARGET_FILE_DIR:VoxelEngineVK>/shaders
-)
-
-if(MSVC)
-    target_compile_options(VoxelEngineVK PRIVATE /W4)
-else()
-    target_compile_options(VoxelEngineVK PRIVATE -Wall -Wextra -Wpedantic)
-endif()
-
-# ============================================================================
-# VULKAN TEST EXECUTABLE
-# ============================================================================
-add_executable(VulkanTest
-    tests/VulkanTest.cpp
-)
-
-target_include_directories(VulkanTest PRIVATE
-    ${vulkan_headers_SOURCE_DIR}/include
-    ${volk_SOURCE_DIR}
-)
-
-target_link_libraries(VulkanTest PRIVATE
-    glfw
-)
-
-# volk needs to link against the system's Vulkan loader on Windows
-if(WIN32)
-    target_compile_definitions(VulkanTest PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-endif()
-
-set_target_properties(VulkanTest PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
+# TODO: Re-enable when returning to Vulkan backend development
+#
+# # Get all game sources except main.cpp
+# file(GLOB_RECURSE VULKAN_GAME_SOURCES
+#     "src/*.cpp"
+# )
+# list(FILTER VULKAN_GAME_SOURCES EXCLUDE REGEX ".*launcher/.*")
+# list(FILTER VULKAN_GAME_SOURCES EXCLUDE REGEX ".*main\\.cpp$")
+#
+# add_executable(VoxelEngineVK
+#     ${VULKAN_GAME_SOURCES}
+#     src/main_vulkan.cpp
+#     ${GLAD_DIR}/src/gl.c
+# )
+#
+# target_include_directories(VoxelEngineVK PRIVATE
+#     ${CMAKE_SOURCE_DIR}/include
+#     ${CMAKE_SOURCE_DIR}/src
+#     ${GLAD_DIR}/include
+#     ${stb_SOURCE_DIR}
+#     ${fastnoiselite_SOURCE_DIR}/Cpp
+#     ${vulkan_headers_SOURCE_DIR}/include
+#     ${volk_SOURCE_DIR}
+#     ${vma_SOURCE_DIR}/include
+#     ${glslang_SOURCE_DIR}
+# )
+#
+# if(WIN32)
+#     target_compile_definitions(VoxelEngineVK PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+# endif()
+#
+# target_link_libraries(VoxelEngineVK PRIVATE
+#     glfw
+#     glm::glm
+#     opengl32
+#     meshoptimizer
+#     glslang
+#     SPIRV
+#     glslang-default-resource-limits
+# )
+#
+# set_target_properties(VoxelEngineVK PROPERTIES
+#     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+# )
+#
+# # Copy assets and shaders for Vulkan build
+# add_custom_command(TARGET VoxelEngineVK POST_BUILD
+#     COMMAND ${CMAKE_COMMAND} -E copy_directory
+#     ${CMAKE_SOURCE_DIR}/assets
+#     $<TARGET_FILE_DIR:VoxelEngineVK>/assets
+# )
+#
+# add_custom_command(TARGET VoxelEngineVK POST_BUILD
+#     COMMAND ${CMAKE_COMMAND} -E copy_directory
+#     ${CMAKE_SOURCE_DIR}/shaders
+#     $<TARGET_FILE_DIR:VoxelEngineVK>/shaders
+# )
+#
+# if(MSVC)
+#     target_compile_options(VoxelEngineVK PRIVATE /W4)
+# else()
+#     target_compile_options(VoxelEngineVK PRIVATE -Wall -Wextra -Wpedantic)
+# endif()
 
 # ============================================================================
-# VULKAN RHI TEST EXECUTABLE (Tests the RHI abstraction layer)
+# VULKAN TEST EXECUTABLE - WIP: Disabled
 # ============================================================================
-add_executable(VulkanRHITest
-    tests/VulkanRHITest.cpp
-    # Vulkan RHI implementation files
-    src/render/rhi/vulkan/VKDevice.cpp
-    src/render/rhi/vulkan/VKBuffer.cpp
-    src/render/rhi/vulkan/VKTexture.cpp
-    src/render/rhi/vulkan/VKShader.cpp
-    src/render/rhi/vulkan/VKPipeline.cpp
-    src/render/rhi/vulkan/VKFramebuffer.cpp
-    src/render/rhi/vulkan/VKDescriptorSet.cpp
-    src/render/rhi/vulkan/VKCommandBuffer.cpp
-)
+# add_executable(VulkanTest
+#     tests/VulkanTest.cpp
+# )
+#
+# target_include_directories(VulkanTest PRIVATE
+#     ${vulkan_headers_SOURCE_DIR}/include
+#     ${volk_SOURCE_DIR}
+# )
+#
+# target_link_libraries(VulkanTest PRIVATE
+#     glfw
+# )
+#
+# # volk needs to link against the system's Vulkan loader on Windows
+# if(WIN32)
+#     target_compile_definitions(VulkanTest PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+# endif()
+#
+# set_target_properties(VulkanTest PROPERTIES
+#     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+# )
 
-target_include_directories(VulkanRHITest PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${vulkan_headers_SOURCE_DIR}/include
-    ${volk_SOURCE_DIR}
-    ${vma_SOURCE_DIR}/include
-    ${glslang_SOURCE_DIR}
-    ${glslang_SOURCE_DIR}/glslang/Include
-)
-
-target_link_libraries(VulkanRHITest PRIVATE
-    glfw
-    glm::glm
-    glslang
-    SPIRV
-    glslang-default-resource-limits
-)
-
-if(WIN32)
-    target_compile_definitions(VulkanRHITest PRIVATE VK_USE_PLATFORM_WIN32_KHR)
-endif()
-
-set_target_properties(VulkanRHITest PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
+# ============================================================================
+# VULKAN RHI TEST EXECUTABLE - WIP: Disabled
+# ============================================================================
+# add_executable(VulkanRHITest
+#     tests/VulkanRHITest.cpp
+#     # Vulkan RHI implementation files
+#     src/render/rhi/vulkan/VKDevice.cpp
+#     src/render/rhi/vulkan/VKBuffer.cpp
+#     src/render/rhi/vulkan/VKTexture.cpp
+#     src/render/rhi/vulkan/VKShader.cpp
+#     src/render/rhi/vulkan/VKPipeline.cpp
+#     src/render/rhi/vulkan/VKFramebuffer.cpp
+#     src/render/rhi/vulkan/VKDescriptorSet.cpp
+#     src/render/rhi/vulkan/VKCommandBuffer.cpp
+# )
+#
+# target_include_directories(VulkanRHITest PRIVATE
+#     ${CMAKE_SOURCE_DIR}/src
+#     ${vulkan_headers_SOURCE_DIR}/include
+#     ${volk_SOURCE_DIR}
+#     ${vma_SOURCE_DIR}/include
+#     ${glslang_SOURCE_DIR}
+#     ${glslang_SOURCE_DIR}/glslang/Include
+# )
+#
+# target_link_libraries(VulkanRHITest PRIVATE
+#     glfw
+#     glm::glm
+#     glslang
+#     SPIRV
+#     glslang-default-resource-limits
+# )
+#
+# if(WIN32)
+#     target_compile_definitions(VulkanRHITest PRIVATE VK_USE_PLATFORM_WIN32_KHR)
+# endif()
+#
+# set_target_properties(VulkanRHITest PROPERTIES
+#     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+# )

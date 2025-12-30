@@ -2,16 +2,24 @@
 
 #include <glad/gl.h>
 #include <glm/glm.hpp>
+#include "../core/Config.h"
+
+// External config reference
+extern GameConfig g_config;
 
 class Crosshair {
 public:
     GLuint VAO = 0;
     GLuint VBO = 0;
     GLuint shaderProgram = 0;
+    GLint scaleLoc = -1;
+
+    // Base crosshair size in NDC (scaled by guiScale)
+    static constexpr float BASE_SIZE = 0.02f;
 
     void init() {
-        // Simple crosshair vertices (2D lines in NDC)
-        float size = 0.02f;
+        // Simple crosshair vertices (2D lines in NDC) - will be scaled by shader
+        float size = 1.0f;  // Unit size, scaled in shader
         float vertices[] = {
             // Horizontal line
             -size, 0.0f,
@@ -34,12 +42,13 @@ public:
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
 
-        // Create simple shader for crosshair
+        // Create simple shader for crosshair with scale uniform
         const char* vertexSrc = R"(
             #version 460 core
             layout (location = 0) in vec2 aPos;
+            uniform float scale;
             void main() {
-                gl_Position = vec4(aPos, 0.0, 1.0);
+                gl_Position = vec4(aPos * scale, 0.0, 1.0);
             }
         )";
 
@@ -66,15 +75,22 @@ public:
 
         glDeleteShader(vertexShader);
         glDeleteShader(fragmentShader);
+
+        // Get uniform location
+        scaleLoc = glGetUniformLocation(shaderProgram, "scale");
     }
 
     void render() {
         glUseProgram(shaderProgram);
         glBindVertexArray(VAO);
 
+        // Set scale based on GUI scale
+        float scale = BASE_SIZE * g_config.guiScale;
+        glUniform1f(scaleLoc, scale);
+
         // Disable depth test for UI
         glDisable(GL_DEPTH_TEST);
-        glLineWidth(2.0f);
+        glLineWidth(2.0f * g_config.guiScale);  // Scale line width too
         glDrawArrays(GL_LINES, 0, 4);
         glEnable(GL_DEPTH_TEST);
     }

@@ -83,8 +83,47 @@ void WorldRendererRHI::renderSolid(RHI::RHICommandBuffer* cmd, ::World& world, c
         GLint currentProgram = 0;
         glGetIntegerv(GL_CURRENT_PROGRAM, &currentProgram);
 
+        // DEBUG: Log state before rendering (first frame only)
+        static bool firstRender = true;
+        if (firstRender) {
+            GLint currentFBO = 0;
+            glGetIntegerv(GL_FRAMEBUFFER_BINDING, &currentFBO);
+            std::cout << "[WorldRendererRHI] Before draw - Program=" << currentProgram
+                      << ", FBO=" << currentFBO << std::endl;
+
+            // Check if MRT is configured
+            GLint drawBuffer0 = 0, drawBuffer1 = 0, drawBuffer2 = 0;
+            glGetIntegerv(GL_DRAW_BUFFER0, &drawBuffer0);
+            glGetIntegerv(GL_DRAW_BUFFER1, &drawBuffer1);
+            glGetIntegerv(GL_DRAW_BUFFER2, &drawBuffer2);
+            std::cout << "[WorldRendererRHI] Draw buffers: " << std::hex
+                      << drawBuffer0 << ", " << drawBuffer1 << ", " << drawBuffer2
+                      << std::dec << std::endl;
+
+            // Check depth state
+            GLboolean depthTest, depthMask;
+            glGetBooleanv(GL_DEPTH_TEST, &depthTest);
+            glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+            std::cout << "[WorldRendererRHI] DepthTest=" << (depthTest ? "ON" : "OFF")
+                      << ", DepthMask=" << (depthMask ? "ON" : "OFF") << std::endl;
+
+            firstRender = false;
+        }
+
         if (currentProgram > 0) {
             m_glChunkOffsetLoc = glGetUniformLocation(currentProgram, "chunkOffset");
+
+            // DEBUG: Log uniform location and VAO state (first render only)
+            static bool firstUniformLog = true;
+            if (firstUniformLog) {
+                std::cout << "[WorldRendererRHI] chunkOffset uniform location = " << m_glChunkOffsetLoc << std::endl;
+
+                // Check VAO binding
+                GLint currentVAO = 0;
+                glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &currentVAO);
+                std::cout << "[WorldRendererRHI] Current VAO before mesh draw = " << currentVAO << std::endl;
+                firstUniformLog = false;
+            }
         }
 
         // Choose rendering mode based on params

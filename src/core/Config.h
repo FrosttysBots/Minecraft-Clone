@@ -58,6 +58,17 @@ struct TitleScreenSettings {
     float mountainScale = 50.0f;
     float detailScale = 5.0f;
     int generationType = 0;
+
+    // Camera orbit settings
+    float orbitSpeed = 0.02f;
+    float cameraOrbitRadius = 80.0f;
+    float cameraHeight = 40.0f;      // Increased to be above max terrain
+    float cameraCenterX = 0.0f;
+    float cameraCenterY = 100.0f;    // Higher to avoid terrain
+    float cameraCenterZ = 0.0f;
+
+    // Active seed (set at runtime)
+    int64_t activeSeed = 0;
 };
 
 // Anti-Aliasing modes
@@ -429,6 +440,7 @@ struct GameConfig {
     bool fullscreen = false;
     bool vsync = true;
     int fov = 70;
+    float guiScale = 1.0f;              // GUI scale multiplier (0.5 - 2.0, like Minecraft)
     int renderDistance = 16;
     int maxChunksPerFrame = 8;     // Reasonable default for new players
     int maxMeshesPerFrame = 8;     // Reasonable default for new players
@@ -496,6 +508,7 @@ struct GameConfig {
     float gamma = 2.2f;                 // Display gamma
     float exposure = 1.0f;              // Exposure adjustment
     float saturation = 1.0f;            // Color saturation
+    float brightness = 1.0f;            // Overall brightness multiplier (0.5 - 1.5)
 
     // FSR / Upscaling
     UpscaleMode upscaleMode = UpscaleMode::NATIVE;  // FSR upscaling preset
@@ -741,6 +754,7 @@ struct GameConfig {
         file << "fullscreen=" << (fullscreen ? "true" : "false") << "\n";
         file << "vsync=" << (vsync ? "true" : "false") << "\n";
         file << "fov=" << fov << "\n";
+        file << "guiScale=" << guiScale << "\n";
         file << "renderDistance=" << renderDistance << "\n";
         file << "maxChunksPerFrame=" << maxChunksPerFrame << "\n";
         file << "maxMeshesPerFrame=" << maxMeshesPerFrame << "\n";
@@ -793,6 +807,7 @@ struct GameConfig {
         file << "gamma=" << gamma << "\n";
         file << "exposure=" << exposure << "\n";
         file << "saturation=" << saturation << "\n";
+        file << "brightness=" << brightness << "\n";
 
         file << "\n[Upscaling]\n";
         file << "enableFSR=" << (enableFSR ? "true" : "false") << "\n";
@@ -847,6 +862,7 @@ struct GameConfig {
             else if (key == "fullscreen") fullscreen = (value == "true");
             else if (key == "vsync") vsync = (value == "true");
             else if (key == "fov") fov = std::stoi(value);
+            else if (key == "guiScale") guiScale = std::clamp(std::stof(value), 0.5f, 2.0f);
             else if (key == "renderDistance") renderDistance = std::stoi(value);
             else if (key == "maxChunksPerFrame") maxChunksPerFrame = std::stoi(value);
             else if (key == "maxMeshesPerFrame") maxMeshesPerFrame = std::stoi(value);
@@ -896,6 +912,7 @@ struct GameConfig {
             else if (key == "gamma") gamma = std::stof(value);
             else if (key == "exposure") exposure = std::stof(value);
             else if (key == "saturation") saturation = std::stof(value);
+            else if (key == "brightness") brightness = std::stof(value);
             // Upscaling settings
             else if (key == "enableFSR") enableFSR = (value == "true");
             else if (key == "upscaleMode") upscaleMode = static_cast<UpscaleMode>(std::stoi(value));

@@ -181,11 +181,25 @@ VKSwapchain::VKSwapchain(VKDevice* device, const SwapchainDesc& desc)
 
     createSwapchain();
     createImageViews();
+    createDepthResources();
+    createRenderPass();
+    createUIRenderPass();
+    createFramebuffers();
     createSyncObjects();
 }
 
 VKSwapchain::~VKSwapchain() {
     cleanup();
+
+    // Destroy render passes (not cleaned up by cleanup() since they're format-dependent, not size-dependent)
+    if (m_renderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(m_device->getDevice(), m_renderPass, nullptr);
+        m_renderPass = VK_NULL_HANDLE;
+    }
+    if (m_uiRenderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(m_device->getDevice(), m_uiRenderPass, nullptr);
+        m_uiRenderPass = VK_NULL_HANDLE;
+    }
 
     // Destroy sync objects
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
@@ -312,6 +326,79 @@ void VKSwapchain::createImageViews() {
     }
 }
 
+void VKSwapchain::createDepthResources() {
+    VkDevice device = m_device->getDevice();
+    VkPhysicalDevice physDevice = m_device->getPhysicalDevice();
+
+    // Create depth image
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = m_extent.width;
+    imageInfo.extent.height = m_extent.height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = m_depthFormat;
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateImage(device, &imageInfo, nullptr, &m_depthImage) != VK_SUCCESS) {
+        std::cerr << "[VKSwapchain] Failed to create depth image" << std::endl;
+        return;
+    }
+
+    // Allocate memory for depth image
+    VkMemoryRequirements memRequirements;
+    vkGetImageMemoryRequirements(device, m_depthImage, &memRequirements);
+
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(physDevice, &memProperties);
+
+    uint32_t memTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((memRequirements.memoryTypeBits & (1 << i)) &&
+            (memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            memTypeIndex = i;
+            break;
+        }
+    }
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = memTypeIndex;
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &m_depthImageMemory) != VK_SUCCESS) {
+        std::cerr << "[VKSwapchain] Failed to allocate depth image memory" << std::endl;
+        return;
+    }
+
+    vkBindImageMemory(device, m_depthImage, m_depthImageMemory, 0);
+
+    // Create depth image view
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = m_depthImage;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = m_depthFormat;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    if (vkCreateImageView(device, &viewInfo, nullptr, &m_depthImageView) != VK_SUCCESS) {
+        std::cerr << "[VKSwapchain] Failed to create depth image view" << std::endl;
+        return;
+    }
+
+    std::cout << "[VKSwapchain] Created depth buffer (" << m_extent.width << "x" << m_extent.height << ")" << std::endl;
+}
+
 void VKSwapchain::createSyncObjects() {
     m_imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
     m_renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
@@ -333,16 +420,261 @@ void VKSwapchain::createSyncObjects() {
     }
 }
 
+RHIRenderPass* VKSwapchain::getSwapchainRenderPass() {
+    return m_rhiRenderPass.get();
+}
+
+RHIFramebuffer* VKSwapchain::getCurrentFramebufferRHI() {
+    if (m_currentImageIndex < m_rhiFramebuffers.size()) {
+        return m_rhiFramebuffers[m_currentImageIndex].get();
+    }
+    return nullptr;
+}
+
+void VKSwapchain::createRenderPass() {
+    // Color attachment
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = m_imageFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    // Depth attachment
+    VkAttachmentDescription depthAttachment{};
+    depthAttachment.format = m_depthFormat;
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorAttachmentRef{};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference depthAttachmentRef{};
+    depthAttachmentRef.attachment = 1;
+    depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+    subpass.pDepthStencilAttachment = &depthAttachmentRef;
+
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.srcAccessMask = 0;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    std::array<VkAttachmentDescription, 2> attachments = {colorAttachment, depthAttachment};
+
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+    renderPassInfo.pAttachments = attachments.data();
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+
+    if (vkCreateRenderPass(m_device->getDevice(), &renderPassInfo, nullptr, &m_renderPass) != VK_SUCCESS) {
+        std::cerr << "[VKSwapchain] Failed to create render pass" << std::endl;
+    } else {
+        std::cout << "[VKSwapchain] Created swapchain render pass with depth buffer" << std::endl;
+
+        // Create RHI wrapper for the render pass
+        RenderPassDesc rpDesc;
+        AttachmentDesc colorDesc;
+        colorDesc.format = m_desc.format;
+        colorDesc.samples = 1;
+        colorDesc.loadOp = LoadOp::Clear;
+        colorDesc.storeOp = StoreOp::Store;
+        colorDesc.initialLayout = TextureLayout::Undefined;
+        colorDesc.finalLayout = TextureLayout::PresentSrc;
+        rpDesc.colorAttachments.push_back(colorDesc);
+
+        AttachmentDesc depthDesc;
+        depthDesc.format = Format::D32_FLOAT;
+        depthDesc.samples = 1;
+        depthDesc.loadOp = LoadOp::Clear;
+        depthDesc.storeOp = StoreOp::DontCare;
+        depthDesc.initialLayout = TextureLayout::Undefined;
+        depthDesc.finalLayout = TextureLayout::DepthStencilAttachment;
+        rpDesc.depthStencilAttachment = depthDesc;
+        rpDesc.hasDepthStencil = true;
+        rpDesc.debugName = "SwapchainRenderPass";
+
+        m_rhiRenderPass = std::make_unique<VKSwapchainRenderPass>(m_renderPass, rpDesc);
+    }
+}
+
+void VKSwapchain::createUIRenderPass() {
+    // UI overlay render pass - uses LOAD to preserve existing content
+    // This render pass expects the image to already be in COLOR_ATTACHMENT_OPTIMAL
+    // (caller must transition from PRESENT_SRC_KHR before beginning this pass)
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = m_imageFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // Preserve existing content
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;  // Caller transitions here first
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    // Depth attachment - also LOAD to preserve depth buffer
+    VkAttachmentDescription depthAttachment{};
+    depthAttachment.format = m_depthFormat;
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;  // Preserve depth
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference colorAttachmentRef{};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    VkAttachmentReference depthAttachmentRef{};
+    depthAttachmentRef.attachment = 1;
+    depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+    subpass.pDepthStencilAttachment = &depthAttachmentRef;
+
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;  // Wait for previous writes
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    std::array<VkAttachmentDescription, 2> attachments = {colorAttachment, depthAttachment};
+
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+    renderPassInfo.pAttachments = attachments.data();
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+
+    if (vkCreateRenderPass(m_device->getDevice(), &renderPassInfo, nullptr, &m_uiRenderPass) != VK_SUCCESS) {
+        std::cerr << "[VKSwapchain] Failed to create UI overlay render pass" << std::endl;
+    } else {
+        std::cout << "[VKSwapchain] Created UI overlay render pass" << std::endl;
+
+        // Create RHI wrapper
+        RenderPassDesc rpDesc;
+        AttachmentDesc colorDesc;
+        colorDesc.format = m_desc.format;
+        colorDesc.samples = 1;
+        colorDesc.loadOp = LoadOp::Load;
+        colorDesc.storeOp = StoreOp::Store;
+        colorDesc.initialLayout = TextureLayout::ColorAttachment;  // Caller transitions here first
+        colorDesc.finalLayout = TextureLayout::PresentSrc;
+        rpDesc.colorAttachments.push_back(colorDesc);
+
+        AttachmentDesc depthDesc;
+        depthDesc.format = Format::D32_FLOAT;
+        depthDesc.samples = 1;
+        depthDesc.loadOp = LoadOp::Load;
+        depthDesc.storeOp = StoreOp::DontCare;
+        depthDesc.initialLayout = TextureLayout::DepthStencilAttachment;
+        depthDesc.finalLayout = TextureLayout::DepthStencilAttachment;
+        rpDesc.depthStencilAttachment = depthDesc;
+        rpDesc.hasDepthStencil = true;
+        rpDesc.debugName = "UIOverlayRenderPass";
+
+        m_rhiUIRenderPass = std::make_unique<VKSwapchainRenderPass>(m_uiRenderPass, rpDesc);
+    }
+}
+
+RHIRenderPass* VKSwapchain::getUIRenderPass() {
+    return m_rhiUIRenderPass.get();
+}
+
+void VKSwapchain::createFramebuffers() {
+    m_framebuffers.resize(m_imageViews.size());
+    m_rhiFramebuffers.resize(m_imageViews.size());
+
+    for (size_t i = 0; i < m_imageViews.size(); i++) {
+        std::array<VkImageView, 2> attachments = { m_imageViews[i], m_depthImageView };
+
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = m_renderPass;
+        framebufferInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+        framebufferInfo.pAttachments = attachments.data();
+        framebufferInfo.width = m_extent.width;
+        framebufferInfo.height = m_extent.height;
+        framebufferInfo.layers = 1;
+
+        if (vkCreateFramebuffer(m_device->getDevice(), &framebufferInfo, nullptr, &m_framebuffers[i]) != VK_SUCCESS) {
+            std::cerr << "[VKSwapchain] Failed to create framebuffer " << i << std::endl;
+        }
+
+        // Create RHI wrapper for the framebuffer
+        m_rhiFramebuffers[i] = std::make_unique<VKSwapchainFramebuffer>(
+            m_framebuffers[i], m_extent.width, m_extent.height);
+    }
+    std::cout << "[VKSwapchain] Created " << m_framebuffers.size() << " swapchain framebuffers with depth" << std::endl;
+}
+
 void VKSwapchain::cleanup() {
+    VkDevice device = m_device->getDevice();
+
+    // Clear RHI wrappers first (they reference Vulkan resources)
+    m_rhiFramebuffers.clear();
+
+    // Destroy framebuffers first (they reference image views)
+    for (auto fb : m_framebuffers) {
+        if (fb != VK_NULL_HANDLE) {
+            vkDestroyFramebuffer(device, fb, nullptr);
+        }
+    }
+    m_framebuffers.clear();
+
+    // Destroy depth resources
+    if (m_depthImageView != VK_NULL_HANDLE) {
+        vkDestroyImageView(device, m_depthImageView, nullptr);
+        m_depthImageView = VK_NULL_HANDLE;
+    }
+    if (m_depthImage != VK_NULL_HANDLE) {
+        vkDestroyImage(device, m_depthImage, nullptr);
+        m_depthImage = VK_NULL_HANDLE;
+    }
+    if (m_depthImageMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(device, m_depthImageMemory, nullptr);
+        m_depthImageMemory = VK_NULL_HANDLE;
+    }
+
     m_textures.clear();
 
     for (auto imageView : m_imageViews) {
-        vkDestroyImageView(m_device->getDevice(), imageView, nullptr);
+        vkDestroyImageView(device, imageView, nullptr);
     }
     m_imageViews.clear();
 
     if (m_swapchain != VK_NULL_HANDLE) {
-        vkDestroySwapchainKHR(m_device->getDevice(), m_swapchain, nullptr);
+        vkDestroySwapchainKHR(device, m_swapchain, nullptr);
         m_swapchain = VK_NULL_HANDLE;
     }
 }
@@ -354,6 +686,8 @@ void VKSwapchain::recreate() {
     cleanup();
     createSwapchain();
     createImageViews();
+    createDepthResources();  // Must recreate depth buffer for new size
+    createFramebuffers();  // Recreate framebuffers for new images
 }
 
 VkSurfaceFormatKHR VKSwapchain::chooseSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& formats) {

@@ -121,6 +121,9 @@ public:
     virtual void setLighting(const LightingParams& lighting) = 0;
     virtual void setFog(const FogParams& fog) = 0;
 
+    // Resources
+    virtual void setTextureAtlas(uint32_t textureID) = 0;
+
     // Stats
     virtual const RenderStats& getStats() const = 0;
 

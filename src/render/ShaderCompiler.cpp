@@ -6,10 +6,12 @@
 #include <regex>
 #include <functional>
 
-// glslang headers
+// WIP: glslang headers only needed for Vulkan SPIR-V compilation
+#ifndef DISABLE_VULKAN
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/Public/ResourceLimits.h>
 #include <SPIRV/GlslangToSpv.h>
+#endif
 
 namespace Render {
 
@@ -129,20 +131,29 @@ ShaderCompiler::~ShaderCompiler() {
 bool ShaderCompiler::initialize() {
     if (s_initialized) return true;
 
+#ifndef DISABLE_VULKAN
     s_initialized = glslang::InitializeProcess();
     if (!s_initialized) {
         std::cerr << "[ShaderCompiler] Failed to initialize glslang" << std::endl;
     }
+#else
+    // WIP: glslang not available, SPIR-V compilation disabled
+    s_initialized = true;  // Return success but compile() will return nullopt
+    std::cout << "[ShaderCompiler] SPIR-V compilation disabled (Vulkan WIP)" << std::endl;
+#endif
     return s_initialized;
 }
 
 void ShaderCompiler::shutdown() {
     if (s_initialized) {
+#ifndef DISABLE_VULKAN
         glslang::FinalizeProcess();
+#endif
         s_initialized = false;
     }
 }
 
+#ifndef DISABLE_VULKAN
 // Convert our stage enum to glslang stage
 static EShLanguage toGlslangStage(ShaderStage stage) {
     switch (stage) {
@@ -157,6 +168,7 @@ static EShLanguage toGlslangStage(ShaderStage stage) {
         default:                          return EShLangVertex;
     }
 }
+#endif
 
 std::optional<CompiledShader> ShaderCompiler::compile(
     const std::string& source,
@@ -169,6 +181,13 @@ std::optional<CompiledShader> ShaderCompiler::compile(
         return std::nullopt;
     }
 
+#ifdef DISABLE_VULKAN
+    // WIP: SPIR-V compilation not available (Vulkan disabled)
+    // OpenGL uses GLSL source directly, not SPIR-V
+    (void)source; (void)stage; (void)options; (void)debugName;
+    m_lastError = "SPIR-V compilation disabled (Vulkan WIP)";
+    return std::nullopt;
+#else
     // Preprocess for Vulkan if needed
     std::string processedSource = source;
     if (options.vulkanSemantics) {
@@ -274,6 +293,7 @@ std::optional<CompiledShader> ShaderCompiler::compile(
     result.sourceHash = computeHash(source, options);
 
     return result;
+#endif // DISABLE_VULKAN
 }
 
 std::optional<CompiledShader> ShaderCompiler::compileFile(

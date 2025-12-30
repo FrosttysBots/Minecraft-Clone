@@ -36,6 +36,14 @@ enum class Format {
     RG8_UNORM,
     RG8_SNORM,
 
+    // 32-bit 16x2 formats
+    RG16_UINT,
+    RG16_SINT,
+
+    // 48-bit 16x3 formats (for packed vertex positions)
+    RGB16_SINT,
+    RGB16_UINT,
+
     // 32-bit formats
     R32_FLOAT,
     R32_UINT,
@@ -390,6 +398,18 @@ enum class StoreOp {
     DontCare
 };
 
+enum class TextureLayout {
+    Undefined,
+    General,
+    ColorAttachment,
+    DepthStencilAttachment,
+    DepthStencilReadOnly,
+    ShaderReadOnly,
+    TransferSrc,
+    TransferDst,
+    PresentSrc
+};
+
 struct AttachmentDesc {
     Format format = Format::Unknown;
     uint32_t samples = 1;
@@ -397,6 +417,8 @@ struct AttachmentDesc {
     StoreOp storeOp = StoreOp::Store;
     LoadOp stencilLoadOp = LoadOp::DontCare;
     StoreOp stencilStoreOp = StoreOp::DontCare;
+    TextureLayout initialLayout = TextureLayout::Undefined;
+    TextureLayout finalLayout = TextureLayout::ColorAttachment;
 };
 
 struct ClearValue {

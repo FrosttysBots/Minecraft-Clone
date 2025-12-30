@@ -76,6 +76,8 @@ struct GraphicsPipelineDesc {
 
     // Render pass compatibility
     RHIRenderPass* renderPass = nullptr;
+    void* nativeRenderPass = nullptr;  // Native VkRenderPass for Vulkan (used if renderPass is null)
+    void* nativePipelineLayout = nullptr;  // Native VkPipelineLayout for Vulkan (used if layout is null)
     uint32_t subpass = 0;
 
     std::string debugName;

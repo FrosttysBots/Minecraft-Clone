@@ -451,7 +451,7 @@ public:
 
             // Validation message
             if (!equationValidationMessage.empty()) {
-                glm::vec4 msgColor = equationValid ? MenuColors::SUCCESS : MenuColors::ERROR;
+                glm::vec4 msgColor = equationValid ? MenuColors::SUCCESS : MenuColors::ERROR_COLOR;
                 ui->drawText(equationValidationMessage,
                             equationInput.x, equationInput.y + equationInput.height + 5,
                             msgColor, 0.9f);

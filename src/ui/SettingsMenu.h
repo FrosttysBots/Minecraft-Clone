@@ -9,6 +9,7 @@
 #include <functional>
 #include <algorithm>
 #include <fstream>
+#include <cmath>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -48,6 +49,11 @@ public:
     MenuDropdown graphicsPresetDropdown;
     MenuSlider renderDistanceSlider;
     MenuSlider fovSlider;
+    MenuDropdown guiScaleDropdown;
+
+    // GUI Scale values: Small=0.75, Normal=1.0, Large=1.5, Extra Large=2.0
+    static constexpr float GUI_SCALE_VALUES[] = {0.75f, 1.0f, 1.5f, 2.0f};
+    static constexpr int GUI_SCALE_COUNT = 4;
     MenuCheckbox vsyncCheckbox;
     MenuCheckbox fullscreenCheckbox;
     MenuDropdown aaDropdown;
@@ -59,6 +65,7 @@ public:
     MenuDropdown aoQualityDropdown;
     MenuCheckbox bloomCheckbox;
     MenuSlider bloomIntensitySlider;
+    MenuSlider brightnessSlider;
     MenuCheckbox motionBlurCheckbox;
     MenuDropdown upscaleDropdown;
     MenuCheckbox waterAnimationCheckbox;
@@ -109,10 +116,49 @@ public:
     // Delta time for text input rendering
     float currentDeltaTime = 0.016f;
 
+    // Tooltip system
+    std::string currentTooltip;
+    float tooltipMouseX = 0.0f;
+    float tooltipMouseY = 0.0f;
+
+    // VRAM monitoring
+    int totalVRAM_MB = 0;
+    int availableVRAM_MB = 0;
+    int usedVRAM_MB = 0;
+
     void init(MenuUIRenderer* uiRenderer) {
         ui = uiRenderer;
         loadFromConfig();
         setupUI();
+        queryVRAM();  // Initial VRAM query
+    }
+
+    // Query current VRAM usage from GPU
+    void queryVRAM() {
+        // NVIDIA: GL_NVX_gpu_memory_info
+        GLint totalKB = 0, availKB = 0;
+        glGetIntegerv(0x9048, &totalKB);  // GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX
+        if (totalKB > 0) {
+            totalVRAM_MB = totalKB / 1024;
+            glGetIntegerv(0x9049, &availKB);  // GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX
+            availableVRAM_MB = availKB / 1024;
+            usedVRAM_MB = totalVRAM_MB - availableVRAM_MB;
+        } else {
+            // AMD: GL_ATI_meminfo (VBO free memory)
+            GLint vboFreeKB[4] = {0};
+            glGetIntegerv(0x87FB, vboFreeKB);  // GL_VBO_FREE_MEMORY_ATI
+            if (vboFreeKB[0] > 0) {
+                availableVRAM_MB = vboFreeKB[0] / 1024;
+                // AMD doesn't provide total, use hardware detection
+                totalVRAM_MB = g_hardware.vramMB;
+                usedVRAM_MB = totalVRAM_MB - availableVRAM_MB;
+            } else {
+                // Fallback to hardware detection
+                totalVRAM_MB = g_hardware.vramMB;
+                availableVRAM_MB = 0;
+                usedVRAM_MB = 0;
+            }
+        }
     }
 
     void loadFromConfig() {
@@ -200,23 +246,36 @@ public:
             [](float val) { g_config.fov = static_cast<int>(val); }
         };
 
+        // Find current GUI scale index
+        int guiScaleIndex = 1;  // Default to "Normal" (1.0)
+        for (int i = 0; i < GUI_SCALE_COUNT; i++) {
+            if (std::abs(g_config.guiScale - GUI_SCALE_VALUES[i]) < 0.1f) {
+                guiScaleIndex = i;
+                break;
+            }
+        }
+
+        guiScaleDropdown = {
+            col2X, contentY + rowSpacing + 5, sliderWidth, 26, "GUI Scale",
+            {"Small (75%)", "Normal (100%)", "Large (150%)", "Extra Large (200%)"},
+            guiScaleIndex,
+            [this](int idx) {
+                if (idx >= 0 && idx < GUI_SCALE_COUNT) {
+                    g_config.guiScale = GUI_SCALE_VALUES[idx];
+                }
+            }
+        };
+        allDropdowns.push_back(&guiScaleDropdown);
+
         vsyncCheckbox = {
-            col2X, contentY + rowSpacing, 24, "VSync", g_config.vsync,
+            col1X, contentY + rowSpacing * 2, 24, "VSync", g_config.vsync,
             [](bool val) { g_config.vsync = val; }
         };
 
         fullscreenCheckbox = {
-            col1X, contentY + rowSpacing * 2, 24, "Fullscreen", g_config.fullscreen,
+            col2X, contentY + rowSpacing * 2, 24, "Fullscreen", g_config.fullscreen,
             [](bool val) { g_config.fullscreen = val; }
         };
-
-        aaDropdown = {
-            col2X, contentY + rowSpacing * 2 - 5, dropdownWidth, 32, "Anti-Aliasing",
-            {"Off", "FXAA", "MSAA 2x", "MSAA 4x", "MSAA 8x"},
-            static_cast<int>(g_config.antiAliasing),
-            [](int idx) { g_config.antiAliasing = static_cast<AntiAliasMode>(idx); }
-        };
-        allDropdowns.push_back(&aaDropdown);
 
         textureQualityDropdown = {
             col1X, contentY + rowSpacing * 3 - 5, dropdownWidth, 32, "Texture Quality",
@@ -226,6 +285,14 @@ public:
         };
         allDropdowns.push_back(&textureQualityDropdown);
 
+        aaDropdown = {
+            col2X, contentY + rowSpacing * 3 - 5, dropdownWidth, 32, "Anti-Aliasing",
+            {"Off", "FXAA", "MSAA 2x", "MSAA 4x", "MSAA 8x"},
+            static_cast<int>(g_config.antiAliasing),
+            [](int idx) { g_config.antiAliasing = static_cast<AntiAliasMode>(idx); }
+        };
+        allDropdowns.push_back(&aaDropdown);
+
         // Map dropdown index to anisotropic values: 0=1, 1=2, 2=4, 3=8, 4=16
         int anisoIndex = 0;
         if (g_config.anisotropicFiltering >= 16) anisoIndex = 4;
@@ -234,7 +301,7 @@ public:
         else if (g_config.anisotropicFiltering >= 2) anisoIndex = 1;
 
         anisotropicDropdown = {
-            col2X, contentY + rowSpacing * 3 - 5, dropdownWidth, 32, "Anisotropic Filter",
+            col1X, contentY + rowSpacing * 4 - 5, dropdownWidth, 32, "Anisotropic Filter",
             {"Off", "2x", "4x", "8x", "16x"},
             anisoIndex,
             [](int idx) {
@@ -278,11 +345,12 @@ public:
         };
 
         upscaleDropdown = {
-            col2X, contentY + rowSpacing * 2 - 5, dropdownWidth, 32, "FSR Upscaling",
+            col2X, contentY + rowSpacing * 2 - 5, 210.0f, 32, "FSR Upscaling",  // Wider to fit options
             {"Native (1.0x)", "Quality (1.5x)", "Balanced (1.7x)", "Performance (2.0x)"},
             static_cast<int>(g_config.upscaleMode),
             [](int idx) { g_config.upscaleMode = static_cast<UpscaleMode>(idx); }
         };
+        upscaleDropdown.tooltip = "AMD FidelityFX upscaling - render at lower res for better FPS";
         allDropdowns.push_back(&upscaleDropdown);
 
         waterAnimationCheckbox = {
@@ -307,6 +375,12 @@ public:
             col2X, contentY + rowSpacing * 4, 24, "Volumetric [Experimental]",
             g_config.cloudStyle == CloudStyle::VOLUMETRIC,
             [](bool val) { g_config.cloudStyle = val ? CloudStyle::VOLUMETRIC : CloudStyle::SIMPLE; }
+        };
+
+        brightnessSlider = {
+            col1X, contentY + rowSpacing * 5 + 5, sliderWidth + 80, 26, "Brightness",
+            50.0f, 150.0f, g_config.brightness * 100.0f,
+            [](float val) { g_config.brightness = val / 100.0f; }
         };
 
         // === PERFORMANCE TAB ===
@@ -477,6 +551,13 @@ public:
         graphicsPresetDropdown.selectedIndex = static_cast<int>(g_config.graphicsPreset);
         renderDistanceSlider.value = static_cast<float>(g_config.renderDistance);
         fovSlider.value = static_cast<float>(g_config.fov);
+        // Find GUI scale index from current value
+        for (int i = 0; i < GUI_SCALE_COUNT; i++) {
+            if (std::abs(g_config.guiScale - GUI_SCALE_VALUES[i]) < 0.1f) {
+                guiScaleDropdown.selectedIndex = i;
+                break;
+            }
+        }
         vsyncCheckbox.checked = g_config.vsync;
         fullscreenCheckbox.checked = g_config.fullscreen;
         aaDropdown.selectedIndex = static_cast<int>(g_config.antiAliasing);
@@ -501,6 +582,7 @@ public:
         cloudsCheckbox.checked = g_config.enableClouds;
         cloudQualityDropdown.selectedIndex = static_cast<int>(g_config.cloudQuality);
         volumetricCloudsCheckbox.checked = (g_config.cloudStyle == CloudStyle::VOLUMETRIC);
+        brightnessSlider.value = g_config.brightness * 100.0f;
 
         // Performance
         hiZCheckbox.checked = g_config.enableHiZCulling;
@@ -517,6 +599,55 @@ public:
         titleSeedInput.text = g_config.titleScreen.customSeed;
         titleRenderDistSlider.value = static_cast<float>(g_config.titleScreen.renderDistance);
         loadSavedWorldsList();
+
+        // Setup tooltips for all settings
+        setupTooltips();
+    }
+
+    void setupTooltips() {
+        // === GRAPHICS TAB ===
+        graphicsPresetDropdown.tooltip = "Quick preset to adjust all graphics settings at once";
+        renderDistanceSlider.tooltip = "How far you can see - higher uses more VRAM";
+        fovSlider.tooltip = "Field of view angle - higher shows more but may distort edges";
+        guiScaleDropdown.tooltip = "Size of UI elements - adjust for your screen size and preference";
+        vsyncCheckbox.tooltip = "Sync to monitor refresh rate - prevents tearing but adds input lag";
+        fullscreenCheckbox.tooltip = "Run in fullscreen mode for better performance";
+        aaDropdown.tooltip = "Smooths jagged edges - MSAA is higher quality, FXAA is faster";
+        textureQualityDropdown.tooltip = "Texture resolution - higher uses more VRAM";
+        anisotropicDropdown.tooltip = "Improves texture quality at angles - minimal performance cost";
+
+        // === EFFECTS TAB ===
+        shadowQualityDropdown.tooltip = "Shadow map resolution and cascade count";
+        aoQualityDropdown.tooltip = "Screen-space ambient occlusion - adds depth to corners";
+        bloomCheckbox.tooltip = "Glow effect around bright objects";
+        bloomIntensitySlider.tooltip = "How strong the bloom glow effect is";
+        motionBlurCheckbox.tooltip = "Blur effect when moving camera quickly";
+        // upscaleDropdown tooltip already set inline
+        waterAnimationCheckbox.tooltip = "Animated water surface waves";
+        cloudsCheckbox.tooltip = "Enable cloud rendering";
+        cloudQualityDropdown.tooltip = "Ray-march steps for volumetric clouds";
+        volumetricCloudsCheckbox.tooltip = "Full 3D volumetric clouds - experimental, may impact FPS";
+        brightnessSlider.tooltip = "Adjust overall screen brightness (50-150%)";
+
+        // === PERFORMANCE TAB ===
+        hiZCheckbox.tooltip = "Hierarchical-Z occlusion culling - skips hidden geometry";
+        batchedRenderingCheckbox.tooltip = "Batch draw calls for better CPU efficiency";
+        chunkSpeedSlider.tooltip = "Max chunks to generate per frame - higher loads faster";
+        meshSpeedSlider.tooltip = "Max meshes to upload per frame - higher loads faster";
+
+        // === CONTROLS TAB ===
+        sensitivitySlider.tooltip = "Mouse look sensitivity";
+        invertYCheckbox.tooltip = "Invert vertical mouse axis";
+
+        // === AUDIO TAB ===
+        masterVolumeSlider.tooltip = "Overall game volume";
+        musicVolumeSlider.tooltip = "Background music volume";
+        sfxVolumeSlider.tooltip = "Sound effects volume";
+
+        // === TITLE SCREEN TAB ===
+        titleSourceDropdown.tooltip = "What world to show on the title screen background";
+        titleSeedInput.tooltip = "World generation seed for title screen";
+        titleRenderDistSlider.tooltip = "Render distance for title screen world";
     }
 
     void update(double mouseX, double mouseY, bool mousePressed, float deltaTime = 0.016f) {
@@ -552,6 +683,7 @@ public:
                 input.handleDropdown(graphicsPresetDropdown, allDropdowns);
                 input.handleSlider(renderDistanceSlider);
                 input.handleSlider(fovSlider);
+                input.handleDropdown(guiScaleDropdown, allDropdowns);
                 input.handleCheckbox(vsyncCheckbox);
                 input.handleCheckbox(fullscreenCheckbox);
                 input.handleDropdown(aaDropdown, allDropdowns);
@@ -570,6 +702,7 @@ public:
                 input.handleCheckbox(cloudsCheckbox);
                 input.handleDropdown(cloudQualityDropdown, allDropdowns);
                 input.handleCheckbox(volumetricCloudsCheckbox);
+                input.handleSlider(brightnessSlider);
                 break;
 
             case SettingsTab::PERFORMANCE:
@@ -600,6 +733,91 @@ public:
                     input.handleDropdown(titleWorldDropdown, allDropdowns);
                 }
                 input.handleSlider(titleRenderDistSlider);
+                break;
+        }
+
+        // Track tooltip for hovered widget
+        updateTooltip(static_cast<float>(mouseX), static_cast<float>(mouseY));
+
+        // Periodically update VRAM usage
+        static float vramUpdateTimer = 0.0f;
+        vramUpdateTimer += deltaTime;
+        if (vramUpdateTimer > 2.0f) {  // Update every 2 seconds
+            queryVRAM();
+            vramUpdateTimer = 0.0f;
+        }
+    }
+
+    void updateTooltip(float mx, float my) {
+        currentTooltip.clear();
+        tooltipMouseX = mx;
+        tooltipMouseY = my;
+
+        // Check widgets based on current tab
+        auto checkSlider = [&](MenuSlider& s) {
+            if (s.visible && s.contains(mx, my)) { currentTooltip = s.tooltip; return true; }
+            return false;
+        };
+        auto checkCheckbox = [&](MenuCheckbox& c) {
+            // Expand hitbox to include label
+            if (c.visible && mx >= c.x && mx <= c.x + c.size + 150 && my >= c.y && my <= c.y + c.size) {
+                currentTooltip = c.tooltip; return true;
+            }
+            return false;
+        };
+        auto checkDropdown = [&](MenuDropdown& d) {
+            if (d.visible && d.contains(mx, my)) { currentTooltip = d.tooltip; return true; }
+            return false;
+        };
+
+        switch (currentTab) {
+            case SettingsTab::GRAPHICS:
+                if (checkDropdown(graphicsPresetDropdown)) return;
+                if (checkSlider(renderDistanceSlider)) return;
+                if (checkSlider(fovSlider)) return;
+                if (checkDropdown(guiScaleDropdown)) return;
+                if (checkCheckbox(vsyncCheckbox)) return;
+                if (checkCheckbox(fullscreenCheckbox)) return;
+                if (checkDropdown(aaDropdown)) return;
+                if (checkDropdown(textureQualityDropdown)) return;
+                if (checkDropdown(anisotropicDropdown)) return;
+                break;
+
+            case SettingsTab::EFFECTS:
+                if (checkDropdown(shadowQualityDropdown)) return;
+                if (checkDropdown(aoQualityDropdown)) return;
+                if (checkCheckbox(bloomCheckbox)) return;
+                if (checkSlider(bloomIntensitySlider)) return;
+                if (checkCheckbox(motionBlurCheckbox)) return;
+                if (checkDropdown(upscaleDropdown)) return;
+                if (checkCheckbox(waterAnimationCheckbox)) return;
+                if (checkCheckbox(cloudsCheckbox)) return;
+                if (checkDropdown(cloudQualityDropdown)) return;
+                if (checkCheckbox(volumetricCloudsCheckbox)) return;
+                if (checkSlider(brightnessSlider)) return;
+                break;
+
+            case SettingsTab::PERFORMANCE:
+                if (checkCheckbox(hiZCheckbox)) return;
+                if (checkCheckbox(batchedRenderingCheckbox)) return;
+                if (checkSlider(chunkSpeedSlider)) return;
+                if (checkSlider(meshSpeedSlider)) return;
+                break;
+
+            case SettingsTab::CONTROLS:
+                if (checkSlider(sensitivitySlider)) return;
+                if (checkCheckbox(invertYCheckbox)) return;
+                break;
+
+            case SettingsTab::AUDIO:
+                if (checkSlider(masterVolumeSlider)) return;
+                if (checkSlider(musicVolumeSlider)) return;
+                if (checkSlider(sfxVolumeSlider)) return;
+                break;
+
+            case SettingsTab::TITLE_SCREEN:
+                if (checkDropdown(titleSourceDropdown)) return;
+                if (checkSlider(titleRenderDistSlider)) return;
                 break;
         }
     }
@@ -645,13 +863,46 @@ public:
                 graphicsPresetDropdown.render(*ui);
                 renderDistanceSlider.render(*ui);
                 fovSlider.render(*ui);
+                guiScaleDropdown.render(*ui);
                 vsyncCheckbox.render(*ui);
                 fullscreenCheckbox.render(*ui);
                 aaDropdown.render(*ui);
                 textureQualityDropdown.render(*ui);
                 anisotropicDropdown.render(*ui);
+
+                // VRAM Usage Bar at bottom of graphics tab
+                {
+                    float vramBarX = panelX + 30;
+                    float vramBarY = panelY + panelHeight - 85;
+                    float vramBarWidth = panelWidth - 60;
+                    float vramBarHeight = 16;
+
+                    if (totalVRAM_MB > 0 && usedVRAM_MB > 0) {
+                        float vramUsage = static_cast<float>(usedVRAM_MB) / static_cast<float>(totalVRAM_MB);
+
+                        // Color based on usage: green < 60%, yellow 60-80%, red > 80%
+                        glm::vec4 vramColor;
+                        if (vramUsage < 0.6f) {
+                            vramColor = MenuColors::SUCCESS;  // Green
+                        } else if (vramUsage < 0.8f) {
+                            vramColor = glm::vec4(0.9f, 0.75f, 0.2f, 1.0f);  // Yellow/Orange
+                        } else {
+                            vramColor = MenuColors::ERROR_COLOR;  // Red
+                        }
+
+                        std::string vramText = std::to_string(usedVRAM_MB) + " / " + std::to_string(totalVRAM_MB) + " MB";
+                        ui->drawProgressBar(vramBarX, vramBarY, vramBarWidth, vramBarHeight,
+                                           vramUsage, vramColor, "VRAM Usage", vramText);
+                    } else if (totalVRAM_MB > 0) {
+                        // Have total but not current usage
+                        ui->drawText("VRAM: " + std::to_string(totalVRAM_MB) + " MB (usage unavailable)",
+                                    vramBarX, vramBarY, MenuColors::TEXT_DIM, 0.9f);
+                    }
+                }
+
                 // Render dropdown options last (on top)
                 graphicsPresetDropdown.renderOptions(*ui);
+                guiScaleDropdown.renderOptions(*ui);
                 aaDropdown.renderOptions(*ui);
                 textureQualityDropdown.renderOptions(*ui);
                 anisotropicDropdown.renderOptions(*ui);
@@ -668,6 +919,7 @@ public:
                 cloudsCheckbox.render(*ui);
                 cloudQualityDropdown.render(*ui);
                 volumetricCloudsCheckbox.render(*ui);
+                brightnessSlider.render(*ui);
                 // Render dropdown options last
                 shadowQualityDropdown.renderOptions(*ui);
                 aoQualityDropdown.renderOptions(*ui);
@@ -760,6 +1012,11 @@ public:
                         glm::vec4(0.2f, 1.0f, 0.3f, alpha * 0.8f));
             ui->drawRect(textX - lineWidth/2 + 20, lineY + 10, lineWidth - 40, 2.0f,
                         glm::vec4(0.2f, 1.0f, 0.3f, alpha * 0.5f));
+        }
+
+        // Render tooltip last (on top of everything)
+        if (!currentTooltip.empty()) {
+            ui->drawTooltip(currentTooltip, tooltipMouseX, tooltipMouseY);
         }
     }
 

@@ -30,6 +30,7 @@ public:
 
     void setLighting(const LightingParams& lighting) override;
     void setFog(const FogParams& fog) override;
+    void setTextureAtlas(uint32_t textureID) override { m_textureAtlas = textureID; }
 
     const RenderStats& getStats() const override { return m_stats; }
 
@@ -55,6 +56,7 @@ private:
     RenderConfig m_config;
     LightingParams m_lighting;
     FogParams m_fog;
+    uint32_t m_textureAtlas = 0;
 
     // Render passes
     std::unique_ptr<ShadowPass> m_shadowPass;
@@ -112,6 +114,7 @@ public:
 
     void setLighting(const LightingParams& lighting) override;
     void setFog(const FogParams& fog) override;
+    void setTextureAtlas(uint32_t textureID) override { (void)textureID; }
 
     const RenderStats& getStats() const override { return m_stats; }
 

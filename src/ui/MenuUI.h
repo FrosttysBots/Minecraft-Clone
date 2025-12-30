@@ -37,7 +37,7 @@ namespace MenuColors {
     const glm::vec4 SLIDER_FILL  = {0.75f, 0.55f, 0.20f, 1.0f};
     const glm::vec4 INPUT_BG     = {0.12f, 0.12f, 0.15f, 1.0f};
     const glm::vec4 INPUT_FOCUS  = {0.15f, 0.15f, 0.18f, 1.0f};
-    const glm::vec4 ERROR        = {0.85f, 0.25f, 0.25f, 1.0f};
+    const glm::vec4 ERROR_COLOR  = {0.85f, 0.25f, 0.25f, 1.0f};
     const glm::vec4 SUCCESS      = {0.25f, 0.75f, 0.35f, 1.0f};
 }
 
@@ -335,6 +335,65 @@ public:
         drawText(text, x + width - textWidth - 10, y, color, scale);
     }
 
+    // Draw a tooltip box with text - positions itself to stay on screen
+    void drawTooltip(const std::string& text, float mouseX, float mouseY) {
+        if (text.empty()) return;
+
+        float padding = 10.0f;
+        float textScale = 0.9f;
+        float textWidth = getTextWidth(text, textScale);
+        float boxWidth = textWidth + padding * 2;
+        float boxHeight = 28.0f;
+
+        // Position tooltip to the right of cursor, or left if it would go off screen
+        float tooltipX = mouseX + 15;
+        float tooltipY = mouseY - boxHeight - 5;
+
+        // Keep tooltip on screen
+        if (tooltipX + boxWidth > windowWidth - 10) {
+            tooltipX = mouseX - boxWidth - 10;
+        }
+        if (tooltipY < 10) {
+            tooltipY = mouseY + 25;
+        }
+
+        // Draw background with slight transparency
+        glm::vec4 bgColor = {0.05f, 0.05f, 0.08f, 0.95f};
+        glm::vec4 borderColor = MenuColors::ACCENT_DIM;
+
+        drawRect(tooltipX, tooltipY, boxWidth, boxHeight, bgColor);
+        drawRectOutline(tooltipX, tooltipY, boxWidth, boxHeight, borderColor, 1.0f);
+        drawText(text, tooltipX + padding, tooltipY + 8, MenuColors::TEXT, textScale);
+    }
+
+    // Draw a progress bar (used for VRAM display)
+    void drawProgressBar(float x, float y, float width, float height,
+                         float progress, const glm::vec4& fillColor,
+                         const std::string& label = "", const std::string& valueText = "") {
+        // Background
+        drawRect(x, y, width, height, MenuColors::SLIDER_BG);
+
+        // Fill
+        float fillWidth = width * std::clamp(progress, 0.0f, 1.0f);
+        if (fillWidth > 0) {
+            drawRect(x, y, fillWidth, height, fillColor);
+        }
+
+        // Border
+        drawRectOutline(x, y, width, height, MenuColors::DIVIDER, 1.0f);
+
+        // Label on left
+        if (!label.empty()) {
+            drawText(label, x, y - 22, MenuColors::TEXT, 0.9f);
+        }
+
+        // Value on right
+        if (!valueText.empty()) {
+            float textWidth = getTextWidth(valueText, 0.85f);
+            drawText(valueText, x + width - textWidth, y - 22, MenuColors::TEXT_DIM, 0.85f);
+        }
+    }
+
     void cleanup() {
         if (shaderProgram) glDeleteProgram(shaderProgram);
         if (quadVAO) glDeleteVertexArrays(1, &quadVAO);
@@ -372,6 +431,7 @@ struct MenuButton {
     bool visible = true;
     bool enabled = true;
     float textScale = 1.2f;
+    std::string tooltip;  // Tooltip text shown on hover
 
     bool contains(float mx, float my) const {
         return visible && enabled && mx >= x && mx <= x + width && my >= y && my <= y + height;
@@ -415,6 +475,8 @@ struct MenuSlider {
     bool dragging = false;
     bool visible = true;
     bool showIntValue = true;
+    bool hovered = false;
+    std::string tooltip;  // Tooltip text shown on hover
 
     bool contains(float mx, float my) const {
         return visible && mx >= x && mx <= x + width && my >= y && my <= y + height;
@@ -464,6 +526,7 @@ struct MenuCheckbox {
     std::function<void(bool)> onChange;
     bool hovered = false;
     bool visible = true;
+    std::string tooltip;  // Tooltip text shown on hover
 
     bool contains(float mx, float my) const {
         return visible && mx >= x && mx <= x + size && my >= y && my <= y + size;
@@ -495,6 +558,7 @@ struct MenuDropdown {
     bool hovered = false;
     int hoveredOption = -1;
     bool visible = true;
+    std::string tooltip;  // Tooltip text shown on hover
 
     bool contains(float mx, float my) const {
         return visible && mx >= x && mx <= x + width && my >= y && my <= y + height;
@@ -555,6 +619,7 @@ struct MenuTextInput {
     size_t maxLength = 64;
     float cursorBlinkTime = 0.0f;
     bool showCursor = true;
+    std::string tooltip;  // Tooltip text shown on hover
 
     bool contains(float mx, float my) const {
         return visible && mx >= x && mx <= x + width && my >= y && my <= y + height;

@@ -49,6 +49,7 @@ public:
     struct MeshResult {
         glm::ivec2 position;
         glm::vec3 worldOffset;
+        bool isPriority = false;  // True for player-modified chunks (bypass processing limits)
 
         // Per sub-chunk mesh data with face-orientation buckets for backface culling
         struct SubChunkMeshData {
@@ -80,11 +81,20 @@ public:
     struct MeshRequest {
         glm::ivec2 position;
         Chunk* chunk;  // Pointer to existing chunk data
+        int distanceSquared = 0;  // Distance from player (for priority ordering)
+        bool isPriority = false;  // True for player-modified chunks (bypass processing limits)
         // Block getters for neighbor access
         std::function<BlockType(int, int, int)> getWorldBlock;
         std::function<BlockType(int, int, int)> getWaterBlock;
         std::function<BlockType(int, int, int)> getSafeBlock;
         std::function<uint8_t(int, int, int)> getLightLevel;
+
+        // Comparator for priority queue (priority chunks first, then lower distance)
+        bool operator>(const MeshRequest& other) const {
+            // Priority chunks always come first
+            if (isPriority != other.isPriority) return !isPriority;
+            return distanceSquared > other.distanceSquared;
+        }
     };
 
 private:
@@ -107,8 +117,8 @@ private:
     std::unordered_set<glm::ivec2> inProgress;
     std::mutex inProgressMutex;
 
-    // Mesh generation queues
-    std::queue<MeshRequest> meshPendingQueue;
+    // Mesh generation queues - priority queue orders by distance (closest first)
+    std::priority_queue<MeshRequest, std::vector<MeshRequest>, std::greater<MeshRequest>> meshPendingQueue;
     std::mutex meshPendingMutex;
     std::condition_variable meshPendingCondition;
 
@@ -256,10 +266,10 @@ public:
             std::swap(completedQueue, empty);
         }
 
-        // Clear pending mesh queue
+        // Clear pending mesh queue (priority_queue)
         {
             std::lock_guard<std::mutex> lock(meshPendingMutex);
-            std::queue<MeshRequest> empty;
+            std::priority_queue<MeshRequest, std::vector<MeshRequest>, std::greater<MeshRequest>> empty;
             std::swap(meshPendingQueue, empty);
         }
 
@@ -483,13 +493,16 @@ private:
                     continue;
                 }
 
-                request = std::move(meshPendingQueue.front());
+                // priority_queue uses top() instead of front()
+                // Copy instead of move since top() returns const reference
+                request = meshPendingQueue.top();
                 meshPendingQueue.pop();
             }
 
             // Generate mesh vertex data
             MeshResult result;
             result.position = request.position;
+            result.isPriority = request.isPriority;  // Copy priority flag
             result.worldOffset = glm::vec3(
                 request.position.x * CHUNK_SIZE_X,
                 0.0f,
@@ -514,7 +527,9 @@ private:
         }
     }
 
+public:
     // Generate mesh vertex data for all sub-chunks (CPU-only, no GPU upload)
+    // Made public for immediate synchronous mesh rebuilds from World::setBlock
     void generateMeshData(MeshResult& result, const Chunk& chunk,
                          const std::function<BlockType(int, int, int)>& /*getWorldBlock*/,
                          const std::function<BlockType(int, int, int)>& /*getWaterBlock*/,
@@ -569,7 +584,9 @@ private:
                                                    baseX, baseZ, yStart, yEnd);
 
                 // Expand to 6 face-orientation buckets for efficient backface culling
-                expandFaceBucketsToVertices(binaryResult, subData.faceBucketVertices);
+                // Pass biome data for grass/foliage tinting
+                expandFaceBucketsToVertices(binaryResult, subData.faceBucketVertices,
+                                           chunk.biomeTemperature.data(), chunk.biomeHumidity.data());
 
                 // OPTIMIZATION: Apply meshoptimizer vertex cache optimization to each bucket
                 // This reorders vertices for better GPU cache utilization (+10-20% efficiency)
@@ -1050,63 +1067,68 @@ private:
 
                     glm::vec3 normal;
 
+                    // Small inward offset to prevent Z-fighting with adjacent solid blocks
+                    constexpr float eps = 0.005f;
+                    constexpr float e0 = eps;        // Offset from 0
+                    constexpr float e1 = 1.0f - eps; // Offset from 1
+
                     if (waterAbove) {
                         // Submerged - only render sides, full height
                         float topY = 1.0f;
 
-                        // Front (+Z)
+                        // Front (+Z) - offset z inward from 1 to e1
                         if (shouldRenderSide(wx, wz + 1)) {
                             normal = glm::vec3(0, 0, 1);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        0,0,1, 1,0,1, 1,topY,1, 0,topY,1);
+                                        0,0,e1, 1,0,e1, 1,topY,e1, 0,topY,e1);
                         }
-                        // Back (-Z)
+                        // Back (-Z) - offset z inward from 0 to e0
                         if (shouldRenderSide(wx, wz - 1)) {
                             normal = glm::vec3(0, 0, -1);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        1,0,0, 0,0,0, 0,topY,0, 1,topY,0);
+                                        1,0,e0, 0,0,e0, 0,topY,e0, 1,topY,e0);
                         }
-                        // Left (-X)
+                        // Left (-X) - offset x inward from 0 to e0
                         if (shouldRenderSide(wx - 1, wz)) {
                             normal = glm::vec3(-1, 0, 0);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        0,0,0, 0,0,1, 0,topY,1, 0,topY,0);
+                                        e0,0,0, e0,0,1, e0,topY,1, e0,topY,0);
                         }
-                        // Right (+X)
+                        // Right (+X) - offset x inward from 1 to e1
                         if (shouldRenderSide(wx + 1, wz)) {
                             normal = glm::vec3(1, 0, 0);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        1,0,1, 1,0,0, 1,topY,0, 1,topY,1);
+                                        e1,0,1, e1,0,0, e1,topY,0, e1,topY,1);
                         }
                     } else {
                         // Surface water - render top with slight lowering + sides
                         float h = 0.875f;  // Slightly below full block
 
-                        // Top face
+                        // Top face (no offset needed - not coplanar with solid blocks)
                         normal = glm::vec3(0, 1, 0);
                         addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
                                     0,h,1, 1,h,1, 1,h,0, 0,h,0);
 
-                        // Side faces
+                        // Side faces with inward offset to prevent Z-fighting
                         if (shouldRenderSide(wx, wz + 1)) {
                             normal = glm::vec3(0, 0, 1);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        0,0,1, 1,0,1, 1,h,1, 0,h,1);
+                                        0,0,e1, 1,0,e1, 1,h,e1, 0,h,e1);
                         }
                         if (shouldRenderSide(wx, wz - 1)) {
                             normal = glm::vec3(0, 0, -1);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        1,0,0, 0,0,0, 0,h,0, 1,h,0);
+                                        1,0,e0, 0,0,e0, 0,h,e0, 1,h,e0);
                         }
                         if (shouldRenderSide(wx - 1, wz)) {
                             normal = glm::vec3(-1, 0, 0);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        0,0,0, 0,0,1, 0,h,1, 0,h,0);
+                                        e0,0,0, e0,0,1, e0,h,1, e0,h,0);
                         }
                         if (shouldRenderSide(wx + 1, wz)) {
                             normal = glm::vec3(1, 0, 0);
                             addWaterQuad(vertices, pos, normal, ao, light, texSlotBase,
-                                        1,0,1, 1,0,0, 1,h,0, 1,h,1);
+                                        e1,0,1, e1,0,0, e1,h,0, e1,h,1);
                         }
 
                         // Bottom face (if no solid block below)

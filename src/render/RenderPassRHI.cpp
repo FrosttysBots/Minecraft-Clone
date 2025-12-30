@@ -432,16 +432,54 @@ void GBufferPassRHI::beginPass(RHI::RHICommandBuffer* cmd, RenderContext& contex
                 glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
 
                 // Set view and projection matrices
-                glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE,
-                                   glm::value_ptr(context.camera->view));
-                glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE,
-                                   glm::value_ptr(context.camera->projection));
+                GLint viewLoc = glGetUniformLocation(shaderProgram, "view");
+                GLint projLoc = glGetUniformLocation(shaderProgram, "projection");
+                glUniformMatrix4fv(viewLoc, 1, GL_FALSE, glm::value_ptr(context.camera->view));
+                glUniformMatrix4fv(projLoc, 1, GL_FALSE, glm::value_ptr(context.camera->projection));
+
+                // DEBUG: Log matrix info on first frame
+                static bool firstMatrixLog = true;
+                if (firstMatrixLog) {
+                    std::cout << "[GBufferPassRHI] Shader program=" << shaderProgram
+                              << ", viewLoc=" << viewLoc << ", projLoc=" << projLoc << std::endl;
+                    std::cout << "[GBufferPassRHI] Camera pos: "
+                              << context.camera->position.x << ", "
+                              << context.camera->position.y << ", "
+                              << context.camera->position.z << std::endl;
+                    std::cout << "[GBufferPassRHI] View[0][0]=" << context.camera->view[0][0]
+                              << ", View[3][3]=" << context.camera->view[3][3] << std::endl;
+                    std::cout << "[GBufferPassRHI] Proj[0][0]=" << context.camera->projection[0][0]
+                              << ", Proj[1][1]=" << context.camera->projection[1][1] << std::endl;
+                    firstMatrixLog = false;
+                }
 
                 // Bind texture atlas to texture unit 0
                 if (context.textureAtlas != 0) {
                     glActiveTexture(GL_TEXTURE0);
                     glBindTexture(GL_TEXTURE_2D, context.textureAtlas);
                     // Note: Shader uses layout(binding = 0), so no glUniform1i needed
+
+                    // DEBUG: Verify texture binding (first frame only)
+                    static bool firstTexBind = true;
+                    if (firstTexBind) {
+                        GLint boundTex = 0;
+                        glGetIntegerv(GL_TEXTURE_BINDING_2D, &boundTex);
+                        std::cout << "[GBufferPassRHI] Bound texture atlas ID=" << context.textureAtlas
+                                  << ", verified bound=" << boundTex << std::endl;
+
+                        // Check texture dimensions
+                        GLint texWidth = 0, texHeight = 0;
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &texWidth);
+                        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &texHeight);
+                        std::cout << "[GBufferPassRHI] Texture atlas size: " << texWidth << "x" << texHeight << std::endl;
+                        firstTexBind = false;
+                    }
+                } else {
+                    static bool warnedNoAtlas = false;
+                    if (!warnedNoAtlas) {
+                        std::cerr << "[GBufferPassRHI] WARNING: No texture atlas bound! context.textureAtlas=0" << std::endl;
+                        warnedNoAtlas = true;
+                    }
                 }
             }
         }
@@ -989,9 +1027,9 @@ void CompositePassRHI::resize(uint32_t width, uint32_t height) {
 void CompositePassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
     if (!m_enabled || !m_framebuffer || !m_renderPass) return;
 
-    // Begin render pass
+    // Begin render pass - clear to sky blue for visibility test
     std::vector<RHI::ClearValue> clearValues;
-    clearValues.push_back(RHI::ClearValue::Color(0.0f, 0.0f, 0.0f, 1.0f));
+    clearValues.push_back(RHI::ClearValue::Color(0.4f, 0.6f, 0.9f, 1.0f));  // Sky blue
     clearValues.push_back(RHI::ClearValue::DepthStencil(1.0f, 0));
 
     cmd->beginRenderPass(m_renderPass.get(), m_framebuffer.get(), clearValues);
@@ -1331,6 +1369,11 @@ void SkyPassRHI::execute(RHI::RHICommandBuffer* cmd, RenderContext& context) {
             memcpy(mapped, &uniforms, sizeof(uniforms));
             m_skyUBO->unmap();
         }
+    }
+
+    // Skip sky pass for Vulkan - composite pass clears to sky blue instead
+    if (m_device->getBackend() == RHI::Backend::Vulkan) {
+        return;  // TODO: Implement proper Vulkan sky rendering
     }
 
     // Bind sky pipeline (should have depth write disabled, LEQUAL compare)

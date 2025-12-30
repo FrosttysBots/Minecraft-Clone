@@ -9,13 +9,17 @@
 #include "core/Raycast.h"
 #include "core/Config.h"
 #include "world/World.h"
+#include "world/DroppedItem.h"
 #include "world/WorldPresets.h"
 #include "render/Crosshair.h"
 #include "render/BlockHighlight.h"
+#include "render/MiningCrackOverlay.h"
 #include "render/ChunkBorderRenderer.h"
 #include "input/KeybindManager.h"
 #include "ui/ControlsScreen.h"
 #include "render/TextureAtlas.h"
+#include "render/TexturePackLoader.h"
+#include "render/BiomeColormap.h"
 #include "render/VertexPool.h"
 #include "ui/MenuUI.h"
 #include "ui/MainMenu.h"
@@ -24,8 +28,15 @@
 #include "ui/PanoramaRenderer.h"
 #include "ui/PauseMenu.h"
 #include "ui/SettingsMenu.h"
+#include "ui/TexturePackScreen.h"
 #include "ui/LoadingScreen3D.h"
 #include "ui/DebugOverlay.h"
+#include "ui/SurvivalHUD.h"
+#include "ui/InventoryUI.h"
+#include "ui/CraftingTableUI.h"
+#include "ui/JEIPanel.h"
+#include "render/ItemAtlas.h"
+#include "core/CraftingRecipes.h"
 #include "benchmark/BenchmarkSystem.h"
 #include "world/WorldSaveLoad.h"
 #include "render/Screenshot.h"
@@ -60,6 +71,17 @@ int WINDOW_WIDTH = 1280;
 int WINDOW_HEIGHT = 720;
 const char* WINDOW_TITLE = "Voxel Engine";
 
+// Window-to-framebuffer scaling (for high-DPI displays)
+// GLFW mouse coordinates are in window space, but UI uses framebuffer space
+float g_mouseScaleX = 1.0f;  // framebufferWidth / windowWidth
+float g_mouseScaleY = 1.0f;  // framebufferHeight / windowHeight
+
+// Helper function to scale mouse coordinates from window to framebuffer space
+inline void scaleMouseToFramebuffer(double& mx, double& my) {
+    mx *= g_mouseScaleX;
+    my *= g_mouseScaleY;
+}
+
 // Render resolution (for FSR upscaling)
 int RENDER_WIDTH = 1280;
 int RENDER_HEIGHT = 720;
@@ -84,23 +106,46 @@ bool flyTogglePressed = false;
 std::optional<RaycastHit> currentTarget;
 constexpr float REACH_DISTANCE = 5.0f;
 
-// Selected block type for placing
-BlockType selectedBlock = BlockType::STONE;
-int selectedSlot = 0;
+// Mining state (survival mode)
+struct MiningState {
+    bool isMining = false;
+    glm::ivec3 targetBlock{0, 0, 0};
+    BlockType targetBlockType = BlockType::AIR;
+    float miningProgress = 0.0f;  // 0.0 to 1.0
+    float miningTime = 0.0f;      // Total time needed to mine
+} miningState;
 
-// Hotbar blocks
-BlockType hotbar[] = {
-    BlockType::STONE,
-    BlockType::DIRT,
-    BlockType::GRASS,
-    BlockType::COBBLESTONE,
-    BlockType::WOOD_PLANKS,
-    BlockType::WOOD_LOG,
-    BlockType::WATER,
-    BlockType::GLASS,
-    BlockType::SAND
-};
-constexpr int HOTBAR_SIZE = sizeof(hotbar) / sizeof(hotbar[0]);
+// Calculate mining time based on block hardness and held tool
+float calculateMiningTime(BlockType block, const ItemStack& heldItem) {
+    float baseHardness = getBlockHardness(block);
+    if (baseHardness <= 0.0f) return 0.0f;  // Instant break
+
+    float speedMultiplier = MiningSpeed::HAND;
+
+    // Check if holding a tool that's effective for this block
+    if (heldItem.isItem() && heldItem.isTool()) {
+        const ItemProperties& props = getItemProperties(heldItem.itemType);
+        int effectiveTool = getEffectiveToolCategory(block);
+
+        // If the tool matches the block's effective tool, apply speed bonus
+        if (static_cast<int>(props.toolCategory) == effectiveTool) {
+            speedMultiplier = props.miningSpeedMultiplier;
+        }
+    }
+
+    return baseHardness / speedMultiplier;
+}
+
+// Inventory system (replaces old hotbar array)
+Inventory playerInventory;
+InventoryUI inventoryUI;
+CraftingTableUI craftingTableUI;
+JEIPanel jeiPanel;
+ItemAtlas itemAtlas;
+
+// Dropped item system
+DroppedItemManager droppedItems;
+DroppedItemRenderer droppedItemRenderer;
 
 // Wireframe toggle
 bool wireframeMode = false;
@@ -118,8 +163,9 @@ int g_renderDistanceOverride = 0;   // F3+F/Shift+F - Temporary render distance 
 // Forward rendering provides better performance and stability for voxel scenes
 bool g_useDeferredRendering = false;  // DISABLED - forward rendering only
 bool g_enableSSAO = false;            // SSAO disabled (requires deferred)
-bool g_useRHIRenderer = false;        // RHI renderer disabled
-std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;  // Kept for future use
+bool g_useRHIRenderer = false;        // Set based on g_config.renderer (Vulkan = true)
+bool g_useVulkanBackend = false;      // True when using Vulkan backend
+std::unique_ptr<Render::DeferredRendererRHI> g_rhiRenderer;  // RHI renderer for Vulkan
 
 // Benchmark system
 Benchmark::BenchmarkSystem g_benchmark;
@@ -145,7 +191,7 @@ bool leftMousePressed = false;
 bool rightMousePressed = false;
 
 // Game state for menu and loading screen
-enum class GameState { MAIN_MENU, WORLD_SELECT, WORLD_CREATE, LOADING, PLAYING, PAUSED };
+enum class GameState { MAIN_MENU, WORLD_SELECT, WORLD_CREATE, TEXTURE_PACKS, TEXTURE_PACKS_PAUSE, LOADING, PLAYING, PAUSED };
 GameState gameState = GameState::MAIN_MENU;
 int totalChunksToLoad = 0;
 int chunksLoaded = 0;
@@ -158,8 +204,10 @@ WorldCreateScreen worldCreateScreen;
 PanoramaRenderer panoramaRenderer;
 PauseMenu pauseMenu;
 SettingsMenu settingsMenu;
+TexturePackScreen texturePackScreen;  // Texture pack selection screen
 LoadingScreen3D loadingScreen3D;  // 3D loading screen with floating blocks
 DebugOverlay debugOverlay;  // F3 debug screen
+SurvivalHUD survivalHUD;    // Health/hunger/air bars
 WorldSettings worldSettings;  // Settings from world create screen
 WorldSaveLoad worldSaveLoad;  // World save/load manager
 bool menuInitialized = false;
@@ -391,12 +439,20 @@ void closeRenderTimingLog() {
 
 // Callback for window resize
 void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
-    (void)window;
     glViewport(0, 0, width, height);
 
-    // Update window dimensions
+    // Update framebuffer dimensions (used for rendering)
     WINDOW_WIDTH = width;
     WINDOW_HEIGHT = height;
+
+    // Calculate mouse scaling factors for high-DPI displays
+    // GLFW mouse coordinates are in window space, UI uses framebuffer space
+    int windowWidth, windowHeight;
+    glfwGetWindowSize(window, &windowWidth, &windowHeight);
+    if (windowWidth > 0 && windowHeight > 0) {
+        g_mouseScaleX = static_cast<float>(width) / static_cast<float>(windowWidth);
+        g_mouseScaleY = static_cast<float>(height) / static_cast<float>(windowHeight);
+    }
 
     // Resize menu UI
     if (menuInitialized) {
@@ -415,11 +471,14 @@ void framebufferSizeCallback(GLFWwindow* window, int width, int height) {
 void mouseCallback(GLFWwindow* window, double xposIn, double yposIn) {
     (void)window;
 
-    // Don't process camera movement when in menu states
+    // Don't process camera movement when in menu states or inventory is open
     if (gameState == GameState::MAIN_MENU ||
         gameState == GameState::WORLD_SELECT ||
         gameState == GameState::WORLD_CREATE ||
-        gameState == GameState::PAUSED) {
+        gameState == GameState::TEXTURE_PACKS ||
+        gameState == GameState::TEXTURE_PACKS_PAUSE ||
+        gameState == GameState::PAUSED ||
+        inventoryUI.isOpen) {
         return;
     }
 
@@ -441,64 +500,143 @@ void mouseCallback(GLFWwindow* window, double xposIn, double yposIn) {
     camera.processMouseMovement(xOffset, yOffset);
 }
 
-// Callback for mouse scroll - now used for hotbar selection
+// Callback for mouse scroll - used for hotbar selection and JEI scrolling
 void scrollCallback(GLFWwindow* window, double xoffset, double yoffset) {
     (void)window;
     (void)xoffset;
 
+    // Handle JEI scrolling when inventory or crafting table is open
+    if ((inventoryUI.isOpen || craftingTableUI.isOpen) && jeiPanel.isVisible) {
+        jeiPanel.handleScroll(static_cast<float>(yoffset));
+        return;
+    }
+
+    // Don't scroll hotbar while inventory is open
+    if (inventoryUI.isOpen) return;
+
     // Scroll through hotbar
-    selectedSlot -= static_cast<int>(yoffset);
-    if (selectedSlot < 0) selectedSlot = HOTBAR_SIZE - 1;
-    if (selectedSlot >= HOTBAR_SIZE) selectedSlot = 0;
-    selectedBlock = hotbar[selectedSlot];
+    playerInventory.cycleSlot(-static_cast<int>(yoffset));
 }
 
 // Callback for mouse buttons
 void mouseButtonCallback(GLFWwindow* window, int button, int action, int mods) {
     (void)window;
-    (void)mods;
+
+    // Handle inventory clicks first
+    if (inventoryUI.isOpen) {
+        double mx, my;
+        glfwGetCursorPos(window, &mx, &my);
+        scaleMouseToFramebuffer(mx, my);  // Convert to framebuffer coordinates
+        bool shiftHeld = (mods & GLFW_MOD_SHIFT) != 0;
+        if (inventoryUI.handleMouseClick(button, action == GLFW_PRESS, playerInventory, shiftHeld)) {
+            return;  // Click was handled by inventory
+        }
+    }
+
+    // Handle crafting table clicks
+    if (craftingTableUI.isOpen && action == GLFW_PRESS) {
+        double mx, my;
+        glfwGetCursorPos(window, &mx, &my);
+        scaleMouseToFramebuffer(mx, my);  // Convert to framebuffer coordinates
+        bool rightClick = (button == GLFW_MOUSE_BUTTON_RIGHT);
+        if (craftingTableUI.handleClick(playerInventory, static_cast<float>(mx), static_cast<float>(my), rightClick)) {
+            return;  // Click was handled by crafting table
+        }
+    }
+
+    // Handle JEI panel clicks (when inventory or crafting table is open)
+    if ((inventoryUI.isOpen || craftingTableUI.isOpen) && jeiPanel.isVisible && action == GLFW_PRESS) {
+        double mx, my;
+        glfwGetCursorPos(window, &mx, &my);
+        scaleMouseToFramebuffer(mx, my);  // Convert to framebuffer coordinates
+        // Creative mode check - for now, player with flight is considered creative
+        bool isCreativeMode = player && player->isFlying;
+        if (jeiPanel.handleClick(button, true, playerInventory, isCreativeMode)) {
+            return;  // Click was handled by JEI
+        }
+    }
 
     if (button == GLFW_MOUSE_BUTTON_LEFT) {
         if (action == GLFW_PRESS && !leftMousePressed) {
             leftMousePressed = true;
-            // Break block
-            if (currentTarget.has_value()) {
+            // Start mining (only when inventory/crafting UI closed)
+            if (!inventoryUI.isOpen && !craftingTableUI.isOpen && currentTarget.has_value()) {
                 glm::ivec3 pos = currentTarget->blockPos;
                 BlockType block = world.getBlock(pos.x, pos.y, pos.z);
-                if (block != BlockType::BEDROCK) { // Can't break bedrock
-                    world.setBlock(pos.x, pos.y, pos.z, BlockType::AIR);
+                if (isBlockBreakable(block)) {
+                    // Start mining this block
+                    miningState.isMining = true;
+                    miningState.targetBlock = pos;
+                    miningState.targetBlockType = block;
+                    miningState.miningProgress = 0.0f;
+                    miningState.miningTime = calculateMiningTime(block, playerInventory.getSelectedStack());
                 }
             }
         } else if (action == GLFW_RELEASE) {
             leftMousePressed = false;
+            // Stop mining when button released
+            miningState.isMining = false;
+            miningState.miningProgress = 0.0f;
         }
     }
 
     if (button == GLFW_MOUSE_BUTTON_RIGHT) {
         if (action == GLFW_PRESS && !rightMousePressed) {
             rightMousePressed = true;
-            // Place block
-            if (currentTarget.has_value() && player) {
-                glm::ivec3 placePos = currentTarget->blockPos + currentTarget->normal;
+            // Handle right-click (only when inventory/crafting UI closed)
+            if (!inventoryUI.isOpen && !craftingTableUI.isOpen && player) {
+                // First check if holding food - start eating
+                ItemStack& heldItem = playerInventory.getSelectedStack();
+                if (heldItem.isFood()) {
+                    const ItemProperties& foodProps = getItemProperties(heldItem.itemType);
+                    player->startEating(foodProps.foodHunger, foodProps.foodSaturation);
+                    // Don't process other actions while eating
+                } else if (currentTarget.has_value()) {
+                    // Check if clicking on a crafting table - open crafting UI
+                    BlockType targetBlock = world.getBlock(currentTarget->blockPos.x,
+                                                            currentTarget->blockPos.y,
+                                                            currentTarget->blockPos.z);
+                    if (targetBlock == BlockType::CRAFTING_TABLE) {
+                        // Open crafting table UI
+                        craftingTableUI.open();
+                        jeiPanel.show();  // Show JEI when crafting table opens
+                        glfwSetInputMode(glfwGetCurrentContext(), GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                        cursorEnabled = true;
+                    } else {
+                        // Place block
+                        BlockType blockToPlace = playerInventory.getSelectedBlock();
 
-                // Don't place block inside player
-                float halfW = Player::WIDTH / 2.0f;
-                glm::vec3 playerMin = player->position - glm::vec3(halfW, 0.0f, halfW);
-                glm::vec3 playerMax = player->position + glm::vec3(halfW, Player::HEIGHT, halfW);
-                glm::vec3 blockMin = glm::vec3(placePos);
-                glm::vec3 blockMax = glm::vec3(placePos) + glm::vec3(1.0f);
+                        // Can't place if no block selected or empty slot
+                        if (blockToPlace != BlockType::AIR) {
+                            glm::ivec3 placePos = currentTarget->blockPos + currentTarget->normal;
 
-                bool collision =
-                    playerMin.x < blockMax.x && playerMax.x > blockMin.x &&
-                    playerMin.y < blockMax.y && playerMax.y > blockMin.y &&
-                    playerMin.z < blockMax.z && playerMax.z > blockMin.z;
+                            // Don't place block inside player
+                            float halfW = Player::WIDTH / 2.0f;
+                            glm::vec3 playerMin = player->position - glm::vec3(halfW, 0.0f, halfW);
+                            glm::vec3 playerMax = player->position + glm::vec3(halfW, Player::HEIGHT, halfW);
+                            glm::vec3 blockMin = glm::vec3(placePos);
+                            glm::vec3 blockMax = glm::vec3(placePos) + glm::vec3(1.0f);
 
-                if (!collision && placePos.y >= 0 && placePos.y < CHUNK_SIZE_Y) {
-                    world.setBlock(placePos.x, placePos.y, placePos.z, selectedBlock);
+                            bool collision =
+                                playerMin.x < blockMax.x && playerMax.x > blockMin.x &&
+                                playerMin.y < blockMax.y && playerMax.y > blockMin.y &&
+                                playerMin.z < blockMax.z && playerMax.z > blockMin.z;
+
+                            if (!collision && placePos.y >= 0 && placePos.y < CHUNK_SIZE_Y) {
+                                world.setBlock(placePos.x, placePos.y, placePos.z, blockToPlace);
+                                // Consume from inventory
+                                playerInventory.slots[playerInventory.selectedSlot].remove(1);
+                            }
+                        }
+                    }
                 }
             }
         } else if (action == GLFW_RELEASE) {
             rightMousePressed = false;
+            // Cancel eating when right-click is released
+            if (player && player->isEating) {
+                player->cancelEating();
+            }
         }
     }
 }
@@ -920,16 +1058,62 @@ InputState processInput(GLFWwindow* window) {
     }
 
     // Number keys for hotbar (using KeybindManager)
-    KeyAction hotbarActions[] = {
-        KeyAction::Hotbar1, KeyAction::Hotbar2, KeyAction::Hotbar3,
-        KeyAction::Hotbar4, KeyAction::Hotbar5, KeyAction::Hotbar6,
-        KeyAction::Hotbar7, KeyAction::Hotbar8, KeyAction::Hotbar9
-    };
-    for (int i = 0; i < HOTBAR_SIZE && i < 9; i++) {
-        if (keybinds.isPressed(window, hotbarActions[i])) {
-            selectedSlot = i;
-            selectedBlock = hotbar[i];
+    if (!inventoryUI.isOpen) {
+        KeyAction hotbarActions[] = {
+            KeyAction::Hotbar1, KeyAction::Hotbar2, KeyAction::Hotbar3,
+            KeyAction::Hotbar4, KeyAction::Hotbar5, KeyAction::Hotbar6,
+            KeyAction::Hotbar7, KeyAction::Hotbar8, KeyAction::Hotbar9
+        };
+        for (int i = 0; i < HOTBAR_SLOTS && i < 9; i++) {
+            if (keybinds.isPressed(window, hotbarActions[i])) {
+                playerInventory.selectSlot(i);
+            }
         }
+    }
+
+    // E key for inventory toggle (also closes crafting table)
+    static bool inventoryKeyPressed = false;
+    if (glfwGetKey(window, GLFW_KEY_E) == GLFW_PRESS) {
+        if (!inventoryKeyPressed) {
+            // If crafting table is open, close it instead of toggling inventory
+            if (craftingTableUI.isOpen) {
+                craftingTableUI.close(playerInventory);
+                glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                cursorEnabled = false;
+                firstMouse = true;
+            } else {
+                inventoryUI.toggle(playerInventory);
+                if (inventoryUI.isOpen) {
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+                    cursorEnabled = true;
+                    jeiPanel.show();  // Show JEI when inventory opens
+                } else {
+                    glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+                    cursorEnabled = false;
+                    firstMouse = true;  // Prevent camera jump
+                    jeiPanel.hide();  // Hide JEI when inventory closes
+                }
+            }
+            inventoryKeyPressed = true;
+        }
+    } else {
+        inventoryKeyPressed = false;
+    }
+
+    // ESC also closes inventory or crafting table
+    if (inventoryUI.isOpen && glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        inventoryUI.close(playerInventory);
+        jeiPanel.hide();  // Hide JEI when inventory closes
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        cursorEnabled = false;
+        firstMouse = true;  // Prevent camera jump
+    }
+    if (craftingTableUI.isOpen && glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+        craftingTableUI.close(playerInventory);
+        jeiPanel.hide();  // Hide JEI when crafting table closes
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+        cursorEnabled = false;
+        firstMouse = true;  // Prevent camera jump
     }
 
     return input;
@@ -942,6 +1126,7 @@ const char* vertexShaderSource = R"(
 layout (location = 0) in vec3 aPackedPos;     // int16 * 3, scaled by 256
 layout (location = 1) in vec2 aPackedTexCoord; // uint16 * 2, 8.8 fixed point
 layout (location = 2) in uvec4 aPackedData;   // normalIndex, ao, light, texSlot
+layout (location = 3) in uvec2 aBiomeData;    // biomeTemp, biomeHumid (0-255)
 
 out vec2 texCoord;
 out vec2 texSlotBase;  // Pass to fragment shader for tiling
@@ -952,6 +1137,8 @@ out float lightLevel;
 out float fogDepth;
 out vec2 screenPos;
 out vec4 fragPosLightSpace;
+flat out uint texSlotIndex;  // For biome tinting check
+out vec2 biomeCoord;         // Biome colormap UV (temperature, humidity)
 
 uniform mat4 view;
 uniform mat4 projection;
@@ -996,6 +1183,10 @@ void main() {
     float slotX = float(texSlot % 16u);
     float slotY = float(texSlot / 16u);
     texSlotBase = vec2(slotX * SLOT_SIZE, slotY * SLOT_SIZE);
+    texSlotIndex = texSlot;  // Pass to fragment for biome tinting check
+
+    // Biome colormap coordinates (0-255 -> 0.0-1.0)
+    biomeCoord = vec2(float(aBiomeData.x) / 255.0, float(aBiomeData.y) / 255.0);
 
     // Transform to clip space
     vec4 viewPos = view * vec4(worldPos, 1.0);
@@ -1019,10 +1210,19 @@ in float lightLevel;
 in float fogDepth;
 in vec2 screenPos;
 in vec4 fragPosLightSpace;
+flat in uint texSlotIndex;  // For biome tinting check
+in vec2 biomeCoord;         // Biome colormap UV (temperature, humidity)
 
 out vec4 FragColor;
 
 uniform sampler2D texAtlas;
+uniform sampler2D grassColormap;  // Biome colormap for grass/foliage tinting
+
+// Tintable texture slot indices (must match BiomeColormap.h TintableSlots)
+const uint TINT_GRASS_TOP = 2u;   // grass_top
+const uint TINT_GRASS_SIDE = 3u;  // grass_side (partial tint)
+const uint TINT_LEAVES = 8u;      // leaves_oak
+const uint TINT_WATER = 11u;      // water_still
 
 // Texture atlas constants for greedy meshing tiling
 const float ATLAS_SIZE = 16.0;
@@ -1175,6 +1375,30 @@ float getEmission(vec2 uv) {
     return 0.0;
 }
 
+// Apply biome tinting to grass/foliage/water textures
+vec3 applyBiomeTint(vec3 baseColor, uint slot, vec2 biomeUV) {
+    // Sample biome colormap (temperature on X, humidity on Y)
+    vec3 tintColor = texture(grassColormap, biomeUV).rgb;
+
+    // Grass top and leaves: full tint
+    if (slot == TINT_GRASS_TOP || slot == TINT_LEAVES) {
+        return baseColor * tintColor * 1.4;
+    }
+    // Grass side: tint only the green grass portion (top of texture)
+    // Typically the grass overlay is in the upper part of the texture
+    // We do a simple Y-based blend
+    if (slot == TINT_GRASS_SIDE) {
+        // Grass side textures have green on top - approximate by tinting everything
+        // but reducing the effect slightly for a natural look
+        return mix(baseColor, baseColor * tintColor * 1.4, 0.6);
+    }
+    // Water: use water colormap (could use separate texture, but for now use grass)
+    if (slot == TINT_WATER) {
+        return baseColor * tintColor * 1.2;
+    }
+    return baseColor;
+}
+
 void main() {
     // Sample texture with greedy meshing tiling support
     // fract(texCoord) tiles within each block, then offset to correct atlas slot
@@ -1183,6 +1407,9 @@ void main() {
 
     // Discard very transparent pixels (for glass, leaves)
     if (texColor.a < 0.1) discard;
+
+    // Apply biome tinting for grass, foliage, and water
+    texColor.rgb = applyBiomeTint(texColor.rgb, texSlotIndex, biomeCoord);
 
     // Check for emissive blocks (use tiledUV to identify block type)
     float emission = getEmission(tiledUV);
@@ -2390,6 +2617,7 @@ const char* gBufferVertexSource = R"(
 layout (location = 0) in vec3 aPackedPos;
 layout (location = 1) in vec2 aPackedTexCoord;
 layout (location = 2) in uvec4 aPackedData;
+layout (location = 3) in uvec2 aBiomeData;  // biomeTemp, biomeHumid (0-255)
 
 out vec3 fragPos;
 out vec3 fragNormal;
@@ -2398,6 +2626,8 @@ out vec2 texSlotBase;
 out float aoFactor;
 out float lightLevel;
 out float viewDepth;
+flat out uint texSlotIndex;  // For biome tinting check
+out vec2 biomeCoord;         // Biome colormap UV (temperature, humidity)
 
 uniform mat4 view;
 uniform mat4 projection;
@@ -2428,6 +2658,10 @@ void main() {
     float slotX = float(texSlot % 16u);
     float slotY = float(texSlot / 16u);
     texSlotBase = vec2(slotX * SLOT_SIZE, slotY * SLOT_SIZE);
+    texSlotIndex = texSlot;  // Pass to fragment for biome tinting check
+
+    // Biome colormap coordinates (0-255 -> 0.0-1.0)
+    biomeCoord = vec2(float(aBiomeData.x) / 255.0, float(aBiomeData.y) / 255.0);
 
     vec4 viewPos = view * vec4(worldPos, 1.0);
     gl_Position = projection * viewPos;
@@ -2450,8 +2684,17 @@ in vec2 texSlotBase;
 in float aoFactor;
 in float lightLevel;
 in float viewDepth;
+flat in uint texSlotIndex;  // For biome tinting check
+in vec2 biomeCoord;         // Biome colormap UV (temperature, humidity)
 
 uniform sampler2D texAtlas;
+uniform sampler2D grassColormap;  // Biome colormap for grass/foliage tinting
+
+// Tintable texture slot indices (must match BiomeColormap.h TintableSlots)
+const uint TINT_GRASS_TOP = 2u;   // grass_top
+const uint TINT_GRASS_SIDE = 3u;  // grass_side (partial tint)
+const uint TINT_LEAVES = 8u;      // leaves_oak
+const uint TINT_WATER = 11u;      // water_still
 
 const float ATLAS_SIZE = 16.0;
 const float SLOT_SIZE = 1.0 / ATLAS_SIZE;
@@ -2465,11 +2708,33 @@ float getEmission(vec2 uv) {
     return 0.0;
 }
 
+// Apply biome tinting to grass/foliage/water textures
+vec3 applyBiomeTint(vec3 baseColor, uint slot, vec2 biomeUV) {
+    vec3 tintColor = texture(grassColormap, biomeUV).rgb;
+
+    // Grass top and leaves: full tint
+    if (slot == TINT_GRASS_TOP || slot == TINT_LEAVES) {
+        return baseColor * tintColor * 1.4;
+    }
+    // Grass side: partial tint for natural look
+    if (slot == TINT_GRASS_SIDE) {
+        return mix(baseColor, baseColor * tintColor * 1.4, 0.6);
+    }
+    // Water: use colormap
+    if (slot == TINT_WATER) {
+        return baseColor * tintColor * 1.2;
+    }
+    return baseColor;
+}
+
 void main() {
     vec2 tiledUV = texSlotBase + fract(texCoord) * SLOT_SIZE;
     vec4 texColor = texture(texAtlas, tiledUV);
 
     if (texColor.a < 0.1) discard;
+
+    // Apply biome tinting for grass, foliage, and water
+    texColor.rgb = applyBiomeTint(texColor.rgb, texSlotIndex, biomeCoord);
 
     float emission = getEmission(texSlotBase);
 
@@ -3181,6 +3446,8 @@ layout(location = 1) out vec4 gNormal;
 layout(location = 2) out vec4 gAlbedo;
 
 uniform sampler2D texAtlas;
+uniform sampler2D normalMap;
+uniform bool useNormalMap;
 
 // Per-vertex input
 layout(location = 0) in PerVertexData {
@@ -3195,12 +3462,36 @@ layout(location = 0) in PerVertexData {
 const float ATLAS_SIZE = 256.0;
 const float TILE_SIZE = 16.0;
 
+// Derive TBN matrix for axis-aligned voxel faces
+mat3 getTBN(vec3 N) {
+    vec3 T, B;
+
+    // For axis-aligned faces, derive tangent and bitangent from normal
+    vec3 absN = abs(N);
+
+    if (absN.y > 0.9) {
+        // Top/bottom face (Y axis)
+        T = vec3(1.0, 0.0, 0.0);
+        B = vec3(0.0, 0.0, sign(N.y));
+    } else if (absN.x > 0.9) {
+        // Left/right face (X axis)
+        T = vec3(0.0, 0.0, -sign(N.x));
+        B = vec3(0.0, 1.0, 0.0);
+    } else {
+        // Front/back face (Z axis)
+        T = vec3(sign(N.z), 0.0, 0.0);
+        B = vec3(0.0, 1.0, 0.0);
+    }
+
+    return mat3(T, B, N);
+}
+
 void main() {
     // Calculate final texture coordinates with tiling
     vec2 tileUV = fract(v_in.texCoord) * (TILE_SIZE / ATLAS_SIZE);
     vec2 finalUV = v_in.texSlotBase + tileUV;
 
-    // Sample texture
+    // Sample albedo texture
     vec4 texColor = texture(texAtlas, finalUV);
 
     // Alpha test
@@ -3208,9 +3499,21 @@ void main() {
         discard;
     }
 
+    // Calculate final normal
+    vec3 N = normalize(v_in.normal);
+
+    if (useNormalMap) {
+        // Sample normal map and convert from [0,1] to [-1,1]
+        vec3 tangentNormal = texture(normalMap, finalUV).rgb * 2.0 - 1.0;
+
+        // Get TBN matrix and transform normal to world space
+        mat3 TBN = getTBN(N);
+        N = normalize(TBN * tangentNormal);
+    }
+
     // Output to G-buffer
     gPosition = vec4(v_in.worldPos, v_in.aoFactor);
-    gNormal = vec4(normalize(v_in.normal), v_in.lightLevel);
+    gNormal = vec4(N, v_in.lightLevel);
     gAlbedo = vec4(texColor.rgb, 0.0);  // Alpha = emission flag
 }
 )";
@@ -3856,8 +4159,9 @@ int main() {
     camera.mouseSensitivity = g_config.mouseSensitivity;
 
     // Apply quality settings from config
-    g_useDeferredRendering = g_config.enableDeferredRendering;
-    g_enableSSAO = g_config.enableSSAO;
+    // NOTE: Deferred rendering is DISABLED - always use forward rendering
+    g_useDeferredRendering = false;  // Force OFF regardless of config
+    g_enableSSAO = false;  // SSAO requires deferred, so also disable
     g_enableHiZCulling = g_config.enableHiZCulling;
     g_showPerfStats = g_config.showPerformanceStats;
     g_enableBatchedRendering = g_config.enableBatchedRendering;
@@ -3868,11 +4172,32 @@ int main() {
         return -1;
     }
 
-    // Configure GLFW
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
-    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    // Check if Vulkan backend is requested
+    g_useVulkanBackend = (g_config.renderer == RendererType::VULKAN);
+
+    // Check Vulkan availability if requested
+    // NOTE: Vulkan integration in main executable is not complete.
+    // For Vulkan, use VoxelEngineVK.exe instead.
+    if (g_useVulkanBackend) {
+        std::cout << "[Vulkan] Vulkan backend requested but not fully integrated in main executable." << std::endl;
+        std::cout << "[Vulkan] Use VoxelEngineVK.exe for Vulkan rendering." << std::endl;
+        std::cout << "[Vulkan] Falling back to OpenGL..." << std::endl;
+        g_useVulkanBackend = false;
+        g_config.renderer = RendererType::OPENGL;
+    }
+
+    // Configure GLFW based on backend
+    if (g_useVulkanBackend) {
+        // Vulkan: No OpenGL context
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    } else {
+        // OpenGL: Request OpenGL 4.6 core profile
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+    }
 
     // Create window (fullscreen if configured)
     GLFWwindow* window = nullptr;
@@ -3890,7 +4215,7 @@ int main() {
         return -1;
     }
 
-    glfwMakeContextCurrent(window);
+    // Set up callbacks (same for both backends)
     glfwSetFramebufferSizeCallback(window, framebufferSizeCallback);
     glfwSetCursorPosCallback(window, mouseCallback);
     glfwSetScrollCallback(window, scrollCallback);
@@ -3900,6 +4225,65 @@ int main() {
 
     // Start with cursor visible for main menu
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+    // Initialize mouse scale factors for high-DPI displays
+    {
+        int fbWidth, fbHeight, winWidth, winHeight;
+        glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
+        glfwGetWindowSize(window, &winWidth, &winHeight);
+        if (winWidth > 0 && winHeight > 0) {
+            g_mouseScaleX = static_cast<float>(fbWidth) / static_cast<float>(winWidth);
+            g_mouseScaleY = static_cast<float>(fbHeight) / static_cast<float>(winHeight);
+        }
+        // Also update WINDOW_WIDTH/HEIGHT to framebuffer size
+        WINDOW_WIDTH = fbWidth;
+        WINDOW_HEIGHT = fbHeight;
+    }
+
+    // Backend-specific initialization
+    if (g_useVulkanBackend) {
+        // Vulkan: Enable RHI renderer, disable OpenGL mesh operations
+        g_useRHIRenderer = true;
+        world.useOpenGLMeshes = false;
+        std::cout << "[Vulkan] Window created (Vulkan mode)" << std::endl;
+
+        // Initialize RHI renderer immediately for Vulkan
+        std::cout << "\n=== Initializing Vulkan RHI Renderer ===" << std::endl;
+        g_rhiRenderer = std::make_unique<Render::DeferredRendererRHI>();
+
+        Render::RenderConfig rhiConfig;
+        rhiConfig.enableShadows = g_config.enableShadows;
+        rhiConfig.enableSSAO = g_enableSSAO;
+        rhiConfig.enableGPUCulling = world.gpuCullingEnabled;
+        rhiConfig.enableHiZCulling = g_enableHiZCulling;
+        rhiConfig.shadowResolution = g_config.shadowResolution;
+        rhiConfig.ssaoSamples = g_config.ssaoSamples;
+        rhiConfig.debugMode = g_deferredDebugMode;
+
+        if (!g_rhiRenderer->initialize(window, rhiConfig)) {
+            std::cerr << "[Vulkan] Failed to initialize RHI renderer, falling back to OpenGL" << std::endl;
+            g_rhiRenderer.reset();
+            g_useRHIRenderer = false;
+            g_useVulkanBackend = false;
+            g_config.renderer = RendererType::OPENGL;
+            // Fall through to OpenGL initialization
+        } else {
+            std::cout << "[Vulkan] RHI renderer initialized successfully" << std::endl;
+
+            // Get GPU info from RHI device
+            if (g_rhiRenderer->getDevice()) {
+                const auto& info = g_rhiRenderer->getDevice()->getInfo();
+                g_hardware.gpuName = info.deviceName;
+                Core::CrashHandler::instance().setGPUInfo("Vulkan: " + info.deviceName + " (" + info.apiVersion + ")");
+                std::cout << "GPU: " << info.deviceName << std::endl;
+                std::cout << "API: " << info.apiVersion << std::endl;
+            }
+
+        }
+    }
+
+    // OpenGL: Set up context and load functions
+    glfwMakeContextCurrent(window);
 
     // VSync from config
     glfwSwapInterval(g_config.vsync ? 1 : 0);
@@ -3916,8 +4300,8 @@ int main() {
     std::cout << "OpenGL Version: " << glGetString(GL_VERSION) << std::endl;
     std::cout << "Renderer: " << glGetString(GL_RENDERER) << std::endl;
 
-    // Set GPU info for crash reports
-    {
+    // Set GPU info for crash reports (OpenGL only - Vulkan sets this later)
+    if (!g_useVulkanBackend) {
         std::stringstream gpuInfo;
         gpuInfo << "OpenGL Version: " << glGetString(GL_VERSION) << "\n";
         gpuInfo << "Renderer: " << glGetString(GL_RENDERER) << "\n";
@@ -3929,84 +4313,88 @@ int main() {
     // ============================================
     // HARDWARE DETECTION & AUTO-TUNING
     // ============================================
-    g_hardware.gpuName = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
-    g_hardware.gpuVendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+    if (!g_useVulkanBackend) {
+        // OpenGL: Get GPU info from OpenGL context
+        g_hardware.gpuName = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        g_hardware.gpuVendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
 
-    // Try to get VRAM info (NVIDIA extension)
-    GLint vramKB = 0;
-    glGetIntegerv(0x9048, &vramKB);  // GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX
-    if (vramKB > 0) {
-        g_hardware.vramMB = vramKB / 1024;
-    } else {
-        // Try AMD extension
-        glGetIntegerv(0x87FB, &vramKB);  // GL_TEXTURE_FREE_MEMORY_ATI
+        // Try to get VRAM info (NVIDIA extension)
+        GLint vramKB = 0;
+        glGetIntegerv(0x9048, &vramKB);  // GL_GPU_MEMORY_INFO_TOTAL_AVAILABLE_MEMORY_NVX
         if (vramKB > 0) {
             g_hardware.vramMB = vramKB / 1024;
-        }
-    }
-
-    // Classify GPU tier and calculate recommendations
-    g_hardware.classifyGPU();
-    g_hardware.calculateRecommendations();
-    g_hardware.print();
-
-    // Initialize shader cache for faster startup
-    ShaderCache::init("shader_cache");
-    ShaderCache::printCacheStats();
-
-    // Check for mesh shader extension (GL_NV_mesh_shader)
-    GLint numExtensions = 0;
-    glGetIntegerv(GL_NUM_EXTENSIONS, &numExtensions);
-    for (GLint i = 0; i < numExtensions; i++) {
-        const char* ext = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
-        if (ext && strcmp(ext, "GL_NV_mesh_shader") == 0) {
-            g_meshShadersAvailable = true;
-            break;
-        }
-    }
-
-    if (g_meshShadersAvailable) {
-        std::cout << "Mesh shaders available (GL_NV_mesh_shader)" << std::endl;
-        // Load glDrawMeshTasksNV function pointer (if not already provided by GLAD)
-#ifndef GLAD_GL_NV_mesh_shader
-        pfn_glDrawMeshTasksNV = (PFNGLDRAWMESHTASKSNVPROC_LOCAL)glfwGetProcAddress("glDrawMeshTasksNV");
-        if (pfn_glDrawMeshTasksNV) {
-            std::cout << "  glDrawMeshTasksNV loaded successfully" << std::endl;
         } else {
-            std::cout << "  Failed to load glDrawMeshTasksNV" << std::endl;
-            g_meshShadersAvailable = false;
+            // Try AMD extension
+            glGetIntegerv(0x87FB, &vramKB);  // GL_TEXTURE_FREE_MEMORY_ATI
+            if (vramKB > 0) {
+                g_hardware.vramMB = vramKB / 1024;
+            }
         }
-#else
-        // GLAD provides mesh shader support
-        std::cout << "  Using GLAD mesh shader functions" << std::endl;
-#endif
+
+        // Classify GPU tier and calculate recommendations
+        g_hardware.classifyGPU();
+        g_hardware.calculateRecommendations();
+        g_hardware.print();
+
+        // Initialize shader cache for faster startup
+        ShaderCache::init("shader_cache");
+        ShaderCache::printCacheStats();
+
+        // Check for mesh shader extension (GL_NV_mesh_shader)
+        GLint numExtensions = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &numExtensions);
+        for (GLint i = 0; i < numExtensions; i++) {
+            const char* ext = reinterpret_cast<const char*>(glGetStringi(GL_EXTENSIONS, i));
+            if (ext && strcmp(ext, "GL_NV_mesh_shader") == 0) {
+                g_meshShadersAvailable = true;
+                break;
+            }
+        }
+
         if (g_meshShadersAvailable) {
-            // Enable by default on supported hardware
-            g_enableMeshShaders = g_hardware.supportsMeshShaders;
-            // Enable meshlet generation for mesh shader rendering
-            g_generateMeshlets = g_enableMeshShaders;
+            std::cout << "Mesh shaders available (GL_NV_mesh_shader)" << std::endl;
+            // Load glDrawMeshTasksNV function pointer (if not already provided by GLAD)
+#ifndef GLAD_GL_NV_mesh_shader
+            pfn_glDrawMeshTasksNV = (PFNGLDRAWMESHTASKSNVPROC_LOCAL)glfwGetProcAddress("glDrawMeshTasksNV");
+            if (pfn_glDrawMeshTasksNV) {
+                std::cout << "  glDrawMeshTasksNV loaded successfully" << std::endl;
+            } else {
+                std::cout << "  Failed to load glDrawMeshTasksNV" << std::endl;
+                g_meshShadersAvailable = false;
+            }
+#else
+            // GLAD provides mesh shader support
+            std::cout << "  Using GLAD mesh shader functions" << std::endl;
+#endif
+            if (g_meshShadersAvailable) {
+                // Enable by default on supported hardware
+                g_enableMeshShaders = g_hardware.supportsMeshShaders;
+                // Enable meshlet generation for mesh shader rendering
+                g_generateMeshlets = g_enableMeshShaders;
+            } else {
+                g_enableMeshShaders = false;
+                g_generateMeshlets = false;
+            }
         } else {
+            std::cout << "Mesh shaders not available" << std::endl;
             g_enableMeshShaders = false;
             g_generateMeshlets = false;
         }
-    } else {
-        std::cout << "Mesh shaders not available" << std::endl;
-        g_enableMeshShaders = false;
-        g_generateMeshlets = false;
-    }
 
-    // Auto-tune if enabled
-    if (g_config.autoTuneOnStartup) {
-        g_config.autoTune();
-        g_config.autoTuneOnStartup = false;  // Only auto-tune once
-        g_config.save();  // Save the tuned settings
+        // Auto-tune if enabled
+        if (g_config.autoTuneOnStartup) {
+            g_config.autoTune();
+            g_config.autoTuneOnStartup = false;  // Only auto-tune once
+            g_config.save();  // Save the tuned settings
 
-        // Re-apply settings that were already used before auto-tune
-        camera.fov = static_cast<float>(g_config.fov);
-        g_useDeferredRendering = g_config.enableDeferredRendering;
-        g_enableSSAO = g_config.enableSSAO;
-        g_enableHiZCulling = g_config.enableHiZCulling;
-    }
+            // Re-apply settings that were already used before auto-tune
+            camera.fov = static_cast<float>(g_config.fov);
+            // NOTE: Deferred rendering stays DISABLED - don't override from config
+            g_useDeferredRendering = false;
+            g_enableSSAO = false;
+            g_enableHiZCulling = g_config.enableHiZCulling;
+        }
+    } // end if (!g_useVulkanBackend)
 
     // Compile main chunk shader (with caching)
     GLuint shaderProgram = ShaderCache::createCachedProgramFromFiles(
@@ -4411,11 +4799,15 @@ int main() {
     GLint skyColorLoc = glGetUniformLocation(shaderProgram, "skyColor");
     GLint fogDensityLoc = glGetUniformLocation(shaderProgram, "fogDensity");
     GLint texAtlasLoc = glGetUniformLocation(shaderProgram, "texAtlas");
+    GLint normalMapLoc = glGetUniformLocation(shaderProgram, "normalMap");
+    GLint grassColormapLoc = glGetUniformLocation(shaderProgram, "grassColormap");
+    GLint useNormalMapLoc = glGetUniformLocation(shaderProgram, "useNormalMap");
     GLint underwaterLoc = glGetUniformLocation(shaderProgram, "isUnderwater");
     GLint timeLoc = glGetUniformLocation(shaderProgram, "time");
     GLint cameraPosLoc = glGetUniformLocation(shaderProgram, "cameraPos");
     GLint chunkOffsetLoc = glGetUniformLocation(shaderProgram, "chunkOffset");  // Packed vertex format
     GLint renderDistLoc = glGetUniformLocation(shaderProgram, "renderDistanceBlocks");
+    GLint brightnessLoc = glGetUniformLocation(shaderProgram, "brightness");
 
     // Get uniform locations for water shader
     GLint waterViewLoc = glGetUniformLocation(waterShaderProgram, "view");
@@ -4468,6 +4860,9 @@ int main() {
     GLint gBufferProjectionLoc = glGetUniformLocation(gBufferProgram, "projection");
     GLint gBufferChunkOffsetLoc = glGetUniformLocation(gBufferProgram, "chunkOffset");
     GLint gBufferTexAtlasLoc = glGetUniformLocation(gBufferProgram, "texAtlas");
+    GLint gBufferNormalMapLoc = glGetUniformLocation(gBufferProgram, "normalMap");
+    GLint gBufferGrassColormapLoc = glGetUniformLocation(gBufferProgram, "grassColormap");
+    GLint gBufferUseNormalMapLoc = glGetUniformLocation(gBufferProgram, "useNormalMap");
 
     // Debug: verify G-buffer uniform locations
     std::cout << "G-buffer uniform locations:" << std::endl;
@@ -4501,6 +4896,7 @@ int main() {
     GLint compositeDebugModeLoc = glGetUniformLocation(compositeProgram, "debugMode");
     GLint compositeRenderDistLoc = glGetUniformLocation(compositeProgram, "renderDistanceBlocks");
     GLint compositeInvViewProjLoc = glGetUniformLocation(compositeProgram, "invViewProj");
+    GLint compositeBrightnessLoc = glGetUniformLocation(compositeProgram, "brightness");
 
     // Debug: verify composite shader uniform locations
     std::cout << "Composite shader uniform locations:" << std::endl;
@@ -5035,11 +5431,22 @@ int main() {
     initRenderTimingLog();
     std::cout << "Render timing log initialized (RenderTime.txt)" << std::endl;
 
-    // Generate texture atlas
-    std::cout << "\nGenerating texture atlas..." << std::endl;
-    TextureAtlas textureAtlas;
-    textureAtlas.generate();
-    std::cout << "Texture atlas generated (256x256)" << std::endl;
+    // Generate texture atlas with normal maps
+    std::cout << "\nGenerating texture atlas with normal maps..." << std::endl;
+    TexturePackLoader texturePack;
+
+    // Try to load texture pack from folder, fall back to procedural
+    std::string texturePackPath = "textures/default";
+    if (!texturePack.loadFromFolder(texturePackPath)) {
+        std::cout << "[TexturePack] No texture pack found, generating procedural textures" << std::endl;
+        texturePack.generateProcedural();
+    }
+    std::cout << "Texture atlas generated (256x256, normal maps: "
+              << (texturePack.hasNormalMaps ? "yes" : "no") << ")" << std::endl;
+
+    // Generate biome colormaps for grass/foliage tinting
+    BiomeColormap biomeColormap;
+    biomeColormap.generate();
 
     // Initialize vertex pool for reduced allocation overhead
     if (g_useVertexPool) {
@@ -5051,14 +5458,18 @@ int main() {
         }
     }
 
-    // Initialize UI elements
+    // ============================================
+    // UI ELEMENTS (OpenGL-only for now)
+    // These render helpers need OpenGL context
+    // ============================================
     Crosshair crosshair;
-    crosshair.init();
-
     BlockHighlight blockHighlight;
-    blockHighlight.init();
-
+    MiningCrackOverlay miningCrackOverlay;
     ChunkBorderRenderer chunkBorderRenderer;
+
+    crosshair.init();
+    blockHighlight.init();
+    miningCrackOverlay.init();
     chunkBorderRenderer.init();
 
     // ============================================
@@ -5070,6 +5481,7 @@ int main() {
     worldCreateScreen.init(&menuUI);
     pauseMenu.init(&menuUI);
     settingsMenu.init(&menuUI);
+    texturePackScreen.init(&menuUI, &texturePack);
 
     // Initialize keybind system
     KeybindManager::getInstance().init();
@@ -5079,14 +5491,23 @@ int main() {
     controlsScreen.init(&menuUI);
     loadingScreen3D.init(WINDOW_WIDTH, WINDOW_HEIGHT);
     debugOverlay.init(&menuUI);
-    debugOverlay.setGPUInfo(
-        reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
-        reinterpret_cast<const char*>(glGetString(GL_VERSION))
-    );
+    if (!g_useVulkanBackend) {
+        debugOverlay.setGPUInfo(
+            reinterpret_cast<const char*>(glGetString(GL_RENDERER)),
+            reinterpret_cast<const char*>(glGetString(GL_VERSION))
+        );
+    } else {
+        // Vulkan: GPU info will be set after RHI init
+        debugOverlay.setGPUInfo("Vulkan Renderer", "Vulkan 1.x");
+    }
     debugOverlay.setRendererBackend(
         g_config.renderer == RendererType::VULKAN ? "Vulkan" : "OpenGL 4.6"
     );
-    panoramaRenderer.init(42424242);
+    // Generate random seed for title screen world
+    std::random_device rd;
+    int panoramaSeed = static_cast<int>(rd());
+    std::cout << "[TitleScreen] Random panorama seed: " << panoramaSeed << std::endl;
+    panoramaRenderer.init(panoramaSeed);
     panoramaRenderer.setProjection(WINDOW_WIDTH, WINDOW_HEIGHT);
     PresetManager::init("assets");
     menuInitialized = true;
@@ -5097,6 +5518,16 @@ int main() {
     cursorEnabled = true;
 
     std::cout << "Menu system initialized" << std::endl;
+
+    // Initialize inventory system and crafting recipes
+    CraftingRecipeRegistry::getInstance().init();
+    itemAtlas.generate();  // Generate procedural item textures
+    inventoryUI.init(&menuUI, texturePack.albedoAtlas, itemAtlas.textureID);
+    craftingTableUI.init(&menuUI, texturePack.albedoAtlas, itemAtlas.textureID);
+    jeiPanel.init(&menuUI, texturePack.albedoAtlas, itemAtlas.textureID);
+    droppedItemRenderer.init(texturePack.albedoAtlas, itemAtlas.textureID);
+    playerInventory.initSurvival();  // Give starting items
+    std::cout << "Inventory system initialized" << std::endl;
 
     // Initialize thread pool with config settings
     world.initThreadPool(g_config.chunkThreads, g_config.meshThreads);
@@ -5187,12 +5618,12 @@ int main() {
     };
 
     // =========================================================================
-    // RHI/Deferred Renderer Initialization - CURRENTLY DISABLED
-    // The deferred rendering path has G-buffer issues that need to be fixed.
-    // Forward rendering is more performant for voxel scenes with few lights.
-    // To re-enable: set g_useRHIRenderer = true at top of file
+    // RHI/Deferred Renderer Initialization
+    // For OpenGL mode: This is optional and currently disabled
+    // For Vulkan mode: Already initialized above, this section is skipped
     // =========================================================================
-    if (g_useRHIRenderer) {
+    if (g_useRHIRenderer && !g_rhiRenderer) {
+        // OpenGL RHI path (not currently used, but here for future)
         std::cout << "\n=== Initializing RHI Renderer ===" << std::endl;
         g_rhiRenderer = std::make_unique<Render::DeferredRendererRHI>();
 
@@ -5266,9 +5697,10 @@ int main() {
         // MAIN MENU STATE
         // ============================================================
         if (gameState == GameState::MAIN_MENU) {
-            // Get mouse position for menu
+            // Get mouse position for menu (scaled to framebuffer coordinates)
             double mx, my;
             glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);
             bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 
             // Update panorama
@@ -5326,6 +5758,10 @@ int main() {
                     showSettings = true;
                     settingsMenu.refreshFromConfig();
                 }
+                else if (action == MenuAction::TEXTURE_PACKS) {
+                    texturePackScreen.refreshPackList();
+                    gameState = GameState::TEXTURE_PACKS;
+                }
                 else if (action == MenuAction::EXIT) {
                     glfwSetWindowShouldClose(window, GLFW_TRUE);
                 }
@@ -5374,9 +5810,10 @@ int main() {
         // WORLD SELECT STATE
         // ============================================================
         if (gameState == GameState::WORLD_SELECT) {
-            // Get mouse position for menu
+            // Get mouse position for menu (scaled to framebuffer coordinates)
             double mx, my;
             glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);
             bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 
             // Update panorama
@@ -5451,9 +5888,10 @@ int main() {
         // WORLD CREATE STATE
         // ============================================================
         if (gameState == GameState::WORLD_CREATE) {
-            // Get mouse position for menu
+            // Get mouse position for menu (scaled to framebuffer coordinates)
             double mx, my;
             glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);
             bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 
             // Update panorama
@@ -5507,6 +5945,57 @@ int main() {
 
             // Render world create UI
             worldCreateScreen.render();
+            menuUI.endFrame();
+
+            glfwSwapBuffers(window);
+            continue;
+        }
+
+        // ============================================================
+        // TEXTURE PACKS STATE (from main menu)
+        // ============================================================
+        if (gameState == GameState::TEXTURE_PACKS) {
+            // Get mouse position for menu (scaled to framebuffer coordinates)
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);
+            bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            // Update panorama
+            panoramaRenderer.update(deltaTime);
+
+            // Update texture pack screen
+            texturePackScreen.update(mx, my, mouseDown, deltaTime);
+
+            // Handle actions
+            TexturePackAction tpAction = texturePackScreen.getAction();
+            if (tpAction == TexturePackAction::DONE) {
+                gameState = GameState::MAIN_MENU;
+            }
+
+            // Check for ESC to go back
+            static bool tpEscWasPressed = false;
+            if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+                if (!tpEscWasPressed) {
+                    gameState = GameState::MAIN_MENU;
+                    tpEscWasPressed = true;
+                }
+            } else {
+                tpEscWasPressed = false;
+            }
+
+            // Render - ensure we're on the default framebuffer
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+            // Render 3D panorama background
+            panoramaRenderer.render();
+
+            // Setup for 2D rendering (overlay on top of panorama)
+            menuUI.beginFrame();
+
+            // Render texture pack screen
+            texturePackScreen.render();
             menuUI.endFrame();
 
             glfwSwapBuffers(window);
@@ -5607,14 +6096,32 @@ int main() {
                     glm::vec3 loadedPos;
                     float loadedYaw, loadedPitch;
                     bool loadedFlying;
+                    int loadedHealth, loadedHunger, loadedAir;
+                    float loadedSaturation;
+                    glm::vec3 loadedSpawnPoint;
 
                     if (loadingExistingWorld &&
                         WorldSaveLoad::loadPlayer(worldSaveLoad.currentWorldPath,
-                                                 loadedPos, loadedYaw, loadedPitch, loadedFlying)) {
+                                                 loadedPos, loadedYaw, loadedPitch, loadedFlying,
+                                                 loadedHealth, loadedHunger, loadedAir,
+                                                 loadedSaturation, loadedSpawnPoint)) {
                         player->position = loadedPos;
                         player->isFlying = loadedFlying;
+                        player->health = loadedHealth;
+                        player->hunger = loadedHunger;
+                        player->air = loadedAir;
+                        player->saturation = loadedSaturation;
+                        player->spawnPoint = loadedSpawnPoint;
                         camera.setOrientation(loadedYaw, loadedPitch);
                         std::cout << "Loaded player position from save" << std::endl;
+
+                        // Load inventory
+                        int loadedSelectedSlot = 0;
+                        if (WorldSaveLoad::loadInventory(worldSaveLoad.currentWorldPath,
+                                                        playerInventory.slots, loadedSelectedSlot)) {
+                            playerInventory.selectedSlot = loadedSelectedSlot;
+                            std::cout << "Loaded inventory from save" << std::endl;
+                        }
                     } else {
                         // Find spawn point for new worlds
                         for (int y = 200; y > 0; y--) {
@@ -5624,6 +6131,7 @@ int main() {
                             }
                         }
                         player->position = spawnPos;
+                        player->spawnPoint = spawnPos;  // Set initial spawn point
                     }
                     camera.position = player->position + glm::vec3(0, Player::EYE_HEIGHT, 0);
 
@@ -5675,12 +6183,59 @@ int main() {
         }
 
         // ============================================================
+        // TEXTURE PACKS STATE (from pause menu - renders over game world)
+        // ============================================================
+        if (gameState == GameState::TEXTURE_PACKS_PAUSE) {
+            // Get mouse position for menu (scaled to framebuffer coordinates)
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);
+            bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            // Update texture pack screen
+            texturePackScreen.update(mx, my, mouseDown, deltaTime);
+
+            // Handle actions
+            TexturePackAction tpAction = texturePackScreen.getAction();
+            if (tpAction == TexturePackAction::DONE) {
+                gameState = GameState::PAUSED;
+            }
+
+            // Check for ESC to go back to pause menu
+            static bool tpPauseEscWasPressed = false;
+            if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
+                if (!tpPauseEscWasPressed) {
+                    gameState = GameState::PAUSED;
+                    tpPauseEscWasPressed = true;
+                }
+            } else {
+                tpPauseEscWasPressed = false;
+            }
+
+            // Render game world in background (frozen)
+            // Skip actual game rendering, just clear and draw the overlay
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
+
+            // Setup for 2D rendering (texture pack screen over game)
+            menuUI.beginFrame();
+
+            // Render texture pack screen
+            texturePackScreen.render();
+            menuUI.endFrame();
+
+            glfwSwapBuffers(window);
+            continue;
+        }
+
+        // ============================================================
         // PAUSED STATE - In-game pause menu with settings
         // ============================================================
         if (gameState == GameState::PAUSED) {
-            // Get mouse position for menu
+            // Get mouse position for menu (scaled to framebuffer coordinates)
             double mx, my;
             glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);
             bool mouseDown = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 
             // Handle ESC to unpause (when not in settings)
@@ -5744,18 +6299,29 @@ int main() {
                     showSettings = true;
                     settingsMenu.refreshFromConfig();
                 }
+                else if (pauseAction == PauseAction::TEXTURE_PACKS) {
+                    texturePackScreen.refreshPackList();
+                    gameState = GameState::TEXTURE_PACKS_PAUSE;
+                }
                 else if (pauseAction == PauseAction::SAVE_GAME) {
                     // Save all modified chunks
                     if (worldSaveLoad.hasLoadedWorld) {
                         int savedChunks = WorldSaveLoad::saveAllChunks(worldSaveLoad.currentWorldPath, world);
 
-                        // Save player position
+                        // Save player position and survival stats
                         if (player) {
                             WorldSaveLoad::savePlayer(worldSaveLoad.currentWorldPath,
                                                      player->position,
                                                      camera.yaw, camera.pitch,
-                                                     player->isFlying);
+                                                     player->isFlying,
+                                                     player->health, player->hunger, player->air,
+                                                     player->saturation, player->spawnPoint);
                         }
+
+                        // Save inventory
+                        WorldSaveLoad::saveInventory(worldSaveLoad.currentWorldPath,
+                                                    playerInventory.slots,
+                                                    playerInventory.selectedSlot);
 
                         // Thumbnail is already captured when ESC was pressed (before pause overlay)
 
@@ -5773,8 +6339,14 @@ int main() {
                             WorldSaveLoad::savePlayer(worldSaveLoad.currentWorldPath,
                                                      player->position,
                                                      camera.yaw, camera.pitch,
-                                                     player->isFlying);
+                                                     player->isFlying,
+                                                     player->health, player->hunger, player->air,
+                                                     player->saturation, player->spawnPoint);
                         }
+                        // Save inventory
+                        WorldSaveLoad::saveInventory(worldSaveLoad.currentWorldPath,
+                                                    playerInventory.slots,
+                                                    playerInventory.selectedSlot);
                         WorldSaveLoad::updateLastPlayed(worldSaveLoad.currentWorldPath);
                     }
 
@@ -5839,15 +6411,14 @@ int main() {
             escWasPressedPlaying = escPressed;
         }
 
-        // Reset window title when playing
-        static bool titleReset = false;
-        if (!titleReset) {
+        // Detect transition into PLAYING state (from any other state)
+        static GameState prevState = GameState::MAIN_MENU;
+        if (prevState != GameState::PLAYING) {
             glfwSetWindowTitle(window, "Voxel Engine");
             std::cout << "Entering PLAYING state - deferred rendering: " << (g_useDeferredRendering ? "ON" : "OFF") << std::endl;
-            std::cout << std::flush;
             LOG_INFO("Game", "Entered PLAYING state");
-            titleReset = true;
         }
+        prevState = gameState;
 
         // ============================================
         // PERFORMANCE STATS - Read GPU timers from previous frame
@@ -6124,6 +6695,49 @@ int main() {
             player->update(deltaTime, world,
                            input.forward, input.backward, input.left, input.right,
                            input.jump, input.descend, input.sprint);
+
+            // Update survival mechanics (fall damage, drowning, hunger, etc.)
+            float armorReduction = playerInventory.getDamageReduction();
+            int damageTaken = player->updateSurvival(deltaTime, world, armorReduction);
+
+            // Damage armor when player takes damage
+            if (damageTaken > 0) {
+                playerInventory.damageArmor(damageTaken);
+            }
+
+            survivalHUD.update(deltaTime);
+            inventoryUI.update(deltaTime);
+
+            // Update dropped items (physics, pickup)
+            droppedItems.update(deltaTime, world, player->position, playerInventory);
+
+            // Update eating if right-click is held
+            if (player->isEating && rightMousePressed) {
+                // Check if still holding food
+                ItemStack& heldItem = playerInventory.getSelectedStack();
+                if (heldItem.isFood()) {
+                    // Update eating progress
+                    if (player->updateEating(deltaTime)) {
+                        // Eating complete - consume the food item
+                        heldItem.remove(1);
+                    }
+                } else {
+                    // Switched items or ran out of food - cancel eating
+                    player->cancelEating();
+                }
+            } else if (player->isEating && !rightMousePressed) {
+                // Right-click released during eating
+                player->cancelEating();
+            }
+
+            // Handle death - respawn when space is pressed after 2 seconds dead
+            if (player->isDead) {
+                player->deathTimer += deltaTime;
+                if (input.jump && player->deathTimer >= 2.0f) {
+                    player->respawn();
+                }
+            }
+
             if (!loggedFirstFrame) {
                 LOG_DEBUG("Game", "First frame player update complete");
                 loggedFirstFrame = true;
@@ -6140,6 +6754,112 @@ int main() {
                 return isBlockSolid(block);
             }
         );
+
+        // Update mining progress (survival mode block breaking)
+        if (miningState.isMining && leftMousePressed && !inventoryUI.isOpen) {
+            // Check if still looking at the same block
+            bool sameBlock = currentTarget.has_value() &&
+                             currentTarget->blockPos == miningState.targetBlock;
+
+            // Check if block still exists and is the same type
+            BlockType currentBlock = world.getBlock(miningState.targetBlock.x,
+                                                     miningState.targetBlock.y,
+                                                     miningState.targetBlock.z);
+
+            if (sameBlock && currentBlock == miningState.targetBlockType) {
+                // Continue mining
+                if (miningState.miningTime > 0.0f) {
+                    miningState.miningProgress += deltaTime / miningState.miningTime;
+                } else {
+                    // Instant break for 0 hardness blocks
+                    miningState.miningProgress = 1.0f;
+                }
+
+                // Block is fully mined
+                if (miningState.miningProgress >= 1.0f) {
+                    // Get held item info for harvest check
+                    ItemStack& heldItem = playerInventory.getSelectedStack();
+                    ToolCategory heldToolCat = ToolCategory::NONE;
+                    ToolTier heldToolTier = ToolTier::NONE;
+                    if (heldItem.isItem() && heldItem.isTool()) {
+                        const ItemProperties& props = getItemProperties(heldItem.itemType);
+                        heldToolCat = props.toolCategory;
+                        heldToolTier = props.toolTier;
+                    }
+
+                    // Check if we can harvest this block with our current tool
+                    bool canHarvest = canHarvestBlock(miningState.targetBlockType,
+                                                      static_cast<int>(heldToolCat),
+                                                      static_cast<int>(heldToolTier));
+
+                    // Remove the block
+                    world.setBlock(miningState.targetBlock.x,
+                                  miningState.targetBlock.y,
+                                  miningState.targetBlock.z,
+                                  BlockType::AIR);
+
+                    // Only give drops if we can harvest (correct tool tier)
+                    if (canHarvest) {
+                        // Get drop using new system that supports item drops
+                        BlockDrop drop = getBlockDropNew(miningState.targetBlockType);
+                        if (drop.count > 0) {
+                            // Spawn dropped item entity at block position
+                            glm::vec3 dropPos(miningState.targetBlock.x,
+                                             miningState.targetBlock.y,
+                                             miningState.targetBlock.z);
+                            droppedItems.spawnBlockDrop(dropPos, drop);
+                        }
+                    }
+
+                    // Damage tool durability (if holding a tool)
+                    if (heldItem.isItem() && heldItem.hasDurability()) {
+                        if (heldItem.useDurability(1)) {
+                            // Tool broke - trigger breaking effect and clear the slot
+                            int winW, winH;
+                            glfwGetWindowSize(window, &winW, &winH);
+                            float scale = g_config.guiScale;
+                            float hotbarSlotSize = 44.0f * scale;
+                            float hotbarGap = 2.0f * scale;
+                            float hotbarWidth = 9 * (hotbarSlotSize + hotbarGap) - hotbarGap;
+                            float hotbarX = (winW - hotbarWidth) / 2.0f;
+                            float hotbarY = winH - hotbarSlotSize - 8.0f * scale;
+                            float effectX = hotbarX + playerInventory.selectedSlot * (hotbarSlotSize + hotbarGap) + hotbarSlotSize / 2.0f;
+                            float effectY = hotbarY + hotbarSlotSize / 2.0f;
+                            inventoryUI.triggerBreakingEffect(effectX, effectY);
+
+                            heldItem.clear();
+                        }
+                    }
+
+                    // Reset mining state
+                    miningState.isMining = false;
+                    miningState.miningProgress = 0.0f;
+                }
+            } else {
+                // Looking at different block or block changed - reset mining
+                miningState.isMining = false;
+                miningState.miningProgress = 0.0f;
+
+                // If looking at a new breakable block, start mining it
+                if (currentTarget.has_value()) {
+                    BlockType newBlock = world.getBlock(currentTarget->blockPos.x,
+                                                        currentTarget->blockPos.y,
+                                                        currentTarget->blockPos.z);
+                    if (isBlockBreakable(newBlock)) {
+                        miningState.isMining = true;
+                        miningState.targetBlock = currentTarget->blockPos;
+                        miningState.targetBlockType = newBlock;
+                        miningState.miningProgress = 0.0f;
+                        miningState.miningTime = calculateMiningTime(newBlock, playerInventory.getSelectedStack());
+                    }
+                }
+            }
+        } else if (!leftMousePressed) {
+            // Not mining - reset state
+            miningState.isMining = false;
+            miningState.miningProgress = 0.0f;
+        }
+
         auto inputEnd = std::chrono::high_resolution_clock::now();
         g_perfStats.inputProcessMs = std::chrono::duration<double, std::milli>(inputEnd - inputStart).count();
 
@@ -6304,7 +7024,7 @@ int main() {
 
                 g_rhiRenderer->setLighting(lighting);
                 g_rhiRenderer->setFog(fog);
-                g_rhiRenderer->setTextureAtlas(textureAtlas.textureID);
+                g_rhiRenderer->setTextureAtlas(texturePack.albedoAtlas);
 
                 // Render frame using RHI
                 static bool loggedFirstRender = false;
@@ -6414,7 +7134,7 @@ int main() {
             glUniformMatrix4fv(zPrepassViewLoc, 1, GL_FALSE, glm::value_ptr(view));
             glUniformMatrix4fv(zPrepassProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
 
-            textureAtlas.bind(0);
+            texturePack.bindAlbedoOnly(0);  // Z-prepass only needs albedo for alpha testing
             glUniform1i(zPrepassTexAtlasLoc, 0);
 
             // Render world depth-only
@@ -6456,8 +7176,9 @@ int main() {
             glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
             glClear(GL_COLOR_BUFFER_BIT);
 
-            // Bind texture atlas (needed for both rendering paths)
-            textureAtlas.bind(0);
+            // Bind texture atlas, normal map, and biome colormap (needed for both rendering paths)
+            texturePack.bind(0, 3);  // Albedo on unit 0, normal map on unit 3
+            biomeColormap.bind(4, 5);  // Grass on unit 4, water on unit 5
 
             // Choose rendering path: Mesh Shaders > Batched > Traditional
             if (g_enableMeshShaders && g_meshShadersAvailable && meshShaderProgram != 0) {
@@ -6472,6 +7193,9 @@ int main() {
                 glUniformMatrix4fv(gBufferViewLoc, 1, GL_FALSE, glm::value_ptr(view));
                 glUniformMatrix4fv(gBufferProjectionLoc, 1, GL_FALSE, glm::value_ptr(projection));
                 glUniform1i(gBufferTexAtlasLoc, 0);
+                glUniform1i(gBufferNormalMapLoc, 3);
+                glUniform1i(gBufferGrassColormapLoc, 4);
+                glUniform1i(gBufferUseNormalMapLoc, texturePack.normalMapsAvailable() ? 1 : 0);
 
                 if (g_enableGPUCulling && world.gpuCullingInitialized) {
                     // ============================================
@@ -6934,6 +7658,7 @@ int main() {
             glUniform1f(compositeUnderwaterLoc, player->isUnderwater ? 1.0f : 0.0f);
             glUniform1i(compositeDebugModeLoc, g_deferredDebugMode);
             glUniform1f(compositeRenderDistLoc, static_cast<float>(world.renderDistance * 16));  // Convert chunks to blocks
+            glUniform1f(compositeBrightnessLoc, g_config.brightness);
 
             // Set inverse view-projection matrix for position reconstruction from depth
             glm::mat4 viewProj = projection * view;
@@ -7035,10 +7760,17 @@ int main() {
             float sunUp = glm::max(0.0f, lightDir.y);
             float shadowStr = sunUp > 0.1f ? 0.6f : 0.0f;  // Only cast shadows when sun is up
             glUniform1f(shadowStrengthLoc, shadowStr);
+            glUniform1f(brightnessLoc, g_config.brightness);
 
-            // Bind texture atlas to slot 0
-            textureAtlas.bind(0);
+            // Bind texture atlas and normal map
+            texturePack.bind(0, 3);  // Albedo on unit 0, normal map on unit 3
             glUniform1i(texAtlasLoc, 0);
+            glUniform1i(normalMapLoc, 3);
+            glUniform1i(useNormalMapLoc, texturePack.normalMapsAvailable() ? 1 : 0);
+
+            // Bind biome colormap for grass/foliage tinting
+            biomeColormap.bind(4, 5);  // Grass on unit 4, water on unit 5
+            glUniform1i(grassColormapLoc, 4);
 
             // Bind shadow map to slot 1
             glActiveTexture(GL_TEXTURE1);
@@ -7057,7 +7789,7 @@ int main() {
                     camera.position, view, projection,
                     lightDir, lightColor, ambientColor, skyColor,
                     fogDensity, static_cast<float>(glfwGetTime()),
-                    viewportSize, textureAtlas.textureID
+                    viewportSize, texturePack.albedoAtlas
                 );
             }
         } // End of deferred/forward rendering path selection
@@ -7094,6 +7826,11 @@ int main() {
         world.renderWater(camera.position, waterChunkOffsetLoc);
 
         glEndQuery(GL_TIME_ELAPSED);
+
+        // ============================================================
+        // Render Dropped Items
+        // ============================================================
+        droppedItemRenderer.render(droppedItems, view, projection, camera.position);
 
         // ============================================================
         // Render Precipitation (rain/snow)
@@ -7153,6 +7890,10 @@ int main() {
         // Render block highlight
         if (currentTarget.has_value() && !wireframeMode) {
             blockHighlight.render(currentTarget->blockPos, view, projection);
+            // Render mining crack overlay when mining
+            if (miningState.isMining && miningState.miningProgress > 0.0f) {
+                miningCrackOverlay.render(miningState.targetBlock, miningState.miningProgress, view, projection);
+            }
         }
 
         // Render chunk borders (F3+G)
@@ -7160,8 +7901,104 @@ int main() {
             chunkBorderRenderer.render(camera.position, world.renderDistance, view, projection);
         }
 
-        // Render crosshair
-        crosshair.render();
+        // Render crosshair (not when inventory or crafting table is open)
+        if (!inventoryUI.isOpen && !craftingTableUI.isOpen) {
+            crosshair.render();
+        }
+
+        // Render survival HUD and hotbar (not when full inventory/crafting screen is open)
+        if (player && !inventoryUI.isOpen && !craftingTableUI.isOpen) {
+            menuUI.beginFrame();
+            survivalHUD.render(*player, menuUI);
+            // Render hotbar at bottom of screen (below survival HUD)
+            inventoryUI.renderHotbar(playerInventory);
+
+            // Render tool breaking effect (particles when tool breaks)
+            inventoryUI.renderBreakingEffect(g_config.guiScale);
+
+            // Render mining progress bar (when actively mining)
+            if (miningState.isMining && miningState.miningProgress > 0.0f) {
+                float barWidth = 100.0f * g_config.guiScale;
+                float barHeight = 6.0f * g_config.guiScale;
+                float barX = (menuUI.windowWidth - barWidth) / 2.0f;
+                float barY = menuUI.windowHeight / 2.0f + 20.0f * g_config.guiScale;
+
+                // Background (dark gray)
+                menuUI.drawRect(barX - 1, barY - 1, barWidth + 2, barHeight + 2,
+                               glm::vec4(0.1f, 0.1f, 0.1f, 0.8f));
+
+                // Progress fill (green to yellow based on progress)
+                float progress = std::min(miningState.miningProgress, 1.0f);
+                glm::vec4 progressColor = glm::mix(
+                    glm::vec4(0.2f, 0.7f, 0.2f, 0.9f),  // Green at start
+                    glm::vec4(0.9f, 0.8f, 0.2f, 0.9f),  // Yellow at end
+                    progress
+                );
+                menuUI.drawRect(barX, barY, barWidth * progress, barHeight, progressColor);
+
+                // Border
+                menuUI.drawRectOutline(barX - 1, barY - 1, barWidth + 2, barHeight + 2,
+                                      glm::vec4(0.3f, 0.3f, 0.3f, 1.0f), 1.0f);
+            }
+
+            menuUI.endFrame();
+        }
+
+        // Render full inventory screen when open
+        if (inventoryUI.isOpen) {
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);  // Convert to framebuffer coordinates
+            menuUI.beginFrame();
+            inventoryUI.render(playerInventory, static_cast<float>(mx), static_cast<float>(my));
+
+            // Render JEI panel next to inventory
+            if (jeiPanel.isVisible) {
+                // Calculate inventory panel position/size for JEI alignment
+                float scale = g_config.guiScale;
+                float slotSize = 40.0f * scale;
+                float slotGap = 2.0f * scale;
+                float padding = 12.0f * scale;
+                float gridWidth = 9 * (slotSize + slotGap) - slotGap;
+                float topSectionHeight = 4 * (slotSize + slotGap);
+                float invHeight = 3 * (slotSize + slotGap);
+                float hotbarHeight = slotSize;
+                float sectionGap = 8 * scale;
+                float hotbarGapY = 6 * scale;
+                float totalWidth = gridWidth + padding * 2;
+                float totalHeight = padding + topSectionHeight + sectionGap + invHeight + hotbarGapY + hotbarHeight + padding;
+                float panelX = (menuUI.windowWidth - totalWidth) / 2.0f;
+                float panelY = (menuUI.windowHeight - totalHeight) / 2.0f;
+
+                jeiPanel.render(static_cast<float>(mx), static_cast<float>(my), panelX, totalWidth, panelY, totalHeight);
+            }
+            menuUI.endFrame();
+        }
+
+        // Render crafting table screen when open
+        if (craftingTableUI.isOpen) {
+            double mx, my;
+            glfwGetCursorPos(window, &mx, &my);
+            scaleMouseToFramebuffer(mx, my);  // Convert to framebuffer coordinates
+            menuUI.beginFrame();
+            craftingTableUI.render(playerInventory, static_cast<float>(mx), static_cast<float>(my));
+
+            // Render JEI panel next to crafting table
+            if (jeiPanel.isVisible) {
+                float scale = g_config.guiScale;
+                float slotSize = 40.0f * scale;
+                float slotGap = 2.0f * scale;
+                float padding = 12.0f * scale;
+                float gridWidth = 9 * (slotSize + slotGap) - slotGap;
+                float panelWidth = std::max(gridWidth, 3 * (slotSize + slotGap) * 2 + slotSize + padding * 4);
+                float panelHeight = padding * 2 + slotSize * 3 + slotGap * 2 + padding + slotSize * 4 + slotGap * 3 + padding;
+                float panelX = (menuUI.windowWidth - panelWidth) / 2.0f;
+                float panelY = (menuUI.windowHeight - panelHeight) / 2.0f;
+
+                jeiPanel.render(static_cast<float>(mx), static_cast<float>(my), panelX, panelWidth, panelY, panelHeight);
+            }
+            menuUI.endFrame();
+        }
 
         // Render debug overlay (F3)
         if (debugOverlay.visible) {
@@ -7299,7 +8136,8 @@ int main() {
 
     crosshair.destroy();
     blockHighlight.destroy();
-    textureAtlas.destroy();
+    miningCrackOverlay.destroy();
+    texturePack.destroy();
     glDeleteProgram(shaderProgram);
     glDeleteProgram(waterShaderProgram);
     glDeleteProgram(skyShaderProgram);

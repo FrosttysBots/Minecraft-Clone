@@ -99,6 +99,11 @@ public:
                                (void*)offsetof(PackedChunkVertex, normalIndex));
         glEnableVertexAttribArray(2);
 
+        // Biome data: 2 unsigned bytes (biomeTemp, biomeHumid) at offset 14
+        glVertexAttribIPointer(3, 2, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                               (void*)offsetof(PackedChunkVertex, biomeTemp));
+        glEnableVertexAttribArray(3);
+
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
 
@@ -270,6 +275,11 @@ public:
         glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
                                (void*)offsetof(PackedChunkVertex, normalIndex));
         glEnableVertexAttribArray(2);
+
+        // Biome data: 2 unsigned bytes (biomeTemp, biomeHumid) at offset 14
+        glVertexAttribIPointer(3, 2, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                               (void*)offsetof(PackedChunkVertex, biomeTemp));
+        glEnableVertexAttribArray(3);
 
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);

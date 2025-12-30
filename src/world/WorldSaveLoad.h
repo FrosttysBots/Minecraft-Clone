@@ -5,6 +5,7 @@
 
 #include "Chunk.h"
 #include "../ui/WorldSelectScreen.h"
+#include "../core/Inventory.h"
 #include <string>
 #include <fstream>
 #include <filesystem>
@@ -209,14 +210,24 @@ public:
     // Defined in World.h after World class is complete
     static int saveAllChunks(const std::string& worldPath, World& world);
 
-    // Save player position
+    // Player data version for backward compatibility
+    static constexpr int32_t PLAYER_DATA_VERSION = 2;  // Version 2 adds survival stats
+
+    // Save player position and survival stats
     static bool savePlayer(const std::string& worldPath, const glm::vec3& position,
-                          float yaw, float pitch, bool isFlying) {
+                          float yaw, float pitch, bool isFlying,
+                          int health = 20, int hunger = 20, int air = 300,
+                          float saturation = 5.0f, const glm::vec3& spawnPoint = glm::vec3(0, 80, 0)) {
         std::string playerPath = worldPath + "/player.dat";
 
         std::ofstream file(playerPath, std::ios::binary);
         if (!file.is_open()) return false;
 
+        // Version header
+        int32_t version = PLAYER_DATA_VERSION;
+        file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+
+        // Position and rotation
         file.write(reinterpret_cast<const char*>(&position.x), sizeof(float));
         file.write(reinterpret_cast<const char*>(&position.y), sizeof(float));
         file.write(reinterpret_cast<const char*>(&position.z), sizeof(float));
@@ -225,18 +236,44 @@ public:
         uint8_t flyingFlag = isFlying ? 1 : 0;
         file.write(reinterpret_cast<const char*>(&flyingFlag), sizeof(uint8_t));
 
+        // Survival stats (Version 2+)
+        file.write(reinterpret_cast<const char*>(&health), sizeof(int));
+        file.write(reinterpret_cast<const char*>(&hunger), sizeof(int));
+        file.write(reinterpret_cast<const char*>(&air), sizeof(int));
+        file.write(reinterpret_cast<const char*>(&saturation), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&spawnPoint.x), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&spawnPoint.y), sizeof(float));
+        file.write(reinterpret_cast<const char*>(&spawnPoint.z), sizeof(float));
+
         file.close();
         return true;
     }
 
-    // Load player position
+    // Load player position and survival stats
     static bool loadPlayer(const std::string& worldPath, glm::vec3& position,
-                          float& yaw, float& pitch, bool& isFlying) {
+                          float& yaw, float& pitch, bool& isFlying,
+                          int& health, int& hunger, int& air,
+                          float& saturation, glm::vec3& spawnPoint) {
         std::string playerPath = worldPath + "/player.dat";
 
         std::ifstream file(playerPath, std::ios::binary);
         if (!file.is_open()) return false;
 
+        // Check file size to detect version
+        file.seekg(0, std::ios::end);
+        std::streamsize fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+
+        int32_t version = 1;  // Default to version 1 for old saves
+
+        // Version 2+ has version header; version 1 starts with position (float)
+        // Detect by file size: v1 = 25 bytes, v2 = 4 + 25 + 28 = 57 bytes
+        if (fileSize > 30) {
+            // Likely version 2+, read version header
+            file.read(reinterpret_cast<char*>(&version), sizeof(version));
+        }
+
+        // Position and rotation
         file.read(reinterpret_cast<char*>(&position.x), sizeof(float));
         file.read(reinterpret_cast<char*>(&position.y), sizeof(float));
         file.read(reinterpret_cast<char*>(&position.z), sizeof(float));
@@ -246,8 +283,36 @@ public:
         file.read(reinterpret_cast<char*>(&flyingFlag), sizeof(uint8_t));
         isFlying = flyingFlag != 0;
 
+        // Survival stats (Version 2+)
+        if (version >= 2 && file.good()) {
+            file.read(reinterpret_cast<char*>(&health), sizeof(int));
+            file.read(reinterpret_cast<char*>(&hunger), sizeof(int));
+            file.read(reinterpret_cast<char*>(&air), sizeof(int));
+            file.read(reinterpret_cast<char*>(&saturation), sizeof(float));
+            file.read(reinterpret_cast<char*>(&spawnPoint.x), sizeof(float));
+            file.read(reinterpret_cast<char*>(&spawnPoint.y), sizeof(float));
+            file.read(reinterpret_cast<char*>(&spawnPoint.z), sizeof(float));
+        } else {
+            // Default survival stats for old saves
+            health = 20;
+            hunger = 20;
+            air = 300;
+            saturation = 5.0f;
+            spawnPoint = position;  // Use current position as spawn
+        }
+
         file.close();
         return true;
+    }
+
+    // Legacy load function for backward compatibility
+    static bool loadPlayer(const std::string& worldPath, glm::vec3& position,
+                          float& yaw, float& pitch, bool& isFlying) {
+        int health, hunger, air;
+        float saturation;
+        glm::vec3 spawnPoint;
+        return loadPlayer(worldPath, position, yaw, pitch, isFlying,
+                         health, hunger, air, saturation, spawnPoint);
     }
 
     // Get list of chunk positions that exist in save
@@ -282,5 +347,152 @@ public:
         }
 
         return positions;
+    }
+
+    // ===== INVENTORY SAVE/LOAD =====
+    // Version 1: Old format (BlockType only)
+    // Version 2: New format (StackType + Block/Item + Durability)
+    static constexpr int32_t INVENTORY_DATA_VERSION = 2;
+
+    // Save inventory to file
+    static bool saveInventory(const std::string& worldPath, const std::array<ItemStack, TOTAL_SLOTS>& slots, int selectedSlot) {
+        std::string invPath = worldPath + "/inventory.dat";
+
+        std::ofstream file(invPath, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        // Version header
+        int32_t version = INVENTORY_DATA_VERSION;
+        file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+
+        // Slot count
+        int32_t slotCount = TOTAL_SLOTS;
+        file.write(reinterpret_cast<const char*>(&slotCount), sizeof(slotCount));
+
+        // Each slot: stackType (uint8) + typeId (uint16) + count (int32) + durability (int32)
+        for (const auto& slot : slots) {
+            uint8_t stackType = static_cast<uint8_t>(slot.stackType);
+            uint16_t typeId = 0;
+            if (slot.isBlock()) {
+                typeId = static_cast<uint16_t>(slot.blockType);
+            } else if (slot.isItem()) {
+                typeId = static_cast<uint16_t>(slot.itemType);
+            }
+            int32_t count = slot.count;
+            int32_t durability = slot.durability;
+
+            file.write(reinterpret_cast<const char*>(&stackType), sizeof(stackType));
+            file.write(reinterpret_cast<const char*>(&typeId), sizeof(typeId));
+            file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+            file.write(reinterpret_cast<const char*>(&durability), sizeof(durability));
+        }
+
+        // Selected slot
+        int32_t selected = selectedSlot;
+        file.write(reinterpret_cast<const char*>(&selected), sizeof(selected));
+
+        file.close();
+        return true;
+    }
+
+    // Load inventory from file
+    static bool loadInventory(const std::string& worldPath, std::array<ItemStack, TOTAL_SLOTS>& slots, int& selectedSlot) {
+        std::string invPath = worldPath + "/inventory.dat";
+
+        std::ifstream file(invPath, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        // Version header
+        int32_t version;
+        file.read(reinterpret_cast<char*>(&version), sizeof(version));
+
+        // Handle version 1 (old format - blocks only)
+        if (version == 1) {
+            int32_t slotCount;
+            file.read(reinterpret_cast<char*>(&slotCount), sizeof(slotCount));
+
+            int slotsToRead = std::min(slotCount, static_cast<int32_t>(TOTAL_SLOTS));
+            for (int i = 0; i < slotsToRead; i++) {
+                uint8_t type;
+                int32_t count;
+                file.read(reinterpret_cast<char*>(&type), sizeof(type));
+                file.read(reinterpret_cast<char*>(&count), sizeof(count));
+                // Convert old format to new: treat as block
+                if (count > 0 && type != 0) {
+                    slots[i] = ItemStack(static_cast<BlockType>(type), count);
+                } else {
+                    slots[i].clear();
+                }
+            }
+
+            // Skip any extra slots in file
+            for (int i = slotsToRead; i < slotCount; i++) {
+                uint8_t type;
+                int32_t count;
+                file.read(reinterpret_cast<char*>(&type), sizeof(type));
+                file.read(reinterpret_cast<char*>(&count), sizeof(count));
+            }
+
+            int32_t selected;
+            file.read(reinterpret_cast<char*>(&selected), sizeof(selected));
+            selectedSlot = std::clamp(static_cast<int>(selected), 0, HOTBAR_SLOTS - 1);
+
+            file.close();
+            return true;
+        }
+
+        // Handle version 2 (new format - blocks and items with durability)
+        if (version != INVENTORY_DATA_VERSION) {
+            file.close();
+            return false;
+        }
+
+        // Slot count
+        int32_t slotCount;
+        file.read(reinterpret_cast<char*>(&slotCount), sizeof(slotCount));
+
+        // Read slots (up to what we have space for)
+        int slotsToRead = std::min(slotCount, static_cast<int32_t>(TOTAL_SLOTS));
+        for (int i = 0; i < slotsToRead; i++) {
+            uint8_t stackType;
+            uint16_t typeId;
+            int32_t count;
+            int32_t durability;
+
+            file.read(reinterpret_cast<char*>(&stackType), sizeof(stackType));
+            file.read(reinterpret_cast<char*>(&typeId), sizeof(typeId));
+            file.read(reinterpret_cast<char*>(&count), sizeof(count));
+            file.read(reinterpret_cast<char*>(&durability), sizeof(durability));
+
+            if (count <= 0) {
+                slots[i].clear();
+            } else if (stackType == static_cast<uint8_t>(StackType::BLOCK)) {
+                slots[i] = ItemStack(static_cast<BlockType>(typeId), count);
+            } else if (stackType == static_cast<uint8_t>(StackType::ITEM)) {
+                slots[i] = ItemStack(static_cast<ItemType>(typeId), count, durability);
+            } else {
+                slots[i].clear();
+            }
+        }
+
+        // Skip any extra slots in file
+        for (int i = slotsToRead; i < slotCount; i++) {
+            uint8_t stackType;
+            uint16_t typeId;
+            int32_t count;
+            int32_t durability;
+            file.read(reinterpret_cast<char*>(&stackType), sizeof(stackType));
+            file.read(reinterpret_cast<char*>(&typeId), sizeof(typeId));
+            file.read(reinterpret_cast<char*>(&count), sizeof(count));
+            file.read(reinterpret_cast<char*>(&durability), sizeof(durability));
+        }
+
+        // Selected slot
+        int32_t selected;
+        file.read(reinterpret_cast<char*>(&selected), sizeof(selected));
+        selectedSlot = std::clamp(static_cast<int>(selected), 0, HOTBAR_SLOTS - 1);
+
+        file.close();
+        return true;
     }
 };

@@ -51,6 +51,30 @@ private:
 };
 
 // ============================================================================
+// GL DEFAULT FRAMEBUFFER WRAPPER
+// ============================================================================
+// Wraps OpenGL's default framebuffer (FBO 0) for RHI compatibility
+
+class GLDefaultFramebuffer : public RHIFramebuffer {
+public:
+    GLDefaultFramebuffer(uint32_t width, uint32_t height);
+
+    const FramebufferDesc& getDesc() const override { return m_desc; }
+    void* getNativeHandle() const override { return nullptr; }  // FBO 0
+
+    uint32_t getWidth() const override { return m_desc.width; }
+    uint32_t getHeight() const override { return m_desc.height; }
+
+    void resize(uint32_t width, uint32_t height) {
+        m_desc.width = width;
+        m_desc.height = height;
+    }
+
+private:
+    FramebufferDesc m_desc;
+};
+
+// ============================================================================
 // GL SWAPCHAIN
 // ============================================================================
 // OpenGL swapchain is implicit - just wraps the default framebuffer
@@ -73,10 +97,16 @@ public:
     bool present() override;
     void resize(uint32_t width, uint32_t height) override;
 
+    // RHI swapchain interface for backend-agnostic rendering
+    RHIRenderPass* getSwapchainRenderPass() override { return m_renderPass.get(); }
+    RHIFramebuffer* getCurrentFramebufferRHI() override { return m_defaultFramebuffer.get(); }
+
 private:
     GLDevice* m_device = nullptr;
     SwapchainDesc m_desc;
     void* m_window = nullptr;
+    std::unique_ptr<GLRenderPass> m_renderPass;
+    std::unique_ptr<GLDefaultFramebuffer> m_defaultFramebuffer;
 };
 
 } // namespace RHI

@@ -267,7 +267,11 @@ void VKGraphicsPipeline::createPipeline() {
     auto* pipelineLayout = static_cast<VKPipelineLayout*>(m_desc.layout);
     auto* renderPass = static_cast<VKRenderPass*>(m_desc.renderPass);
 
-    if (!pipelineLayout) {
+    // Check for native pipeline layout first
+    if (m_desc.nativePipelineLayout) {
+        m_pipelineLayout = static_cast<VkPipelineLayout>(m_desc.nativePipelineLayout);
+        std::cout << "[VKGraphicsPipeline] Using provided native pipeline layout" << std::endl;
+    } else if (!pipelineLayout) {
         std::cerr << "[VKGraphicsPipeline] Error: pipeline layout is null! Creating default layout..." << std::endl;
 
         // Create a descriptor set layout with a uniform buffer binding at binding 0
@@ -304,7 +308,16 @@ void VKGraphicsPipeline::createPipeline() {
         }
     }
 
-    if (!renderPass) {
+    // Get VkRenderPass from either the wrapper or native handle
+    VkRenderPass vkRenderPass = VK_NULL_HANDLE;
+    if (m_desc.renderPass) {
+        // Use getNativeHandle() which works for both VKRenderPass and VKSwapchainRenderPass
+        vkRenderPass = static_cast<VkRenderPass>(m_desc.renderPass->getNativeHandle());
+    } else if (m_desc.nativeRenderPass) {
+        vkRenderPass = static_cast<VkRenderPass>(m_desc.nativeRenderPass);
+    }
+
+    if (vkRenderPass == VK_NULL_HANDLE) {
         std::cerr << "[VKGraphicsPipeline] Error: render pass is null!" << std::endl;
         return;
     }
@@ -326,7 +339,7 @@ void VKGraphicsPipeline::createPipeline() {
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = pipelineLayout ? pipelineLayout->getVkLayout() : m_pipelineLayout;
-    pipelineInfo.renderPass = renderPass->getVkRenderPass();
+    pipelineInfo.renderPass = vkRenderPass;
     pipelineInfo.subpass = m_desc.subpass;
     pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipelineInfo.basePipelineIndex = -1;
@@ -362,7 +375,10 @@ void VKGraphicsPipeline::createPipeline() {
 }
 
 VkPipelineLayout VKGraphicsPipeline::getVkLayout() const {
-    return static_cast<VKPipelineLayout*>(m_desc.layout)->getVkLayout();
+    if (m_desc.layout) {
+        return static_cast<VKPipelineLayout*>(m_desc.layout)->getVkLayout();
+    }
+    return m_pipelineLayout;  // Return default/native layout
 }
 
 // ============================================================================

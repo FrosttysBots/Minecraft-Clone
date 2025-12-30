@@ -41,8 +41,9 @@ struct PackedChunkVertex {
     // Texture slot index in atlas (0-255)
     uint8_t texSlot;       // 1 byte
 
-    // Padding for 4-byte alignment
-    uint16_t padding;      // 2 bytes
+    // Biome data for grass/foliage tinting (0-255 maps to 0.0-1.0)
+    uint8_t biomeTemp;     // 1 byte - temperature for colormap sampling
+    uint8_t biomeHumid;    // 1 byte - humidity for colormap sampling
 
     // Total: 16 bytes (3x smaller than original 48 bytes)
 };
@@ -146,8 +147,9 @@ struct LODMesh {
 
     void destroy() {
         // Wait for any pending GPU operations before destroying
+        // Use short timeout to avoid blocking - GPU should be done by now
         if (fence != nullptr) {
-            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000); // 1 second timeout
+            glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000); // 1ms timeout (was 1 second!)
             glDeleteSync(fence);
             fence = nullptr;
         }
@@ -180,12 +182,14 @@ struct LODMesh {
 
     // Wait for GPU to finish using this buffer (blocking - use sparingly!)
     // Returns true if GPU is ready, false if timeout/failure occurred
+    // OPTIMIZATION: Reduced timeout to prevent long frame stalls
     bool waitForGPU() {
         if (fence == nullptr) return true;
 
-        // Try multiple short waits to avoid long stalls
-        for (int attempt = 0; attempt < 10; attempt++) {
-            GLenum result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 10000000);  // 10ms per attempt
+        // Short wait to avoid long stalls - 3 attempts × 1ms = 3ms max
+        // If GPU is more than 3ms behind, we bail out and handle it
+        for (int attempt = 0; attempt < 3; attempt++) {
+            GLenum result = glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000);  // 1ms per attempt
             if (result == GL_ALREADY_SIGNALED || result == GL_CONDITION_SATISFIED) {
                 glDeleteSync(fence);
                 fence = nullptr;
@@ -352,6 +356,11 @@ public:
     int waterVertexCount = 0;
     GLsizeiptr waterVboCapacity = 0;
 
+    // 3D lightmap texture for smooth lighting across greedy-meshed quads
+    // Stores light values per-block, sampled in fragment shader using world position
+    // Size: 16 x 256 x 16 (CHUNK_SIZE_X x CHUNK_SIZE_Y x CHUNK_SIZE_Z)
+    GLuint lightmapTexture = 0;
+
     glm::ivec2 chunkPosition;
 
     // World position of chunk origin (needed for shader to reconstruct world positions)
@@ -368,8 +377,10 @@ public:
         : subChunks(std::move(other.subChunks)),
           lodMeshes(std::move(other.lodMeshes)),
           waterVAO(other.waterVAO), waterVBO(other.waterVBO), waterVertexCount(other.waterVertexCount),
-          waterVboCapacity(other.waterVboCapacity), chunkPosition(other.chunkPosition), worldOffset(other.worldOffset)
+          waterVboCapacity(other.waterVboCapacity), lightmapTexture(other.lightmapTexture),
+          chunkPosition(other.chunkPosition), worldOffset(other.worldOffset)
     {
+        other.lightmapTexture = 0;
         // Reset moved-from sub-chunks
         for (auto& sub : other.subChunks) {
             for (auto& lod : sub.lodMeshes) {
@@ -407,8 +418,10 @@ public:
             waterVBO = other.waterVBO;
             waterVertexCount = other.waterVertexCount;
             waterVboCapacity = other.waterVboCapacity;
+            lightmapTexture = other.lightmapTexture;
             chunkPosition = other.chunkPosition;
             worldOffset = other.worldOffset;
+            other.lightmapTexture = 0;
             // Reset moved-from sub-chunks
             for (auto& sub : other.subChunks) {
                 for (auto& lod : sub.lodMeshes) {
@@ -464,6 +477,68 @@ public:
         }
         waterVertexCount = 0;
         waterVboCapacity = 0;
+
+        // Clean up 3D lightmap texture
+        if (lightmapTexture != 0) {
+            glDeleteTextures(1, &lightmapTexture);
+            lightmapTexture = 0;
+        }
+    }
+
+    // Create or update the 3D lightmap texture from chunk light data
+    // This enables smooth lighting across greedy-meshed quads by sampling
+    // light values per-pixel in the fragment shader instead of per-vertex
+    void updateLightmap(const Chunk& chunk) {
+        // Allocate texture data (16 x 256 x 16 = 65536 bytes)
+        std::vector<uint8_t> lightData(CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z);
+
+        // Fill with light values from chunk
+        // 3D texture layout: X varies fastest, then Z, then Y
+        for (int y = 0; y < CHUNK_SIZE_Y; y++) {
+            for (int z = 0; z < CHUNK_SIZE_Z; z++) {
+                for (int x = 0; x < CHUNK_SIZE_X; x++) {
+                    int index = x + z * CHUNK_SIZE_X + y * CHUNK_SIZE_X * CHUNK_SIZE_Z;
+                    // Get light level (0-15) and scale to 0-255
+                    uint8_t light = chunk.getLightLevel(x, y, z);
+                    lightData[index] = light * 17;  // Scale 0-15 to 0-255
+                }
+            }
+        }
+
+        // Create texture if it doesn't exist
+        if (lightmapTexture == 0) {
+            glGenTextures(1, &lightmapTexture);
+            glBindTexture(GL_TEXTURE_3D, lightmapTexture);
+
+            // Set texture parameters for smooth interpolation
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+            // Allocate storage
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_R8,
+                         CHUNK_SIZE_X, CHUNK_SIZE_Z, CHUNK_SIZE_Y,  // width, height, depth
+                         0, GL_RED, GL_UNSIGNED_BYTE, lightData.data());
+        } else {
+            // Update existing texture
+            glBindTexture(GL_TEXTURE_3D, lightmapTexture);
+            glTexSubImage3D(GL_TEXTURE_3D, 0,
+                            0, 0, 0,  // offset
+                            CHUNK_SIZE_X, CHUNK_SIZE_Z, CHUNK_SIZE_Y,  // size
+                            GL_RED, GL_UNSIGNED_BYTE, lightData.data());
+        }
+
+        glBindTexture(GL_TEXTURE_3D, 0);
+    }
+
+    // Bind the lightmap texture to a specific texture unit
+    void bindLightmap(int textureUnit = 2) const {
+        if (lightmapTexture != 0) {
+            glActiveTexture(GL_TEXTURE0 + textureUnit);
+            glBindTexture(GL_TEXTURE_3D, lightmapTexture);
+        }
     }
 
     // Block getter function type - takes world coordinates, returns block type
@@ -2354,6 +2429,11 @@ private:
                                (void*)offsetof(PackedChunkVertex, normalIndex));
         glEnableVertexAttribArray(2);
 
+        // Biome data: 2 unsigned bytes (biomeTemp, biomeHumid) for grass/foliage tinting
+        glVertexAttribIPointer(3, 2, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                               (void*)offsetof(PackedChunkVertex, biomeTemp));
+        glEnableVertexAttribArray(3);
+
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
     }
@@ -2547,8 +2627,18 @@ public:
                                (void*)offsetof(PackedChunkVertex, normalIndex));
         glEnableVertexAttribArray(2);
 
+        // Biome data: 2 unsigned bytes (biomeTemp, biomeHumid) for grass/foliage tinting
+        glVertexAttribIPointer(3, 2, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                               (void*)offsetof(PackedChunkVertex, biomeTemp));
+        glEnableVertexAttribArray(3);
+
         glBindBuffer(GL_ARRAY_BUFFER, 0);
         glBindVertexArray(0);
+
+        // Cache vertices for Vulkan/RHI rendering path (LOD 0 only)
+        if (lodLevel == 0) {
+            sub.cachedVertices = vertices;
+        }
     }
 
     // Upload face-orientation buckets to a specific sub-chunk
@@ -2576,13 +2666,37 @@ public:
             sub.faceBucketVertexCounts[bucketIdx] = static_cast<int>(vertices.size());
             GLsizeiptr dataSize = vertices.size() * sizeof(PackedChunkVertex);
 
-            // Reuse buffer if data fits
-            if (sub.faceBucketVAOs[bucketIdx] != 0 &&
-                sub.faceBucketVBOs[bucketIdx] != 0 &&
+            // Reuse buffer if data fits (but always recreate VAO to ensure correct attributes)
+            if (sub.faceBucketVBOs[bucketIdx] != 0 &&
                 dataSize <= sub.faceBucketCapacities[bucketIdx]) {
                 glBindBuffer(GL_ARRAY_BUFFER, sub.faceBucketVBOs[bucketIdx]);
                 glBufferSubData(GL_ARRAY_BUFFER, 0, dataSize, vertices.data());
+
+                // Recreate VAO to ensure all vertex attributes are set up correctly
+                if (sub.faceBucketVAOs[bucketIdx] != 0) {
+                    glDeleteVertexArrays(1, &sub.faceBucketVAOs[bucketIdx]);
+                }
+                glGenVertexArrays(1, &sub.faceBucketVAOs[bucketIdx]);
+                glBindVertexArray(sub.faceBucketVAOs[bucketIdx]);
+
+                glVertexAttribPointer(0, 3, GL_SHORT, GL_FALSE, sizeof(PackedChunkVertex),
+                                      (void*)offsetof(PackedChunkVertex, x));
+                glEnableVertexAttribArray(0);
+
+                glVertexAttribPointer(1, 2, GL_UNSIGNED_SHORT, GL_FALSE, sizeof(PackedChunkVertex),
+                                      (void*)offsetof(PackedChunkVertex, u));
+                glEnableVertexAttribArray(1);
+
+                glVertexAttribIPointer(2, 4, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                                       (void*)offsetof(PackedChunkVertex, normalIndex));
+                glEnableVertexAttribArray(2);
+
+                glVertexAttribIPointer(3, 2, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                                       (void*)offsetof(PackedChunkVertex, biomeTemp));
+                glEnableVertexAttribArray(3);
+
                 glBindBuffer(GL_ARRAY_BUFFER, 0);
+                glBindVertexArray(0);
                 continue;
             }
 
@@ -2618,11 +2732,31 @@ public:
                                    (void*)offsetof(PackedChunkVertex, normalIndex));
             glEnableVertexAttribArray(2);
 
+            // Biome data: 2 unsigned bytes (biomeTemp, biomeHumid) for grass/foliage tinting
+            glVertexAttribIPointer(3, 2, GL_UNSIGNED_BYTE, sizeof(PackedChunkVertex),
+                                   (void*)offsetof(PackedChunkVertex, biomeTemp));
+            glEnableVertexAttribArray(3);
+
             glBindBuffer(GL_ARRAY_BUFFER, 0);
             glBindVertexArray(0);
         }
 
         sub.isEmpty = !hasAnyData;
+
+        // Cache vertices for Vulkan/RHI rendering path
+        // Combine all face buckets into a single cachedVertices vector
+        sub.cachedVertices.clear();
+        if (hasAnyData) {
+            size_t totalVertices = 0;
+            for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
+                totalVertices += faceBuckets[bucketIdx].size();
+            }
+            sub.cachedVertices.reserve(totalVertices);
+            for (int bucketIdx = 0; bucketIdx < FACE_BUCKET_COUNT; bucketIdx++) {
+                sub.cachedVertices.insert(sub.cachedVertices.end(),
+                    faceBuckets[bucketIdx].begin(), faceBuckets[bucketIdx].end());
+            }
+        }
     }
 
     // Render a specific face bucket of a sub-chunk (for face-orientation culling)

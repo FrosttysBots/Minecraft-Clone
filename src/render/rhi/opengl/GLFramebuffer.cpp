@@ -96,6 +96,16 @@ void GLFramebuffer::bind() {
 }
 
 // ============================================================================
+// GL DEFAULT FRAMEBUFFER WRAPPER
+// ============================================================================
+
+GLDefaultFramebuffer::GLDefaultFramebuffer(uint32_t width, uint32_t height) {
+    m_desc.width = width;
+    m_desc.height = height;
+    m_desc.debugName = "DefaultFramebuffer";
+}
+
+// ============================================================================
 // GL SWAPCHAIN
 // ============================================================================
 
@@ -104,6 +114,31 @@ GLSwapchain::GLSwapchain(GLDevice* device, const SwapchainDesc& desc)
 
     // In OpenGL, the swapchain is implicit (default framebuffer)
     // Just store the window handle and dimensions
+
+    // Create render pass description for default framebuffer
+    RenderPassDesc rpDesc;
+    AttachmentDesc colorAttach;
+    colorAttach.format = desc.format;
+    colorAttach.samples = 1;
+    colorAttach.loadOp = LoadOp::Clear;
+    colorAttach.storeOp = StoreOp::Store;
+    colorAttach.initialLayout = TextureLayout::ColorAttachment;
+    colorAttach.finalLayout = TextureLayout::PresentSrc;
+    rpDesc.colorAttachments.push_back(colorAttach);
+
+    AttachmentDesc depthAttach;
+    depthAttach.format = Format::D32_FLOAT;
+    depthAttach.samples = 1;
+    depthAttach.loadOp = LoadOp::Clear;
+    depthAttach.storeOp = StoreOp::DontCare;
+    depthAttach.initialLayout = TextureLayout::DepthStencilAttachment;
+    depthAttach.finalLayout = TextureLayout::DepthStencilAttachment;
+    rpDesc.depthStencilAttachment = depthAttach;
+    rpDesc.hasDepthStencil = true;
+    rpDesc.debugName = "SwapchainRenderPass";
+
+    m_renderPass = std::make_unique<GLRenderPass>(rpDesc);
+    m_defaultFramebuffer = std::make_unique<GLDefaultFramebuffer>(desc.width, desc.height);
 
     // Enable/disable vsync
     glfwSwapInterval(desc.vsync ? 1 : 0);
@@ -144,7 +179,11 @@ bool GLSwapchain::present() {
 void GLSwapchain::resize(uint32_t width, uint32_t height) {
     m_desc.width = width;
     m_desc.height = height;
-    // OpenGL handles this automatically
+    // Update default framebuffer wrapper dimensions
+    if (m_defaultFramebuffer) {
+        m_defaultFramebuffer->resize(width, height);
+    }
+    // OpenGL handles the actual resize automatically
 }
 
 } // namespace RHI

@@ -12,6 +12,9 @@ layout(location = 5) in float lightLevel;
 layout(location = 6) in float viewDepth;
 
 layout(binding = 0) uniform sampler2D texAtlas;
+layout(binding = 3) uniform sampler2D normalMap;
+
+uniform bool useNormalMap;
 
 const float ATLAS_SIZE = 16.0;
 const float SLOT_SIZE = 1.0 / ATLAS_SIZE;
@@ -33,7 +36,37 @@ void main() {
 
     float emission = getEmission(texSlotBase);
 
+    // Normal mapping with TBN matrix for voxel faces
+    vec3 norm = normalize(fragNormal);
+
+    if (useNormalMap) {
+        // Sample normal map at the same UV as albedo
+        vec3 normalSample = texture(normalMap, tiledUV).rgb;
+        normalSample = normalSample * 2.0 - 1.0;  // Convert from [0,1] to [-1,1]
+
+        // Compute TBN matrix for axis-aligned voxel faces
+        vec3 tangent, bitangent;
+        vec3 absNormal = abs(fragNormal);
+
+        if (absNormal.y > 0.9) {
+            // Top/bottom face (Y-aligned): tangent = X, bitangent = Z
+            tangent = vec3(1.0, 0.0, 0.0);
+            bitangent = vec3(0.0, 0.0, fragNormal.y > 0.0 ? 1.0 : -1.0);
+        } else if (absNormal.x > 0.9) {
+            // Left/right face (X-aligned): tangent = Z, bitangent = Y
+            tangent = vec3(0.0, 0.0, fragNormal.x > 0.0 ? -1.0 : 1.0);
+            bitangent = vec3(0.0, 1.0, 0.0);
+        } else {
+            // Front/back face (Z-aligned): tangent = X, bitangent = Y
+            tangent = vec3(fragNormal.z > 0.0 ? 1.0 : -1.0, 0.0, 0.0);
+            bitangent = vec3(0.0, 1.0, 0.0);
+        }
+
+        mat3 TBN = mat3(tangent, bitangent, norm);
+        norm = normalize(TBN * normalSample);
+    }
+
     gPosition = vec4(fragPos, aoFactor);
-    gNormal = vec4(normalize(fragNormal), lightLevel);
+    gNormal = vec4(norm, lightLevel);
     gAlbedo = vec4(texColor.rgb, emission);
 }

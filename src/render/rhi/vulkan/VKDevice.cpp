@@ -589,12 +589,20 @@ VkFormat VKDevice::toVkFormat(Format format) {
         case Format::R32_SINT:      return VK_FORMAT_R32_SINT;
         case Format::RG16_FLOAT:    return VK_FORMAT_R16G16_SFLOAT;
         case Format::RGBA8_UNORM:   return VK_FORMAT_R8G8B8A8_UNORM;
+        case Format::RGBA8_UINT:    return VK_FORMAT_R8G8B8A8_UINT;
+        case Format::RGBA8_SINT:    return VK_FORMAT_R8G8B8A8_SINT;
         case Format::RGBA8_SRGB:    return VK_FORMAT_R8G8B8A8_SRGB;
         case Format::BGRA8_UNORM:   return VK_FORMAT_B8G8R8A8_UNORM;
         case Format::BGRA8_SRGB:    return VK_FORMAT_B8G8R8A8_SRGB;
         case Format::RGB10A2_UNORM: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
         case Format::RG11B10_FLOAT: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+        case Format::RG16_UINT:     return VK_FORMAT_R16G16_UINT;
+        case Format::RG16_SINT:     return VK_FORMAT_R16G16_SINT;
+        case Format::RGB16_SINT:    return VK_FORMAT_R16G16B16_SINT;
+        case Format::RGB16_UINT:    return VK_FORMAT_R16G16B16_UINT;
         case Format::RG32_FLOAT:    return VK_FORMAT_R32G32_SFLOAT;
+        case Format::RGB32_FLOAT:   return VK_FORMAT_R32G32B32_SFLOAT;
+        case Format::RGB32_UINT:    return VK_FORMAT_R32G32B32_UINT;
         case Format::RGBA16_FLOAT:  return VK_FORMAT_R16G16B16A16_SFLOAT;
         case Format::RGBA32_FLOAT:  return VK_FORMAT_R32G32B32A32_SFLOAT;
         case Format::D16_UNORM:     return VK_FORMAT_D16_UNORM;
@@ -842,6 +850,36 @@ void VKQueue::submit(const std::vector<RHICommandBuffer*>& commandBuffers) {
 
 void VKQueue::waitIdle() {
     vkQueueWaitIdle(m_queue);
+}
+
+void VKQueue::submitWithSync(const std::vector<RHICommandBuffer*>& commandBuffers,
+                              VkSemaphore waitSemaphore, VkSemaphore signalSemaphore,
+                              VkFence fence) {
+    std::vector<VkCommandBuffer> vkBuffers;
+    vkBuffers.reserve(commandBuffers.size());
+    for (auto* cmd : commandBuffers) {
+        vkBuffers.push_back(static_cast<VKCommandBuffer*>(cmd)->getVkCommandBuffer());
+    }
+
+    VkPipelineStageFlags waitStages[] = {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = static_cast<uint32_t>(vkBuffers.size());
+    submitInfo.pCommandBuffers = vkBuffers.data();
+
+    if (waitSemaphore != VK_NULL_HANDLE) {
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &waitSemaphore;
+        submitInfo.pWaitDstStageMask = waitStages;
+    }
+
+    if (signalSemaphore != VK_NULL_HANDLE) {
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &signalSemaphore;
+    }
+
+    vkQueueSubmit(m_queue, 1, &submitInfo, fence);
 }
 
 // ============================================================================

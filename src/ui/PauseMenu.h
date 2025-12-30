@@ -10,6 +10,7 @@ enum class PauseAction {
     NONE,
     RESUME,
     SETTINGS,
+    TEXTURE_PACKS,
     SAVE_GAME,
     QUIT_TO_MENU
 };
@@ -22,6 +23,7 @@ public:
     // Buttons
     MenuButton resumeButton;
     MenuButton settingsButton;
+    MenuButton texturePacksButton;
     MenuButton saveButton;
     MenuButton quitButton;
 
@@ -40,7 +42,7 @@ public:
     void setupButtons() {
         float centerX = ui->windowWidth / 2.0f;
         float panelWidth = 350.0f;
-        float panelHeight = 320.0f;
+        float panelHeight = 385.0f;  // Increased for texture packs button
         float panelX = centerX - panelWidth / 2.0f;
         float panelY = ui->windowHeight / 2.0f - panelHeight / 2.0f;
 
@@ -68,9 +70,18 @@ public:
         };
         settingsButton.textScale = 1.3f;
 
+        // Texture Packs button
+        texturePacksButton = {
+            btnX, startY + 2 * (btnHeight + btnSpacing),
+            btnWidth, btnHeight,
+            "TEXTURE PACKS",
+            [this]() { currentAction = PauseAction::TEXTURE_PACKS; }
+        };
+        texturePacksButton.textScale = 1.3f;
+
         // Save button
         saveButton = {
-            btnX, startY + 2 * (btnHeight + btnSpacing),
+            btnX, startY + 3 * (btnHeight + btnSpacing),
             btnWidth, btnHeight,
             "SAVE GAME",
             [this]() { currentAction = PauseAction::SAVE_GAME; }
@@ -79,7 +90,7 @@ public:
 
         // Quit to menu button
         quitButton = {
-            btnX, startY + 3 * (btnHeight + btnSpacing),
+            btnX, startY + 4 * (btnHeight + btnSpacing),
             btnWidth, btnHeight,
             "QUIT TO MENU",
             [this]() { currentAction = PauseAction::QUIT_TO_MENU; }
@@ -100,6 +111,7 @@ public:
         input.update(mouseX, mouseY, mousePressed);
         input.handleButton(resumeButton);
         input.handleButton(settingsButton);
+        input.handleButton(texturePacksButton);
         input.handleButton(saveButton);
         input.handleButton(quitButton);
 
@@ -122,7 +134,7 @@ public:
 
         float centerX = ui->windowWidth / 2.0f;
         float panelWidth = 350.0f;
-        float panelHeight = 340.0f;
+        float panelHeight = 405.0f;  // Increased for texture packs button
         float panelX = centerX - panelWidth / 2.0f;
         float panelY = ui->windowHeight / 2.0f - panelHeight / 2.0f;
 
@@ -140,6 +152,7 @@ public:
         // Buttons
         resumeButton.render(*ui);
         settingsButton.render(*ui);
+        texturePacksButton.render(*ui);
         saveButton.render(*ui);
         quitButton.render(*ui);
 

@@ -37,6 +37,11 @@ public:
     std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> minY;  // Lowest non-air block
     std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> maxY;  // Highest non-air block
 
+    // Biome data per column for grass/foliage tinting (256 bytes each)
+    // Values 0-255 map to 0.0-1.0 for colormap sampling
+    std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> biomeTemperature;
+    std::array<uint8_t, CHUNK_SIZE_X * CHUNK_SIZE_Z> biomeHumidity;
+
     // Global min/max for entire chunk (for fast culling)
     uint8_t chunkMinY = 255;
     uint8_t chunkMaxY = 0;
@@ -63,6 +68,9 @@ public:
         lightLevels.fill(0);
         minY.fill(255);  // No blocks yet
         maxY.fill(0);
+        // Initialize biome data to neutral (0.5 temperature/humidity)
+        biomeTemperature.fill(128);
+        biomeHumidity.fill(128);
     }
 
     // Convert local coords to array index
